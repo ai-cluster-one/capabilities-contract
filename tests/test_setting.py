@@ -158,8 +158,9 @@ def test_connect_without_a_setting_is_store_not_configured_and_creates_nothing(c
 
 # --- parity with the manager's own store tier, when it is on this machine ---------
 
-STORE_TIER = Path(os.environ.get("CAPABILITIES_STORE_TIER",
-                                 "/Users/kz/dev/capabilities/contract/store.py"))
+# The manager's own store tier (its contract/store.py), named explicitly; without it
+# the parity tests skip.
+STORE_TIER_ENV = "CAPABILITIES_STORE_TIER"
 
 PARITY_CASES = [
     BASE,
@@ -180,11 +181,15 @@ PARITY_CASES = [
 
 @pytest.fixture(scope="module")
 def tier(tmp_path_factory):
-    if not STORE_TIER.exists():
-        pytest.skip("the manager's store tier is not on this machine")
+    named = os.environ.get(STORE_TIER_ENV)
+    if not named:
+        pytest.skip(f"{STORE_TIER_ENV} does not name the manager's store.py")
+    tier_file = Path(named)
+    if not tier_file.is_file():
+        pytest.skip(f"{STORE_TIER_ENV} names {tier_file}, which is not a file")
     # Imported from a copy, so nothing is written beside the original.
     copy = tmp_path_factory.mktemp("tier") / "store_tier.py"
-    shutil.copyfile(STORE_TIER, copy)
+    shutil.copyfile(tier_file, copy)
     spec = importlib.util.spec_from_file_location("store_tier", copy)
     module = importlib.util.module_from_spec(spec)
     sys.dont_write_bytecode, before = True, sys.dont_write_bytecode

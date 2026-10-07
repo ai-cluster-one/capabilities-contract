@@ -27,7 +27,6 @@ ADMIN = "admin"
 AGENT = "agent"
 PASSWORD = "s3cret pass/word%"  # a value that needs quoting; never a real secret
 DATABASE = "app"
-DEFAULT_PG_BIN = "/opt/homebrew/opt/postgresql@17/bin"
 
 ENFORCED_HBA = (f"hostssl all {ADMIN} 127.0.0.1/32 trust\n"
                 "hostssl all all 127.0.0.1/32 scram-sha-256\n"
@@ -41,9 +40,9 @@ def _free_port() -> int:
 
 
 def _pg_tool(name: str) -> str | None:
-    for base in (os.environ.get("PG_BIN"), DEFAULT_PG_BIN):
-        if base and (Path(base) / name).exists():
-            return str(Path(base) / name)
+    base = os.environ.get("PG_BIN")
+    if base and (Path(base) / name).exists():
+        return str(Path(base) / name)
     return shutil.which(name)
 
 

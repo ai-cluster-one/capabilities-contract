@@ -9,7 +9,7 @@ description = "The shared database layer of the capabilities contract: read the 
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
-authors = [{ name = "CallVA" }]
+authors = [{ name = "ai-cluster-one" }]
 keywords = ["capabilities", "postgres", "psycopg", "migrations", "schema"]
 classifiers = [
     "Intended Audience :: Developers",
@@ -26,8 +26,8 @@ dependencies = ["psycopg[binary]>=3.2,<4"]
 dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.urls]
-Homepage = "https://github.com/callva-io/capabilities-contract"
-Source = "https://github.com/callva-io/capabilities-contract"
+Homepage = "https://github.com/ai-cluster-one/capabilities-contract"
+Source = "https://github.com/ai-cluster-one/capabilities-contract"
 
 [tool.hatch.version]
 path = "capabilities_contract/version.py"
