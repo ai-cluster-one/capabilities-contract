@@ -29,7 +29,6 @@ jobs:
 
     env:
       CAPABILITIES_CONTRACT_TEST_URL: postgresql://postgres:postgres@localhost:5432/postgres?sslmode=require
-      CAPABILITIES_CONTRACT_TEST_ROOTCERT: ${{ runner.temp }}/server.crt
 
     steps:
       - uses: actions/checkout@v4
@@ -60,10 +59,12 @@ jobs:
           docker exec -u postgres "$CONTAINER" psql -tAc "SHOW ssl"
 
       - name: Install
-        run: uv pip install -e ".[dev]"
+        run: uv sync --locked --extra dev
 
       - name: Lint
         run: uv run ruff check .
 
       - name: Test
+        env:
+          CAPABILITIES_CONTRACT_TEST_ROOTCERT: ${{ runner.temp }}/server.crt
         run: uv run pytest -q
