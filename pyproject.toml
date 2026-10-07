@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "capabilities-contract"
+dynamic = ["version"]
+description = "The shared database layer of the capabilities contract: read the machine's store setting, connect bound to its schema, and migrate each owner's tables once under a ledger."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "CallVA" }]
+keywords = ["capabilities", "postgres", "psycopg", "migrations", "schema"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = ["psycopg[binary]>=3.2,<4"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.urls]
+Homepage = "https://github.com/callva-io/capabilities-contract"
+Source = "https://github.com/callva-io/capabilities-contract"
+
+[tool.hatch.version]
+path = "capabilities_contract/version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["capabilities_contract"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/capabilities_contract", "/README.md", "/LICENSE"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
