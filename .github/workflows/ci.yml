@@ -18,7 +18,7 @@ jobs:
       postgres:
         image: postgres:${{ matrix.postgres }}
         env:
-          POSTGRES_PASSWORD: postgres
+          POSTGRES_PASSWORD: ci-throwaway-pw-7f3a
         ports:
           - 5432:5432
         options: >-
@@ -28,7 +28,7 @@ jobs:
           --health-retries 30
 
     env:
-      CAPABILITIES_CONTRACT_TEST_URL: postgresql://postgres:postgres@localhost:5432/postgres?sslmode=require
+      CAPABILITIES_CONTRACT_TEST_URL: postgresql://postgres:ci-throwaway-pw-7f3a@localhost:5432/postgres?sslmode=require
 
     steps:
       - uses: actions/checkout@v4
