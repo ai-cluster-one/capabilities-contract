@@ -12,13 +12,13 @@ Its one dependency is `psycopg[binary]>=3.2,<4`, imported lazily: `import capabi
 
 ```python
 # /// script
-# dependencies = ["capabilities-contract==0.1.0"]
+# dependencies = ["capabilities-contract==0.2.0"]
 # ///
 ```
 
 ## The store setting
 
-`read_setting()` returns the store in force as a `Setting`, reading and never writing. `CAPABILITIES_STORE_URL`, when set, wins and must be a `postgresql://` URL. Otherwise it reads the manager's setting, written only by `capabilities store set`: the non-secret values in `$XDG_CONFIG_HOME/capabilities/store.json` and the password as `CAPABILITIES_STORE_PASSWORD` in `$XDG_CONFIG_HOME/capabilities/credentials.env`. The fields and their checks are the manager's: `host`, `database`, `user` with no whitespace, `port` 1-65535 (default 5432), `sslmode` one of `require`, `verify-ca`, `verify-full` (`disable`, `allow` and `prefer` are refused as `sslmode_too_weak`), and an optional `sslrootcert`. A `capabilities.store.v1` setting binds the schema `agentkit`; a `capabilities.store.v2` setting may name another schema in `db_schema` (the document's `schema` key is its id). The URL override binds `agentkit`. With neither a setting nor the override, it raises `DbError("store_not_configured", ..., "run capabilities store set")`.
+`read_setting()` returns the store in force as a `Setting`, reading and never writing. `AGENTKIT_STORE_URL`, when set, wins, then `CAPABILITIES_STORE_URL`; either must be a `postgresql://` URL and binds the schema `agentkit`. Otherwise it reads the machine's store setting, the one file the family of tools shares: `$XDG_CONFIG_HOME/agentkit/store.json`, or `~/.config/agentkit/store.json` when `XDG_CONFIG_HOME` is unset, an `agentkit.store.v1` document whose format is the capabilities package's [SHEBANG.md, "The store setting"](https://github.com/ai-cluster-one/capabilities/blob/main/SHEBANG.md#the-store-setting). `setting_path()` gives that file's absolute path, and `Setting.source` names the override or the absolute path the setting was read from. A file of a newer `agentkit.store.*` version is refused as `store_setting_too_new`. While the file is absent, it reads the legacy pair `capabilities store set` wrote before: the non-secret values in `$XDG_CONFIG_HOME/capabilities/store.json` (`capabilities.store.v1`, binding `agentkit`, or `capabilities.store.v2`, which may name `db_schema`) and the password as `CAPABILITIES_STORE_PASSWORD` in `$XDG_CONFIG_HOME/capabilities/credentials.env`; `setting_files()` gives those two paths. The checks are the manager's: `host`, `database`, `user` with no whitespace, `port` 1-65535 (default 5432), `sslmode` one of `require`, `verify-ca`, `verify-full`, or `disable` for a local host (`localhost`, a loopback address or a Unix socket directory); `disable` elsewhere, `allow` and `prefer` are refused as `sslmode_too_weak`; and an optional `sslrootcert`. With neither a setting nor an override, it raises `DbError("store_not_configured", ..., "run capabilities store set")`.
 
 ## Connect
 
@@ -49,7 +49,7 @@ The version rule lets tools at different releases share one database. When the s
 
 ## Errors
 
-Every failure is a `DbError` with `slug` (stable, for the caller to map to an exit code), `message` and `hint` (possibly `None`). Slugs: `store_not_configured`, `store_not_postgres`, `store_setting_unreadable`, `bad_store_setting`, `sslmode_too_weak`, `bad_schema_name`, `store_unreachable`, `driver_missing`, `bad_application_name`, `bad_owner`, `bad_version`, `bad_step`, `connection_busy`, `checksum_mismatch`, `naming_law`, `step_failed`, `schema_too_new`.
+Every failure is a `DbError` with `slug` (stable, for the caller to map to an exit code), `message` and `hint` (possibly `None`). Slugs: `store_not_configured`, `store_not_postgres`, `store_setting_unreadable`, `store_setting_too_new`, `bad_store_setting`, `sslmode_too_weak`, `bad_schema_name`, `store_unreachable`, `driver_missing`, `bad_application_name`, `bad_owner`, `bad_version`, `bad_step`, `connection_busy`, `checksum_mismatch`, `naming_law`, `step_failed`, `schema_too_new`.
 
 ## Development
 

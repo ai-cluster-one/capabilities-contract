@@ -135,6 +135,14 @@ def server():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def write_family_setting(config_home: Path, document) -> Path:
+    folder = config_home / "agentkit"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / "store.json"
+    path.write_text(document if isinstance(document, str) else json.dumps(document))
+    return path
+
+
 def write_setting(config_home: Path, document: dict, password: str | None = None) -> None:
     folder = config_home / "capabilities"
     folder.mkdir(parents=True, exist_ok=True)
@@ -167,6 +175,7 @@ def clean_env(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home))
     monkeypatch.delenv("CAPABILITIES_STORE_URL", raising=False)
+    monkeypatch.delenv("AGENTKIT_STORE_URL", raising=False)
     return home
 
 

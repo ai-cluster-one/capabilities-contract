@@ -10,12 +10,13 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import write_setting
+from conftest import write_family_setting, write_setting
 
-from capabilities_contract.db import DbError, read_setting, setting_files
+from capabilities_contract.db import DbError, read_setting, setting_files, setting_path
 
 BASE = {"schema": "capabilities.store.v1", "host": "db.example.test", "port": 5432,
         "database": "app", "user": "agent", "sslmode": "require"}
+FAMILY = {**BASE, "schema": "agentkit.store.v1", "password": "pw"}
 
 
 def _read(home: Path, document: dict, password: str | None = "pw"):
@@ -99,6 +100,110 @@ def test_an_override_that_is_not_postgres_is_refused(clean_env, monkeypatch):
     with pytest.raises(DbError) as caught:
         read_setting()
     assert caught.value.slug == "store_not_postgres"
+
+
+# --- the family file ---------------------------------------------------------------
+
+def test_the_family_file_is_under_agentkit(clean_env, monkeypatch):
+    assert setting_path() == clean_env / "agentkit" / "store.json"
+    monkeypatch.delenv("XDG_CONFIG_HOME")
+    monkeypatch.setenv("HOME", str(clean_env / "home"))
+    assert setting_path() == clean_env / "home" / ".config" / "agentkit" / "store.json"
+    assert setting_path().is_absolute()
+
+
+def test_the_family_file_is_read_with_its_password(clean_env):
+    path = write_family_setting(clean_env, {**FAMILY, "password": "p@ss word"})
+    s = read_setting()
+    assert (s.host, s.port, s.database, s.user, s.sslmode) == (
+        "db.example.test", 5432, "app", "agent", "require")
+    assert s.schema == "agentkit" and s.password == "p@ss word"
+    assert s.source == str(path)
+    assert "p@ss" not in repr(s)
+
+
+def test_the_family_file_names_its_schema_and_may_carry_no_password(clean_env):
+    doc = {k: v for k, v in FAMILY.items() if k != "password"}
+    write_family_setting(clean_env, {**doc, "db_schema": "shared_state"})
+    s = read_setting()
+    assert s.schema == "shared_state" and s.password is None
+
+
+def test_the_family_file_wins_over_the_legacy_pair(clean_env):
+    write_setting(clean_env, {**BASE, "host": "legacy.example.test"}, "old")
+    path = write_family_setting(clean_env, FAMILY)
+    s = read_setting()
+    assert s.host == "db.example.test" and s.password == "pw" and s.source == str(path)
+
+
+def test_the_legacy_pair_is_read_while_the_family_file_is_absent(clean_env):
+    write_setting(clean_env, BASE, "old")
+    s = read_setting()
+    assert s.password == "old"
+    assert s.source == str(clean_env / "capabilities" / "store.json")
+
+
+def test_agentkit_store_url_wins_over_capabilities_store_url(clean_env, monkeypatch):
+    write_family_setting(clean_env, FAMILY)
+    monkeypatch.setenv("CAPABILITIES_STORE_URL", "postgresql://c@h/d")
+    assert read_setting().source == "CAPABILITIES_STORE_URL"
+    monkeypatch.setenv("AGENTKIT_STORE_URL", "postgresql://a@h/d")
+    s = read_setting()
+    assert s.source == "AGENTKIT_STORE_URL" and s.schema == "agentkit"
+    assert s.connect_kwargs() == {"conninfo": "postgresql://a@h/d"}
+
+
+def test_an_agentkit_store_url_that_is_not_postgres_is_refused(clean_env, monkeypatch):
+    monkeypatch.setenv("AGENTKIT_STORE_URL", "sqlite:///x.db")
+    with pytest.raises(DbError) as caught:
+        read_setting()
+    assert caught.value.slug == "store_not_postgres"
+    assert "AGENTKIT_STORE_URL" in caught.value.message
+
+
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "::1", "/var/run/postgresql"])
+def test_sslmode_disable_is_admitted_for_a_local_host(clean_env, host):
+    write_family_setting(clean_env, {**FAMILY, "host": host, "sslmode": "disable"})
+    s = read_setting()
+    assert s.host == host and s.sslmode == "disable"
+
+
+@pytest.mark.parametrize("host,mode", [("db.example.test", "disable"),
+                                       ("192.0.2.10", "disable"),
+                                       ("localhost", "prefer"),
+                                       ("localhost", "allow")])
+def test_plain_text_is_refused_elsewhere_and_allow_prefer_everywhere(clean_env, host, mode):
+    write_family_setting(clean_env, {**FAMILY, "host": host, "sslmode": mode})
+    with pytest.raises(DbError) as caught:
+        read_setting()
+    assert caught.value.slug == "sslmode_too_weak"
+
+
+def test_a_newer_family_version_is_refused_and_not_read_past(clean_env):
+    write_setting(clean_env, BASE, "old")
+    write_family_setting(clean_env, {**FAMILY, "schema": "agentkit.store.v2", "extra": 1})
+    with pytest.raises(DbError) as caught:
+        read_setting()
+    assert caught.value.slug == "store_setting_too_new"
+    assert "update" in caught.value.hint
+
+
+@pytest.mark.parametrize("document", [
+    {**FAMILY, "at": "2026-10-08T00:00:00Z"},
+    {**FAMILY, "schema": "capabilities.store.v1"},
+    {k: v for k, v in FAMILY.items() if k != "schema"},
+    {**FAMILY, "password": 5},
+    {**FAMILY, "password": "a\nb"},
+    {**FAMILY, "db_schema": "public"},
+    {k: v for k, v in FAMILY.items() if k != "host"},
+    "not json",
+    [1],
+])
+def test_a_malformed_family_file_is_refused(clean_env, document):
+    write_family_setting(clean_env, document)
+    with pytest.raises(DbError) as caught:
+        read_setting()
+    assert caught.value.slug in ("bad_store_setting", "bad_schema_name"), caught.value
 
 
 # --- refused --------------------------------------------------------------------
@@ -198,6 +303,36 @@ def tier(tmp_path_factory):
     finally:
         sys.dont_write_bytecode = before
     return module
+
+
+FAMILY_PARITY_CASES = [
+    FAMILY,
+    {**FAMILY, "db_schema": "other_schema"},
+    {**FAMILY, "host": "localhost", "sslmode": "disable"},
+    {**FAMILY, "host": "db.example.test", "sslmode": "disable"},
+    {**FAMILY, "schema": "agentkit.store.v9"},
+    {**FAMILY, "extra": 1},
+]
+
+
+@pytest.mark.parametrize("document", FAMILY_PARITY_CASES)
+def test_the_family_file_reads_as_the_store_tier_reads_it(tier, clean_env, document):
+    write_family_setting(clean_env, document)
+    try:
+        theirs = tier.read_store_setting()
+        their_error = None
+    except tier.StoreError as exc:
+        theirs, their_error = None, exc.slug
+    try:
+        ours = read_setting()
+        our_error = None
+    except DbError as exc:
+        ours, our_error = None, exc.slug
+    assert our_error == their_error
+    if theirs is not None:
+        ours_values = {k: getattr(ours, k) for k in theirs if k != "db_schema"}
+        assert ours_values == {k: v for k, v in theirs.items() if k != "db_schema"}
+        assert ours.schema == theirs["db_schema"]
 
 
 @pytest.mark.parametrize("document", PARITY_CASES)
