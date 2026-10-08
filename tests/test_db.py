@@ -13,6 +13,7 @@ import psycopg
 import pytest
 
 from capabilities_contract.db import DbError, Step, connect, migrate, read_setting
+from capabilities_contract.version import __version__
 
 
 def _connect():
@@ -133,7 +134,7 @@ def test_migrate_creates_the_ledger_and_applies_each_step_once(store):
         assert _ledger(conn, store.schema, "demo") == [("0001",), ("0002",), ("0003",),
                                                        ("0004",)]
         assert _rows(conn, f'SELECT library_version FROM "{store.schema}".schema_ledger '
-                           "LIMIT 1") == [("0.1.0",)]
+                           "LIMIT 1") == [(__version__,)]
         assert _rows(conn, f'SELECT major, minor FROM "{store.schema}".schema_version') \
             == [(1, 1)]
 
@@ -211,6 +212,7 @@ def test_two_processes_migrating_one_owner_apply_each_step_exactly_once(store, t
     go = tmp_path / "go"
     env = {**os.environ, "XDG_CONFIG_HOME": str(store.config_home)}
     env.pop("CAPABILITIES_STORE_URL", None)
+    env.pop("AGENTKIT_STORE_URL", None)
     procs = [subprocess.Popen([sys.executable, str(script), str(i), str(go)], env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
              for i in range(2)]
