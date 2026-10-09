@@ -280,17 +280,40 @@ def _libpq_reads(url: str) -> dict | None:
         return None
 
 
+def _libpq_secrets() -> set[str]:
+    """Read here from libpq's own option table, apart from the library: each parameter
+    it marks as a password field, and the SCRAM keys."""
+    from psycopg import pq
+
+    return {o.keyword.decode() for o in pq.Conninfo.get_defaults()
+            if o.dispchar == b"*"} | {"scram_client_key", "scram_server_key"}
+
+
+def test_the_secret_parameters_are_those_libpq_marks_and_the_scram_keys():
+    from psycopg import pq
+
+    from capabilities_contract.db._setting import _libpq_secret_params
+
+    secrets = _libpq_secret_params()
+    assert secrets == _libpq_secrets()
+    assert {"password", "sslpassword", "scram_client_key", "scram_server_key"} <= secrets
+    known = {o.keyword.decode() for o in pq.Conninfo.get_defaults()}
+    if "oauth_client_secret" in known:
+        assert "oauth_client_secret" in secrets
+
+
 def _assert_no_secret_shown(url: str, read: dict) -> bool:
     """Whether the URL carried a secret; every secret libpq reads from it is absent
     from the report, unless the report shows the same text as something else libpq
     reads, such as the host of an unencoded `pa@ss@host`, or as a key."""
     report = Setting(url=url, level="environment", sources=("AGENTKIT_DB_URL",)).report()
     shown = json.dumps(report, ensure_ascii=False)
+    secrets = _libpq_secrets()
     public = json.dumps({**report, "url": {k: v for k, v in report["url"].items()
-                                           if k not in ("password", "sslpassword")}},
-                        ensure_ascii=False) + ' "password" "sslpassword"'
+                                           if k not in secrets}},
+                        ensure_ascii=False) + " " + " ".join(f'"{k}"' for k in secrets)
     carried = False
-    for key in ("password", "sslpassword"):
+    for key in sorted(secrets):
         if key in read:
             carried = True
             assert report["url"][key] == "***", url
@@ -312,12 +335,18 @@ SHAPES = [
     "postgresql://agent:pw@db.example.com:5432?application_name=a@b&password=QX",
     "postgresql://ag?ent@db.example.com/app?password=QX",
     "postgresql://ag?ent:pw@db.example.com/app?password=QX",
+    "postgresql://agent@db.example.com/app?oauth_issuer=https://issuer.example.com"
+    "&oauth_client_id=cid&oauth_client_secret=OAUTHSECRET",
+    "postgresql://agent@db.example.com/app?scram_client_key=CLIENTKEY"
+    "&scram_server_key=SERVERKEY",
 ]
 
 
 @pytest.mark.parametrize("url", SHAPES)
 def test_the_report_hides_every_secret_libpq_reads_from_a_named_shape(url):
     read = _libpq_reads(url)
+    if read is None and "oauth_" in url:
+        pytest.skip("this libpq reads no OAuth parameters")
     assert read is not None
     assert _assert_no_secret_shown(url, read)
 
@@ -325,6 +354,7 @@ def test_the_report_hides_every_secret_libpq_reads_from_a_named_shape(url):
 def _generated_urls(count: int, seed: int = 20261009):
     rng = random.Random(seed)
     specials = "#?@/&=:%,[]+ ;"
+    secret_keys = sorted(_libpq_secrets() - {"password", "sslpassword"})
 
     def token(tag: str, n: int) -> str:
         chars = [rng.choice(specials + "abcXYZ019") for _ in range(rng.randint(0, 6))]
@@ -343,7 +373,8 @@ def _generated_urls(count: int, seed: int = 20261009):
         params = []
         for _ in range(rng.randint(0, 3)):
             key = rng.choice(["password", "sslpassword", "pass%77ord", "ssl%70assword",
-                              "PASSWORD", "application_name", "sslmode"])
+                              "PASSWORD", "application_name", "sslmode",
+                              *secret_keys])
             value = ("require" if key == "sslmode"
                      else maybe_encoded(token("Qv", n)))
             params.append(f"{key}={value}")

@@ -23,6 +23,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -64,8 +65,9 @@ NOT_CONFIGURED_HINT = ("set AGENTKIT_DB_URL or the AGENTKIT_DB_* fields in the p
 _IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 _SYSTEM_SCHEMAS = ("public", "information_schema")
 _REDACTED = "***"
-# The libpq connection parameters whose value is a secret.
-_SECRET_PARAMS = ("password", "sslpassword")
+# Secrets libpq does not mark as password fields: the SCRAM keys stand in for the
+# password, though its option table marks them only as debug options.
+_SECRET_PARAMS_UNMARKED = ("scram_client_key", "scram_server_key")
 
 
 def check_schema_name(name: object) -> str:
@@ -81,6 +83,17 @@ def check_schema_name(name: object) -> str:
     return name
 
 
+@lru_cache(maxsize=1)
+def _libpq_secret_params() -> frozenset[str]:
+    """The libpq connection parameters whose value is a secret: every one libpq's own
+    option table marks as a password field, and the SCRAM keys."""
+    from psycopg import pq
+
+    marked = {option.keyword.decode() for option in pq.Conninfo.get_defaults()
+              if option.dispchar == b"*"}
+    return frozenset(marked.union(_SECRET_PARAMS_UNMARKED))
+
+
 def _url_report(url: str) -> dict:
     """The parameters libpq reads from a URL, each secret replaced, with the sslmode
     a URL naming none is connected with. Only libpq's own parse takes the URL apart,
@@ -94,7 +107,8 @@ def _url_report(url: str) -> dict:
     except (psycopg.Error, ValueError):
         return {"unparseable": True}
     params.setdefault("sslmode", DEFAULT_SSLMODE)
-    return {key: _REDACTED if key in _SECRET_PARAMS else value
+    secrets = _libpq_secret_params()
+    return {key: _REDACTED if key in secrets else value
             for key, value in params.items()}
 
 
