@@ -1,17 +1,19 @@
-"""The machine's store setting, read exactly as the manager's store tier reads it.
+"""Which database a project uses, resolved through one cascade.
 
-The setting is one file shared by every tool of the family on the machine:
-`$XDG_CONFIG_HOME/agentkit/store.json`, or `~/.config/agentkit/store.json` when
-`XDG_CONFIG_HOME` is unset, an `agentkit.store.v1` document holding the connection
-values and the password. Its format is the capabilities package's SHEBANG.md, "The
-store setting". This module reads it and writes nothing. `AGENTKIT_STORE_URL`, then
-`CAPABILITIES_STORE_URL`, when set, is the store in force and wins over the setting.
+Three levels are asked in order, and the first that answers is the setting in force;
+a level is never completed from a lower one:
 
-While the file is absent the setting is read from the legacy pair the manager wrote
-before: the non-secret values in `$XDG_CONFIG_HOME/capabilities/store.json`
-(`capabilities.store.v1`, binding `agentkit`, or `capabilities.store.v2`, which may
-name `db_schema`) and the password as `CAPABILITIES_STORE_PASSWORD` in
-`$XDG_CONFIG_HOME/capabilities/credentials.env`.
+1. `project` - the `AGENTKIT_DB_*` keys in the project's `.env.local` and `.env`,
+   `.env.local` winning key by key;
+2. `environment` - the same keys in the process environment;
+3. `machine` - the machine's store setting file, `$XDG_CONFIG_HOME/agentkit/store.json`
+   (`~/.config/agentkit/store.json` when `XDG_CONFIG_HOME` is unset), an
+   `agentkit.store.v1` document whose format is the capabilities package's SHEBANG.md,
+   "The store setting".
+
+Within one level `AGENTKIT_DB_URL` wins and that level's separate fields are ignored,
+except `AGENTKIT_DB_SCHEMA`, which applies beside a URL. This module reads and writes
+nothing else.
 """
 
 from __future__ import annotations
@@ -22,18 +24,12 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse, urlunparse
 
 from capabilities_contract.db._errors import DbError
 
 SETTING_FORMAT = "agentkit.store.v1"
 SETTING_FORMAT_PREFIX = "agentkit.store."
-SETTING_SCHEMA_V1 = "capabilities.store.v1"
-SETTING_SCHEMA_V2 = "capabilities.store.v2"
-SETTING_SCHEMAS = (SETTING_SCHEMA_V1, SETTING_SCHEMA_V2)
-PASSWORD_KEY = "CAPABILITIES_STORE_PASSWORD"
-URL_ENVS = ("AGENTKIT_STORE_URL", "CAPABILITIES_STORE_URL")
-URL_ENV = "CAPABILITIES_STORE_URL"
 SSLMODES = ("require", "verify-ca", "verify-full")
 SSLMODES_REFUSED = ("disable", "allow", "prefer")
 SSLMODE_LOCAL = "disable"
@@ -41,11 +37,33 @@ SETTING_FIELDS = ("host", "port", "database", "user", "sslmode", "sslrootcert")
 SCHEMA_FIELD = "db_schema"
 FORMAT_FIELDS = ("schema", *SETTING_FIELDS, "password", SCHEMA_FIELD)
 DEFAULT_SCHEMA = "agentkit"
+DEFAULT_PORT = 5432
+DEFAULT_SSLMODE = "require"
+
+KEY_PREFIX = "AGENTKIT_DB_"
+URL_KEY = "AGENTKIT_DB_URL"
+SCHEMA_KEY = "AGENTKIT_DB_SCHEMA"
+PASSWORD_KEY = "AGENTKIT_DB_PASSWORD"
+# The separate fields, each key with the setting field it fills.
+FIELD_KEYS = {
+    "AGENTKIT_DB_HOST": "host",
+    "AGENTKIT_DB_PORT": "port",
+    "AGENTKIT_DB_NAME": "database",
+    "AGENTKIT_DB_USER": "user",
+    "AGENTKIT_DB_SSLMODE": "sslmode",
+    "AGENTKIT_DB_SSLROOTCERT": "sslrootcert",
+}
+KEYS = (URL_KEY, *FIELD_KEYS, PASSWORD_KEY, SCHEMA_KEY)
+
+LEVELS = ("project", "environment", "machine")
+PROJECT_FILES = (".env.local", ".env")
+
+NOT_CONFIGURED_HINT = ("set AGENTKIT_DB_URL or the AGENTKIT_DB_* fields in the project's "
+                       ".env.local or the process environment, or run capabilities store set")
 
 _IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 _SYSTEM_SCHEMAS = ("public", "information_schema")
-
-NOT_CONFIGURED_HINT = "run capabilities store set"
+_REDACTED = "***"
 
 
 def check_schema_name(name: object) -> str:
@@ -61,16 +79,30 @@ def check_schema_name(name: object) -> str:
     return name
 
 
+def redact_url(url: str) -> str:
+    """The URL with any password, in the authority or the query, replaced."""
+    parsed = urlparse(url)
+    netloc = parsed.netloc
+    if parsed.password is not None:
+        userinfo, _, hostport = netloc.rpartition("@")
+        user = userinfo.split(":", 1)[0]
+        netloc = f"{user}:{_REDACTED}@{hostport}"
+    query = re.sub(r"(^|&)(password=)[^&]*", rf"\g<1>\g<2>{_REDACTED}", parsed.query)
+    return urlunparse(parsed._replace(netloc=netloc, query=query))
+
+
 @dataclass(frozen=True)
 class Setting:
-    """Where the store is and which schema it binds.
+    """Where the database is, which schema it binds, and where that was found.
 
-    Either `url` (from `AGENTKIT_STORE_URL` or `CAPABILITIES_STORE_URL`) or the host
-    fields are set. `source` is the override's name or the absolute path of the file
-    the setting was read from. The password and URL are never shown in the repr."""
+    Either `url` or the host fields are set. `level` is `project`, `environment` or
+    `machine`; `sources` names every file (an absolute path) or variable that supplied
+    a value in force. The password and URL are never shown in the repr; `report()`
+    gives the whole setting with its secrets redacted."""
 
     schema: str = DEFAULT_SCHEMA
-    source: str = ""
+    level: str = ""
+    sources: tuple[str, ...] = ()
     url: str | None = field(default=None, repr=False)
     host: str | None = None
     port: int | None = None
@@ -81,15 +113,30 @@ class Setting:
     password: str | None = field(default=None, repr=False)
 
     def connect_kwargs(self) -> dict:
-        """Arguments for `psycopg.connect`: a conninfo string, or keyword values."""
+        """Arguments for `psycopg.connect`: a conninfo string, or keyword values. A URL
+        that names no sslmode is given `require`."""
         if self.url is not None:
-            return {"conninfo": self.url}
+            out = {"conninfo": self.url}
+            if "sslmode" not in parse_qs(urlparse(self.url).query):
+                out["sslmode"] = DEFAULT_SSLMODE
+            return out
         out = {"host": self.host, "port": self.port, "dbname": self.database,
                "user": self.user, "sslmode": self.sslmode}
         if self.sslrootcert:
             out["sslrootcert"] = self.sslrootcert
         if self.password:
             out["password"] = self.password
+        return out
+
+    def report(self) -> dict:
+        """The setting in force for a status or doctor surface, secrets redacted."""
+        out = {"level": self.level, "sources": list(self.sources), "schema": self.schema}
+        if self.url is not None:
+            out["url"] = redact_url(self.url)
+            return out
+        out.update(host=self.host, port=self.port, database=self.database, user=self.user,
+                   sslmode=self.sslmode, sslrootcert=self.sslrootcert,
+                   password=_REDACTED if self.password else None)
         return out
 
 
@@ -99,15 +146,8 @@ def _config_home(config_home: Path | str | None) -> Path:
 
 
 def setting_path(config_home: Path | str | None = None) -> Path:
-    """The family's store setting file, as an absolute path."""
+    """The machine's store setting file, as an absolute path."""
     return _config_home(config_home) / "agentkit" / "store.json"
-
-
-def setting_files(config_home: Path | str | None = None) -> tuple[Path, Path]:
-    """The legacy setting file and password file, in that order."""
-    home = _config_home(config_home)
-    return (home / "capabilities" / "store.json",
-            home / "capabilities" / "credentials.env")
 
 
 def host_is_local(host: object) -> bool:
@@ -123,11 +163,22 @@ def host_is_local(host: object) -> bool:
         return False
 
 
+def _check_sslmode(sslmode: object, local: bool) -> None:
+    if sslmode in SSLMODES or (sslmode == SSLMODE_LOCAL and local):
+        return
+    if sslmode in SSLMODES_REFUSED:
+        raise DbError("sslmode_too_weak",
+                      f"sslmode {sslmode!r} lets the store be reached without TLS",
+                      f"use one of {', '.join(SSLMODES)}; disable is admitted only "
+                      "for a local host or Unix socket")
+    raise DbError("bad_store_setting", f"unknown sslmode {sslmode!r}",
+                  f"use one of {', '.join(SSLMODES)}")
+
+
 def check_setting(values: dict) -> dict:
-    """The setting's non-secret values, checked and normalised, or DbError. The same
-    rules as the manager's store tier: no unknown field, host/database/user without
-    whitespace, port 1-65535, sslmode at least `require`, or `disable` for a local
-    host."""
+    """The setting's non-secret values, checked and normalised, or DbError: no unknown
+    field, host/database/user without whitespace, port 1-65535, sslmode at least
+    `require`, or `disable` for a local host."""
     if not isinstance(values, dict):
         raise DbError("bad_store_setting", "the store setting is not an object")
     unknown = sorted(set(values) - set(SETTING_FIELDS))
@@ -142,22 +193,14 @@ def check_setting(values: dict) -> dict:
             raise DbError("bad_store_setting",
                           f"the store setting needs a {name} with no whitespace")
         out[name] = value
-    port = values.get("port", 5432)
+    port = values.get("port", DEFAULT_PORT)
     if isinstance(port, str) and port.isdigit():
         port = int(port)
     if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
         raise DbError("bad_store_setting", "the store port must be 1-65535")
     out["port"] = port
     sslmode = values.get("sslmode")
-    local = sslmode == SSLMODE_LOCAL and host_is_local(out["host"])
-    if sslmode in SSLMODES_REFUSED and not local:
-        raise DbError("sslmode_too_weak",
-                      f"sslmode {sslmode!r} lets the store be reached without TLS",
-                      f"use one of {', '.join(SSLMODES)}; disable is admitted only "
-                      "for a local host or Unix socket")
-    if sslmode not in SSLMODES and not local:
-        raise DbError("bad_store_setting", f"unknown sslmode {sslmode!r}",
-                      f"use one of {', '.join(SSLMODES)}")
+    _check_sslmode(sslmode, host_is_local(out["host"]))
     out["sslmode"] = sslmode
     root = values.get("sslrootcert")
     if root is not None:
@@ -168,33 +211,128 @@ def check_setting(values: dict) -> dict:
     return out
 
 
-def read_setting(config_home: Path | str | None = None) -> Setting:
-    """The store in force on this machine.
+def check_url(url: str) -> str:
+    """A PostgreSQL URL whose sslmode, when it names one, holds to the TLS rule."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("postgres", "postgresql"):
+        raise DbError("store_not_postgres",
+                      f"{URL_KEY} names a {parsed.scheme or 'file'} store, not PostgreSQL",
+                      f"point {URL_KEY} at a postgresql:// URL")
+    query = parse_qs(parsed.query)
+    host = (query.get("host") or [parsed.hostname])[-1]
+    sslmode = (query.get("sslmode") or [DEFAULT_SSLMODE])[-1]
+    _check_sslmode(sslmode, host is None or host_is_local(host))
+    return url
 
-    `AGENTKIT_STORE_URL`, then `CAPABILITIES_STORE_URL`, then the family's setting
-    file, then, while that file is absent, the legacy pair. With none of them, raises
-    DbError `store_not_configured`. Reads only; never creates a file."""
-    for name in URL_ENVS:
-        url = os.environ.get(name)
-        if url:
-            scheme = urlparse(url).scheme
-            if scheme not in ("postgres", "postgresql"):
-                raise DbError("store_not_postgres",
-                              f"{name} names a {scheme or 'file'} store, not Postgres",
-                              f"point {name} at a postgresql:// URL or unset it")
-            return Setting(url=url, schema=DEFAULT_SCHEMA, source=name)
+
+def _read_env_file(path: Path) -> dict:
+    """The `AGENTKIT_DB_*` keys of a KEY=VALUE env file, parsed as the contract's
+    credential cascade parses one. A missing file holds none."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise DbError("store_setting_unreadable", f"cannot read {path}: {exc}") from exc
+    out: dict = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        if key.startswith(KEY_PREFIX):
+            out[key] = value.strip().strip('"').strip("'")
+    return out
+
+
+def _project_values(project_root: Path | str) -> dict[str, tuple[str, str]]:
+    """Each key the project's env files set, with the file it came from."""
+    root = Path(os.path.abspath(project_root))
+    found: dict[str, tuple[str, str]] = {}
+    for name in reversed(PROJECT_FILES):  # .env first, so .env.local wins
+        path = root / name
+        for key, value in _read_env_file(path).items():
+            if value:
+                found[key] = (value, str(path))
+    return found
+
+
+def _environment_values() -> dict[str, tuple[str, str]]:
+    return {key: (os.environ[key], key) for key in KEYS if os.environ.get(key)}
+
+
+def _from_keys(level: str, found: dict[str, tuple[str, str]]) -> Setting:
+    """The setting one level's keys describe, never completed from another level."""
+    unknown = sorted(key for key in found if key not in KEYS)
+    if unknown:
+        raise DbError("bad_store_setting",
+                      f"the {level} level sets keys the database setting does not have: "
+                      f"{', '.join(unknown)} ({_where(found, unknown)})",
+                      f"use only {', '.join(KEYS)}")
+    used = [URL_KEY, SCHEMA_KEY] if URL_KEY in found else list(found)
+    used = [key for key in used if key in found]
+    try:
+        schema = check_schema_name(found[SCHEMA_KEY][0]) if SCHEMA_KEY in found \
+            else DEFAULT_SCHEMA
+        if URL_KEY in found:
+            return Setting(schema=schema, level=level, sources=_sources(found, used),
+                           url=check_url(found[URL_KEY][0]))
+        values = {name: found[key][0] for key, name in FIELD_KEYS.items() if key in found}
+        values.setdefault("sslmode", DEFAULT_SSLMODE)
+        password = found[PASSWORD_KEY][0] if PASSWORD_KEY in found else None
+        return Setting(schema=schema, level=level, sources=_sources(found, used),
+                       password=password, **check_setting(values))
+    except DbError as exc:
+        raise DbError(exc.slug, f"the {level} level ({_where(found, used)}): {exc.message}",
+                      exc.hint) from None
+
+
+def _sources(found: dict[str, tuple[str, str]], keys: list[str]) -> tuple[str, ...]:
+    out: list[str] = []
+    for key in keys:
+        if found[key][1] not in out:
+            out.append(found[key][1])
+    return tuple(out)
+
+
+def _where(found: dict[str, tuple[str, str]], keys: list[str]) -> str:
+    return ", ".join(_sources(found, keys))
+
+
+def resolve_setting(project_root: Path | str | None, *,
+                    config_home: Path | str | None = None) -> Setting:
+    """The database setting in force for a process standing in `project_root`.
+
+    The project's `.env.local` / `.env`, then the process environment, then the
+    machine's store setting file; the first level that sets any `AGENTKIT_DB_*` key,
+    or the machine level when its file exists, answers whole. `project_root` None
+    means the process stands in no project, so the project level is not asked. With
+    no level answering, raises DbError `store_not_configured`. Reads only; never
+    creates a file."""
+    if project_root is not None:
+        found = _project_values(project_root)
+        if found:
+            return _from_keys("project", found)
+    found = _environment_values()
+    if found:
+        return _from_keys("environment", found)
     path = setting_path(config_home)
     try:
         raw = path.read_text()
     except FileNotFoundError:
-        return _read_legacy(config_home)
+        raise DbError("store_not_configured",
+                      "no database is configured for this project or this machine",
+                      NOT_CONFIGURED_HINT) from None
     except OSError as exc:
         raise DbError("store_setting_unreadable",
                       f"cannot read the store setting {path}: {exc}") from exc
-    return _read_family(path, raw)
+    return _read_machine_file(path, raw)
 
 
-def _read_family(path: Path, raw: str) -> Setting:
+def _read_machine_file(path: Path, raw: str) -> Setting:
     try:
         data = json.loads(raw)
     except ValueError as exc:
@@ -222,42 +360,5 @@ def _read_family(path: Path, raw: str) -> Setting:
     password = data.get("password")
     if password is not None and (not isinstance(password, str) or "\n" in password):
         raise DbError("bad_store_setting", f"{path} carries a password that is not one line")
-    return Setting(schema=schema, source=str(path), password=password or None, **values)
-
-
-def _read_legacy(config_home: Path | str | None) -> Setting:
-    setting_file, password_file = setting_files(config_home)
-    try:
-        raw = setting_file.read_text()
-    except FileNotFoundError:
-        raise DbError("store_not_configured", "this machine has no store setting",
-                      NOT_CONFIGURED_HINT) from None
-    except OSError as exc:
-        raise DbError("store_setting_unreadable",
-                      f"cannot read the store setting {setting_file}: {exc}") from exc
-    try:
-        data = json.loads(raw)
-    except ValueError as exc:
-        raise DbError("bad_store_setting", f"{setting_file} is not a store setting",
-                      "rewrite it with `capabilities store set`") from exc
-    if not isinstance(data, dict) or data.get("schema") not in SETTING_SCHEMAS:
-        raise DbError("bad_store_setting",
-                      f"{setting_file} is not a {' or '.join(SETTING_SCHEMAS)} setting",
-                      "rewrite it with `capabilities store set`")
-    values = check_setting({k: v for k, v in data.items() if k in SETTING_FIELDS})
-    schema = DEFAULT_SCHEMA
-    if data["schema"] == SETTING_SCHEMA_V2 and data.get(SCHEMA_FIELD) is not None:
-        schema = check_schema_name(data[SCHEMA_FIELD])
-    password = None
-    try:
-        lines = password_file.read_text().splitlines()
-    except FileNotFoundError:
-        lines = []
-    except OSError as exc:
-        raise DbError("store_setting_unreadable",
-                      f"cannot read the store password file {password_file}: {exc}") from exc
-    prefix = PASSWORD_KEY + "="
-    for line in lines:
-        if line.startswith(prefix):
-            password = line[len(prefix):] or None
-    return Setting(schema=schema, source=str(setting_file), password=password, **values)
+    return Setting(schema=schema, level="machine", sources=(str(path),),
+                   password=password or None, **values)

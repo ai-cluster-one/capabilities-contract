@@ -112,8 +112,8 @@ def test_an_unanswering_store_is_refused_within_the_connect_bound(store):
     silent.listen(1)
     port = silent.getsockname()[1]
     try:
-        setting = Setting(source="test", host="127.0.0.1", port=port, database="x",
-                          user="x", sslmode="disable", schema="agentkit")
+        setting = Setting(level="machine", sources=("test",), host="127.0.0.1", port=port,
+                          database="x", user="x", sslmode="disable", schema="agentkit")
         started = time.monotonic()
         with pytest.raises(DbError) as caught:
             connect(application_name="capabilities-contract-tests", setting=setting,

@@ -1,8 +1,10 @@
-"""The setting is read exactly as the manager's store tier reads it."""
+"""Which database a project uses: the project's env files, then the process
+environment, then the machine file, the first level that answers winning whole."""
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -10,101 +12,251 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import write_family_setting, write_setting
+from conftest import write_family_setting
 
-from capabilities_contract.db import DbError, read_setting, setting_files, setting_path
+from capabilities_contract.db import DbError, resolve_setting, setting_path
 
-BASE = {"schema": "capabilities.store.v1", "host": "db.example.test", "port": 5432,
-        "database": "app", "user": "agent", "sslmode": "require"}
-FAMILY = {**BASE, "schema": "agentkit.store.v1", "password": "pw"}
-
-
-def _read(home: Path, document: dict, password: str | None = "pw"):
-    write_setting(home, document, password)
-    return read_setting()
+FAMILY = {"schema": "agentkit.store.v1", "host": "db.example.test", "port": 5432,
+          "database": "app", "user": "agent", "sslmode": "require", "password": "pw"}
+FIELDS = {"AGENTKIT_DB_HOST": "env.example.test", "AGENTKIT_DB_NAME": "envdb",
+          "AGENTKIT_DB_USER": "envuser", "AGENTKIT_DB_PASSWORD": "env-secret"}
 
 
-def _refused(home: Path, document) -> DbError:
-    folder = home / "capabilities"
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / "store.json").write_text(
-        document if isinstance(document, str) else __import__("json").dumps(document))
+def _env_file(root: Path, name: str, keys: dict) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / name
+    path.write_text("".join(f"{k}={v}\n" for k, v in keys.items()))
+    return path
+
+
+def _setenv(monkeypatch, keys: dict) -> None:
+    for key, value in keys.items():
+        monkeypatch.setenv(key, value)
+
+
+def _refused(*args, **kwargs) -> DbError:
     with pytest.raises(DbError) as caught:
-        read_setting()
+        resolve_setting(*args, **kwargs)
     return caught.value
 
 
-# --- accepted -------------------------------------------------------------------
-
-def test_the_files_are_the_managers(clean_env):
-    assert setting_files() == (clean_env / "capabilities" / "store.json",
-                               clean_env / "capabilities" / "credentials.env")
-
-
-def test_a_v1_setting_binds_agentkit_and_reads_the_password(clean_env):
-    s = _read(clean_env, BASE, password="p@ss word")
-    assert (s.host, s.port, s.database, s.user, s.sslmode) == (
-        "db.example.test", 5432, "app", "agent", "require")
-    assert s.schema == "agentkit" and s.password == "p@ss word"
-    assert s.source == str(clean_env / "capabilities" / "store.json")
-    assert "p@ss" not in repr(s)
+@pytest.fixture()
+def project(tmp_path) -> Path:
+    root = tmp_path / "project"
+    root.mkdir()
+    return root
 
 
-def test_the_port_defaults_and_a_digit_string_is_a_port(clean_env):
-    doc = {k: v for k, v in BASE.items() if k != "port"}
-    assert _read(clean_env, doc).port == 5432
-    assert _read(clean_env, {**BASE, "port": "6543"}).port == 6543
+# --- the order -------------------------------------------------------------------
+
+def test_the_project_answers_before_the_environment_and_the_machine(clean_env, project,
+                                                                    monkeypatch):
+    write_family_setting(clean_env, FAMILY)
+    _setenv(monkeypatch, FIELDS)
+    path = _env_file(project, ".env", {**FIELDS, "AGENTKIT_DB_HOST": "project.example.test"})
+    s = resolve_setting(project)
+    assert (s.level, s.sources, s.host) == ("project", (str(path),), "project.example.test")
 
 
-def test_no_password_file_means_no_password(clean_env):
-    assert _read(clean_env, BASE, password=None).password is None
+def test_the_environment_answers_before_the_machine(clean_env, project, monkeypatch):
+    write_family_setting(clean_env, FAMILY)
+    _setenv(monkeypatch, FIELDS)
+    s = resolve_setting(project)
+    assert (s.level, s.host, s.database, s.user, s.password) == (
+        "environment", "env.example.test", "envdb", "envuser", "env-secret")
+    assert set(s.sources) == set(FIELDS)
 
 
-@pytest.mark.parametrize("mode", ["require", "verify-ca", "verify-full"])
-def test_require_and_stronger_are_accepted(clean_env, mode):
-    s = _read(clean_env, {**BASE, "sslmode": mode, "sslrootcert": "/etc/ssl/root.crt"})
-    assert s.sslmode == mode and s.sslrootcert == "/etc/ssl/root.crt"
+def test_the_machine_file_answers_last(clean_env, project):
+    path = write_family_setting(clean_env, FAMILY)
+    s = resolve_setting(project)
+    assert (s.level, s.sources) == ("machine", (str(path),))
+    assert (s.host, s.port, s.database, s.user, s.sslmode, s.password, s.schema) == (
+        "db.example.test", 5432, "app", "agent", "require", "pw", "agentkit")
 
 
-def test_a_v2_setting_names_its_schema(clean_env):
-    doc = {**BASE, "schema": "capabilities.store.v2", "db_schema": "shared_state"}
-    assert _read(clean_env, doc).schema == "shared_state"
+def test_no_project_root_skips_the_project_level(clean_env, project, monkeypatch):
+    _env_file(project, ".env", {**FIELDS, "AGENTKIT_DB_HOST": "project.example.test"})
+    _setenv(monkeypatch, FIELDS)
+    assert resolve_setting(None).level == "environment"
+    monkeypatch.chdir(project)
+    assert resolve_setting(None).level == "environment"
 
 
-def test_a_v2_setting_without_a_schema_binds_agentkit(clean_env):
-    assert _read(clean_env, {**BASE, "schema": "capabilities.store.v2"}).schema == "agentkit"
+def test_env_local_wins_over_env_key_by_key(clean_env, project):
+    env = _env_file(project, ".env", FIELDS)
+    local = _env_file(project, ".env.local", {"AGENTKIT_DB_PASSWORD": "local-secret",
+                                              "OTHER": "x"})
+    s = resolve_setting(project)
+    assert (s.host, s.password) == ("env.example.test", "local-secret")
+    assert set(s.sources) == {str(env), str(local)}
 
 
-def test_a_v1_setting_ignores_unknown_fields_as_the_store_tier_does(clean_env):
-    doc = {**BASE, "db_schema": "elsewhere", "comment": "x"}
-    assert _read(clean_env, doc).schema == "agentkit"
+def test_a_level_is_never_completed_from_a_lower_one(clean_env, project, monkeypatch):
+    write_family_setting(clean_env, FAMILY)
+    _setenv(monkeypatch, FIELDS)
+    _env_file(project, ".env", {"AGENTKIT_DB_SCHEMA": "mine"})
+    err = _refused(project)
+    assert err.slug == "bad_store_setting"
+    assert "project level" in err.message and "host" in err.message
+    monkeypatch.delenv("AGENTKIT_DB_HOST")
+    err = _refused(None)
+    assert "environment level" in err.message and "host" in err.message
 
 
-def test_the_override_wins_over_the_setting(clean_env, monkeypatch):
-    write_setting(clean_env, BASE, "pw")
-    monkeypatch.setenv("CAPABILITIES_STORE_URL", "postgresql://u:secret@h:5/d?sslmode=require")
-    s = read_setting()
-    assert s.source == "CAPABILITIES_STORE_URL" and s.schema == "agentkit"
-    assert s.connect_kwargs() == {"conninfo": "postgresql://u:secret@h:5/d?sslmode=require"}
-    assert "secret" not in repr(s)
+def test_empty_values_and_other_keys_do_not_answer(clean_env, project, monkeypatch):
+    path = write_family_setting(clean_env, FAMILY)
+    _env_file(project, ".env", {"AGENTKIT_DB_URL": "", "DATABASE_URL": "postgresql://x/y"})
+    monkeypatch.setenv("AGENTKIT_DB_HOST", "")
+    assert resolve_setting(project).sources == (str(path),)
 
 
-def test_the_override_wins_with_no_setting(clean_env, monkeypatch):
-    monkeypatch.setenv("CAPABILITIES_STORE_URL", "postgres://h/d")
-    assert read_setting().source == "CAPABILITIES_STORE_URL"
-    assert os.listdir(clean_env) == []
+def test_the_retired_variables_and_files_are_not_read(clean_env, project, monkeypatch):
+    monkeypatch.setenv("AGENTKIT_STORE_URL", "postgresql://a@h/d")
+    monkeypatch.setenv("CAPABILITIES_STORE_URL", "postgresql://c@h/d")
+    monkeypatch.setenv("CAPABILITIES_STORE_PASSWORD", "x")
+    legacy = clean_env / "capabilities"
+    legacy.mkdir()
+    (legacy / "store.json").write_text(json.dumps({**FAMILY, "schema": "capabilities.store.v1"}))
+    (legacy / "credentials.env").write_text("CAPABILITIES_STORE_PASSWORD=pw\n")
+    _env_file(project, ".env", {"CAPABILITIES_STORE_URL": "postgresql://p@h/d"})
+    assert _refused(project).slug == "store_not_configured"
 
 
-def test_an_override_that_is_not_postgres_is_refused(clean_env, monkeypatch):
-    monkeypatch.setenv("CAPABILITIES_STORE_URL", "/var/lib/store.db")
-    with pytest.raises(DbError) as caught:
-        read_setting()
-    assert caught.value.slug == "store_not_postgres"
+def test_an_unknown_agentkit_db_key_in_a_project_file_is_refused(clean_env, project):
+    _env_file(project, ".env", {**FIELDS, "AGENTKIT_DB_HOSTNAME": "x"})
+    err = _refused(project)
+    assert err.slug == "bad_store_setting" and "AGENTKIT_DB_HOSTNAME" in err.message
 
 
-# --- the family file ---------------------------------------------------------------
+def test_the_env_files_parse_as_the_credential_cascade_parses_them(clean_env, project):
+    (project / ".env").write_text(
+        "# comment\n\nexport AGENTKIT_DB_HOST=env.example.test\n"
+        "AGENTKIT_DB_NAME = \"envdb\"\nAGENTKIT_DB_USER='envuser'\nnot a line\n")
+    s = resolve_setting(project)
+    assert (s.host, s.database, s.user) == ("env.example.test", "envdb", "envuser")
 
-def test_the_family_file_is_under_agentkit(clean_env, monkeypatch):
+
+# --- the separate fields ---------------------------------------------------------
+
+def test_fields_take_their_defaults(clean_env, monkeypatch):
+    _setenv(monkeypatch, {k: v for k, v in FIELDS.items() if k != "AGENTKIT_DB_PASSWORD"})
+    s = resolve_setting(None)
+    assert (s.port, s.sslmode, s.schema, s.password, s.sslrootcert) == (
+        5432, "require", "agentkit", None, None)
+    assert s.connect_kwargs() == {"host": "env.example.test", "port": 5432, "dbname": "envdb",
+                                  "user": "envuser", "sslmode": "require"}
+
+
+def test_every_field_is_read(clean_env, monkeypatch):
+    _setenv(monkeypatch, {**FIELDS, "AGENTKIT_DB_PORT": "6543", "AGENTKIT_DB_SCHEMA": "shared",
+                          "AGENTKIT_DB_SSLMODE": "verify-full",
+                          "AGENTKIT_DB_SSLROOTCERT": "/etc/ssl/root.crt"})
+    s = resolve_setting(None)
+    assert (s.port, s.schema, s.sslmode, s.sslrootcert) == (
+        6543, "shared", "verify-full", "/etc/ssl/root.crt")
+    assert s.connect_kwargs()["password"] == "env-secret"
+
+
+@pytest.mark.parametrize("keys,slug", [
+    ({"AGENTKIT_DB_PORT": "54x"}, "bad_store_setting"),
+    ({"AGENTKIT_DB_PORT": "0"}, "bad_store_setting"),
+    ({"AGENTKIT_DB_HOST": "a b"}, "bad_store_setting"),
+    ({"AGENTKIT_DB_SSLMODE": "prefer"}, "sslmode_too_weak"),
+    ({"AGENTKIT_DB_SSLMODE": "disable"}, "sslmode_too_weak"),
+    ({"AGENTKIT_DB_SSLMODE": "verify"}, "bad_store_setting"),
+    ({"AGENTKIT_DB_SCHEMA": "public"}, "bad_schema_name"),
+    ({"AGENTKIT_DB_SCHEMA": "Agent-Kit"}, "bad_schema_name"),
+])
+def test_bad_fields_are_refused_naming_where_they_came_from(clean_env, monkeypatch, keys, slug):
+    _setenv(monkeypatch, {**FIELDS, **keys})
+    err = _refused(None)
+    assert err.slug == slug and err.message.startswith("the environment level (")
+
+
+def test_sslmode_disable_is_admitted_for_a_local_host(clean_env, monkeypatch):
+    _setenv(monkeypatch, {**FIELDS, "AGENTKIT_DB_HOST": "localhost",
+                          "AGENTKIT_DB_SSLMODE": "disable"})
+    assert resolve_setting(None).sslmode == "disable"
+
+
+# --- the URL ---------------------------------------------------------------------
+
+def test_the_url_wins_within_its_level_and_the_schema_applies_beside_it(clean_env, project):
+    url = "postgresql://u:secret@db.example.test:6543/d?sslmode=verify-full"
+    path = _env_file(project, ".env.local", {**FIELDS, "AGENTKIT_DB_URL": url,
+                                             "AGENTKIT_DB_SCHEMA": "shared"})
+    s = resolve_setting(project)
+    assert (s.url, s.schema, s.host, s.password) == (url, "shared", None, None)
+    assert s.sources == (str(path),)
+    assert s.connect_kwargs() == {"conninfo": url}
+
+
+def test_a_url_in_one_file_ignores_the_fields_of_the_other(clean_env, project):
+    _env_file(project, ".env", {**FIELDS, "AGENTKIT_DB_SCHEMA": "shared"})
+    local = _env_file(project, ".env.local", {"AGENTKIT_DB_URL": "postgresql://u@h/d"})
+    s = resolve_setting(project)
+    assert s.url == "postgresql://u@h/d" and s.schema == "shared"
+    assert s.sources[0] == str(local) and len(s.sources) == 2
+
+
+def test_a_url_without_a_schema_binds_agentkit(clean_env, monkeypatch):
+    monkeypatch.setenv("AGENTKIT_DB_URL", "postgres://u@h/d")
+    s = resolve_setting(None)
+    assert (s.schema, s.level, s.sources) == ("agentkit", "environment", ("AGENTKIT_DB_URL",))
+
+
+def test_a_url_naming_no_sslmode_is_given_require(clean_env, monkeypatch):
+    monkeypatch.setenv("AGENTKIT_DB_URL", "postgresql://u@h/d")
+    assert resolve_setting(None).connect_kwargs() == {"conninfo": "postgresql://u@h/d",
+                                                      "sslmode": "require"}
+
+
+@pytest.mark.parametrize("url,slug", [
+    ("sqlite:///x.db", "store_not_postgres"),
+    ("/var/lib/store.db", "store_not_postgres"),
+    ("postgresql://u@db.example.test/d?sslmode=disable", "sslmode_too_weak"),
+    ("postgresql://u@localhost/d?sslmode=prefer", "sslmode_too_weak"),
+])
+def test_a_bad_url_is_refused(clean_env, monkeypatch, url, slug):
+    monkeypatch.setenv("AGENTKIT_DB_URL", url)
+    err = _refused(None)
+    assert err.slug == slug and "AGENTKIT_DB_URL" in err.message
+
+
+@pytest.mark.parametrize("url", ["postgresql://u@localhost/d?sslmode=disable",
+                                 "postgresql://u@127.0.0.1:5/d?sslmode=disable",
+                                 "postgresql:///d?host=/var/run/postgresql&sslmode=disable",
+                                 "postgresql:///d?sslmode=disable"])
+def test_a_url_to_a_local_host_may_disable_tls(clean_env, monkeypatch, url):
+    monkeypatch.setenv("AGENTKIT_DB_URL", url)
+    assert resolve_setting(None).url == url
+
+
+# --- the report ------------------------------------------------------------------
+
+def test_the_report_names_the_level_and_sources_and_redacts_secrets(clean_env, project,
+                                                                    monkeypatch):
+    url = "postgresql://u:hunter22@h/d?sslmode=require&password=hunter22"
+    monkeypatch.setenv("AGENTKIT_DB_URL", url)
+    s = resolve_setting(project)
+    report = s.report()
+    assert report == {"level": "environment", "sources": ["AGENTKIT_DB_URL"],
+                      "schema": "agentkit",
+                      "url": "postgresql://u:***@h/d?sslmode=require&password=***"}
+    assert "hunter22" not in repr(s) and "hunter22" not in json.dumps(report)
+    monkeypatch.delenv("AGENTKIT_DB_URL")
+    path = write_family_setting(clean_env, FAMILY)
+    report = resolve_setting(project).report()
+    assert report == {"level": "machine", "sources": [str(path)], "schema": "agentkit",
+                      "host": "db.example.test", "port": 5432, "database": "app",
+                      "user": "agent", "sslmode": "require", "sslrootcert": None,
+                      "password": "***"}
+
+
+# --- the machine file ------------------------------------------------------------
+
+def test_the_machine_file_is_under_agentkit(clean_env, monkeypatch):
     assert setting_path() == clean_env / "agentkit" / "store.json"
     monkeypatch.delenv("XDG_CONFIG_HOME")
     monkeypatch.setenv("HOME", str(clean_env / "home"))
@@ -112,59 +264,18 @@ def test_the_family_file_is_under_agentkit(clean_env, monkeypatch):
     assert setting_path().is_absolute()
 
 
-def test_the_family_file_is_read_with_its_password(clean_env):
-    path = write_family_setting(clean_env, {**FAMILY, "password": "p@ss word"})
-    s = read_setting()
-    assert (s.host, s.port, s.database, s.user, s.sslmode) == (
-        "db.example.test", 5432, "app", "agent", "require")
-    assert s.schema == "agentkit" and s.password == "p@ss word"
-    assert s.source == str(path)
-    assert "p@ss" not in repr(s)
-
-
-def test_the_family_file_names_its_schema_and_may_carry_no_password(clean_env):
+def test_the_machine_file_names_its_schema_and_may_carry_no_password(clean_env):
     doc = {k: v for k, v in FAMILY.items() if k != "password"}
-    write_family_setting(clean_env, {**doc, "db_schema": "shared_state"})
-    s = read_setting()
-    assert s.schema == "shared_state" and s.password is None
-
-
-def test_the_family_file_wins_over_the_legacy_pair(clean_env):
-    write_setting(clean_env, {**BASE, "host": "legacy.example.test"}, "old")
-    path = write_family_setting(clean_env, FAMILY)
-    s = read_setting()
-    assert s.host == "db.example.test" and s.password == "pw" and s.source == str(path)
-
-
-def test_the_legacy_pair_is_read_while_the_family_file_is_absent(clean_env):
-    write_setting(clean_env, BASE, "old")
-    s = read_setting()
-    assert s.password == "old"
-    assert s.source == str(clean_env / "capabilities" / "store.json")
-
-
-def test_agentkit_store_url_wins_over_capabilities_store_url(clean_env, monkeypatch):
-    write_family_setting(clean_env, FAMILY)
-    monkeypatch.setenv("CAPABILITIES_STORE_URL", "postgresql://c@h/d")
-    assert read_setting().source == "CAPABILITIES_STORE_URL"
-    monkeypatch.setenv("AGENTKIT_STORE_URL", "postgresql://a@h/d")
-    s = read_setting()
-    assert s.source == "AGENTKIT_STORE_URL" and s.schema == "agentkit"
-    assert s.connect_kwargs() == {"conninfo": "postgresql://a@h/d"}
-
-
-def test_an_agentkit_store_url_that_is_not_postgres_is_refused(clean_env, monkeypatch):
-    monkeypatch.setenv("AGENTKIT_STORE_URL", "sqlite:///x.db")
-    with pytest.raises(DbError) as caught:
-        read_setting()
-    assert caught.value.slug == "store_not_postgres"
-    assert "AGENTKIT_STORE_URL" in caught.value.message
+    write_family_setting(clean_env, {**doc, "db_schema": "shared_state", "port": "6543"})
+    s = resolve_setting(None)
+    assert (s.schema, s.password, s.port) == ("shared_state", None, 6543)
+    assert "pw" not in repr(resolve_setting(None))
 
 
 @pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "::1", "/var/run/postgresql"])
-def test_sslmode_disable_is_admitted_for_a_local_host(clean_env, host):
+def test_sslmode_disable_is_admitted_in_the_file_for_a_local_host(clean_env, host):
     write_family_setting(clean_env, {**FAMILY, "host": host, "sslmode": "disable"})
-    s = read_setting()
+    s = resolve_setting(None)
     assert s.host == host and s.sslmode == "disable"
 
 
@@ -174,89 +285,50 @@ def test_sslmode_disable_is_admitted_for_a_local_host(clean_env, host):
                                        ("localhost", "allow")])
 def test_plain_text_is_refused_elsewhere_and_allow_prefer_everywhere(clean_env, host, mode):
     write_family_setting(clean_env, {**FAMILY, "host": host, "sslmode": mode})
-    with pytest.raises(DbError) as caught:
-        read_setting()
-    assert caught.value.slug == "sslmode_too_weak"
+    assert _refused(None).slug == "sslmode_too_weak"
 
 
-def test_a_newer_family_version_is_refused_and_not_read_past(clean_env):
-    write_setting(clean_env, BASE, "old")
+def test_a_newer_machine_file_version_is_refused(clean_env):
     write_family_setting(clean_env, {**FAMILY, "schema": "agentkit.store.v2", "extra": 1})
-    with pytest.raises(DbError) as caught:
-        read_setting()
-    assert caught.value.slug == "store_setting_too_new"
-    assert "update" in caught.value.hint
+    err = _refused(None)
+    assert err.slug == "store_setting_too_new" and "update" in err.hint
 
 
 @pytest.mark.parametrize("document", [
     {**FAMILY, "at": "2026-10-08T00:00:00Z"},
     {**FAMILY, "schema": "capabilities.store.v1"},
     {k: v for k, v in FAMILY.items() if k != "schema"},
+    {k: v for k, v in FAMILY.items() if k != "sslmode"},
     {**FAMILY, "password": 5},
     {**FAMILY, "password": "a\nb"},
     {**FAMILY, "db_schema": "public"},
+    {**FAMILY, "db_schema": "pg_catalog"},
     {k: v for k, v in FAMILY.items() if k != "host"},
+    {**FAMILY, "port": True},
+    {**FAMILY, "port": 70000},
+    {**FAMILY, "sslrootcert": ""},
     "not json",
     [1],
 ])
-def test_a_malformed_family_file_is_refused(clean_env, document):
+def test_a_malformed_machine_file_is_refused(clean_env, document):
     write_family_setting(clean_env, document)
-    with pytest.raises(DbError) as caught:
-        read_setting()
-    assert caught.value.slug in ("bad_store_setting", "bad_schema_name"), caught.value
+    assert _refused(None).slug in ("bad_store_setting", "bad_schema_name")
 
 
-# --- refused --------------------------------------------------------------------
+# --- not configured --------------------------------------------------------------
 
-@pytest.mark.parametrize("mode", ["disable", "allow", "prefer"])
-def test_an_sslmode_below_require_is_refused(clean_env, mode):
-    err = _refused(clean_env, {**BASE, "sslmode": mode})
-    assert err.slug == "sslmode_too_weak" and "require" in err.hint
-
-
-@pytest.mark.parametrize("document", [
-    {k: v for k, v in BASE.items() if k != "sslmode"},
-    {**BASE, "sslmode": "verify"},
-    {**BASE, "host": "db example"},
-    {**BASE, "host": ""},
-    {k: v for k, v in BASE.items() if k != "user"},
-    {**BASE, "database": 5},
-    {**BASE, "port": 0},
-    {**BASE, "port": 70000},
-    {**BASE, "port": True},
-    {**BASE, "port": "54x"},
-    {**BASE, "sslrootcert": ""},
-    {**BASE, "sslrootcert": "a\nb"},
-    {**BASE, "schema": "capabilities.store.v3"},
-    {k: v for k, v in BASE.items() if k != "schema"},
-    [1, 2],
-    "not json",
-    {**BASE, "schema": "capabilities.store.v2", "db_schema": "public"},
-    {**BASE, "schema": "capabilities.store.v2", "db_schema": "pg_catalog"},
-    {**BASE, "schema": "capabilities.store.v2", "db_schema": "Agent-Kit"},
-    {**BASE, "schema": "capabilities.store.v2", "db_schema": 7},
-])
-def test_a_malformed_setting_is_refused(clean_env, document):
-    err = _refused(clean_env, document)
-    assert err.slug in ("bad_store_setting", "bad_schema_name"), err
-
-
-# --- not configured (C3) ---------------------------------------------------------
-
-def test_no_setting_and_no_override_is_store_not_configured_and_creates_nothing(clean_env):
-    with pytest.raises(DbError) as caught:
-        read_setting()
-    err = caught.value
+def test_nothing_configured_is_store_not_configured_and_creates_nothing(clean_env, project):
+    err = _refused(project)
     assert err.slug == "store_not_configured"
-    assert err.message == "this machine has no store setting"
-    assert err.hint == "run capabilities store set"
-    assert list(clean_env.rglob("*")) == []
+    assert "AGENTKIT_DB_URL" in err.hint and "capabilities store set" in err.hint
+    assert list(clean_env.rglob("*")) == [] and list(project.rglob("*")) == []
 
 
-def test_connect_without_a_setting_is_store_not_configured_and_creates_nothing(clean_env):
+def test_connect_without_a_setting_is_store_not_configured_and_creates_nothing(clean_env,
+                                                                              project):
     from capabilities_contract.db import connect
     with pytest.raises(DbError) as caught:
-        connect(application_name="test")
+        connect(application_name="test", project_root=project)
     assert caught.value.slug == "store_not_configured"
     assert list(clean_env.rglob("*")) == []
 
@@ -266,22 +338,6 @@ def test_connect_without_a_setting_is_store_not_configured_and_creates_nothing(c
 # The manager's own store tier (its contract/store.py), named explicitly; without it
 # the parity tests skip.
 STORE_TIER_ENV = "CAPABILITIES_STORE_TIER"
-
-PARITY_CASES = [
-    BASE,
-    {**BASE, "port": "6543", "sslmode": "verify-full", "sslrootcert": "system"},
-    {k: v for k, v in BASE.items() if k != "port"},
-    {**BASE, "extra": 1},
-    {**BASE, "sslmode": "prefer"},
-    {**BASE, "sslmode": "disable"},
-    {**BASE, "sslmode": "nope"},
-    {**BASE, "host": "a b"},
-    {**BASE, "port": 0},
-    {**BASE, "port": True},
-    {**BASE, "sslrootcert": "x\ny"},
-    {k: v for k, v in BASE.items() if k != "database"},
-    {**BASE, "schema": "other"},
-]
 
 
 @pytest.fixture(scope="module")
@@ -316,7 +372,10 @@ FAMILY_PARITY_CASES = [
 
 
 @pytest.mark.parametrize("document", FAMILY_PARITY_CASES)
-def test_the_family_file_reads_as_the_store_tier_reads_it(tier, clean_env, document):
+def test_the_machine_file_reads_as_the_store_tier_reads_it(tier, clean_env, monkeypatch,
+                                                           document):
+    for name in ("AGENTKIT_STORE_URL", "CAPABILITIES_STORE_URL"):
+        monkeypatch.delenv(name, raising=False)
     write_family_setting(clean_env, document)
     try:
         theirs = tier.read_store_setting()
@@ -324,7 +383,7 @@ def test_the_family_file_reads_as_the_store_tier_reads_it(tier, clean_env, docum
     except tier.StoreError as exc:
         theirs, their_error = None, exc.slug
     try:
-        ours = read_setting()
+        ours = resolve_setting(None)
         our_error = None
     except DbError as exc:
         ours, our_error = None, exc.slug
@@ -335,36 +394,10 @@ def test_the_family_file_reads_as_the_store_tier_reads_it(tier, clean_env, docum
         assert ours.schema == theirs["db_schema"]
 
 
-@pytest.mark.parametrize("document", PARITY_CASES)
-def test_the_setting_reads_as_the_store_tier_reads_it(tier, clean_env, document):
-    write_setting(clean_env, document, "pw")
-    try:
-        theirs = tier.read_store_setting()
-        their_error = None
-    except tier.StoreError as exc:
-        theirs, their_error = None, exc.slug
-    try:
-        ours = read_setting()
-        our_error = None
-    except DbError as exc:
-        ours, our_error = None, exc.slug
-    assert our_error == their_error
-    if theirs is not None:
-        assert {k: getattr(ours, k) for k in theirs} == theirs
-
-
-def test_the_store_tier_refuses_a_v2_setting(tier, clean_env):
-    """Why a schema field needs a new setting id: today's readers refuse it."""
-    write_setting(clean_env, {**BASE, "schema": "capabilities.store.v2", "db_schema": "x"})
-    with pytest.raises(tier.StoreError):
-        tier.read_store_setting()
-    assert read_setting().schema == "x"
-
-
 def test_import_does_not_load_the_driver():
-    """C5: a fresh interpreter importing the module leaves psycopg unloaded."""
+    """A fresh interpreter importing the module leaves psycopg unloaded."""
     code = ("import sys, capabilities_contract.db as db; "
-            "assert db.connect and db.migrate; "
+            "assert db.connect and db.migrate and db.resolve_setting; "
             "print('psycopg' in sys.modules, any(m.startswith('psycopg') for m in sys.modules))")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          check=True).stdout.split()

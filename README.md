@@ -1,6 +1,6 @@
 # capabilities-contract
 
-The capabilities contract as a Python library. Its first part, `capabilities_contract.db`, is the one way the capabilities manager, its capabilities and ContextKit reach the shared Postgres database: read the machine's store setting, connect bound to its schema, migrate each owner's tables once under a ledger, and report where they stand. It does nothing else: no SQLite, no project registry, no records.
+The capabilities contract as a Python library. Its first part, `capabilities_contract.db`, is the one way the capabilities manager, its capabilities and ContextKit reach the shared PostgreSQL database: resolve which database a project uses, connect bound to its schema, migrate each owner's tables once under a ledger, and report where they stand. It does nothing else: no SQLite, no project registry, no records.
 
 ## Install
 
@@ -12,23 +12,35 @@ Its one dependency is `psycopg[binary]>=3.2,<4`, imported lazily: `import capabi
 
 ```python
 # /// script
-# dependencies = ["capabilities-contract==0.3.0"]
+# dependencies = ["capabilities-contract==0.4.0"]
 # ///
 ```
 
-## The store setting
+## Which database
 
-`read_setting()` returns the store in force as a `Setting`, reading and never writing. `AGENTKIT_STORE_URL`, when set, wins, then `CAPABILITIES_STORE_URL`; either must be a `postgresql://` URL and binds the schema `agentkit`. Otherwise it reads the machine's store setting, the one file the family of tools shares: `$XDG_CONFIG_HOME/agentkit/store.json`, or `~/.config/agentkit/store.json` when `XDG_CONFIG_HOME` is unset, an `agentkit.store.v1` document whose format is the capabilities package's [SHEBANG.md, "The store setting"](https://github.com/ai-cluster-one/capabilities/blob/main/SHEBANG.md#the-store-setting). `setting_path()` gives that file's absolute path, and `Setting.source` names the override or the absolute path the setting was read from. A file of a newer `agentkit.store.*` version is refused as `store_setting_too_new`. While the file is absent, it reads the legacy pair `capabilities store set` wrote before: the non-secret values in `$XDG_CONFIG_HOME/capabilities/store.json` (`capabilities.store.v1`, binding `agentkit`, or `capabilities.store.v2`, which may name `db_schema`) and the password as `CAPABILITIES_STORE_PASSWORD` in `$XDG_CONFIG_HOME/capabilities/credentials.env`; `setting_files()` gives those two paths. The checks are the manager's: `host`, `database`, `user` with no whitespace, `port` 1-65535 (default 5432), `sslmode` one of `require`, `verify-ca`, `verify-full`, or `disable` for a local host (`localhost`, a loopback address or a Unix socket directory); `disable` elsewhere, `allow` and `prefer` are refused as `sslmode_too_weak`; and an optional `sslrootcert`. With neither a setting nor an override, it raises `DbError("store_not_configured", ..., "run capabilities store set")`.
+`resolve_setting(project_root)` returns the database setting in force for a process standing in that project, as a `Setting`, reading and never writing. It asks three levels in order, and the first that answers is used whole, never completed from a lower level:
+
+1. `project` - the `AGENTKIT_DB_*` keys in the project's `.env.local` and `.env`, `.env.local` winning key by key;
+2. `environment` - the same keys in the process environment;
+3. `machine` - the machine's store setting file, `$XDG_CONFIG_HOME/agentkit/store.json`, or `~/.config/agentkit/store.json` when `XDG_CONFIG_HOME` is unset, an `agentkit.store.v1` document whose format is the capabilities package's [SHEBANG.md, "The store setting"](https://github.com/ai-cluster-one/capabilities/blob/main/SHEBANG.md#the-store-setting). `setting_path()` gives its absolute path.
+
+A level answers when it sets any `AGENTKIT_DB_*` key to a non-empty value, or, for the machine level, when the file exists. `project_root=None` means the process stands in no project, and the project level is not asked.
+
+The keys (`KEYS`): `AGENTKIT_DB_URL`, `AGENTKIT_DB_HOST`, `AGENTKIT_DB_PORT` (default 5432), `AGENTKIT_DB_NAME`, `AGENTKIT_DB_USER`, `AGENTKIT_DB_PASSWORD`, `AGENTKIT_DB_SCHEMA` (default `agentkit`), `AGENTKIT_DB_SSLMODE` (default `require`), `AGENTKIT_DB_SSLROOTCERT`. Within one level `AGENTKIT_DB_URL` wins and that level's other keys are ignored, except `AGENTKIT_DB_SCHEMA`, which applies beside a URL. A URL is a `postgresql://` or `postgres://` URL; one that names no `sslmode` is connected with `require`. A project file setting a key with the prefix that is not one of these is refused.
+
+The checks are the same at every level: `host`, `database` and `user` with no whitespace, `port` 1-65535, `sslmode` one of `require`, `verify-ca`, `verify-full`, or `disable` for a local host (`localhost`, a loopback address or a Unix socket directory, which is also what a URL naming no host reaches); `disable` elsewhere, `allow` and `prefer` are refused as `sslmode_too_weak`; a schema is a lowercase identifier and never `public`, `information_schema` or `pg_*`. A refusal from the project or environment level names the level and the files or variables it read. A machine file of a newer `agentkit.store.*` version is refused as `store_setting_too_new`. With no level answering it raises `DbError("store_not_configured", ...)` with a hint naming the keys and `capabilities store set`.
+
+`Setting.level` names the level that answered (`LEVELS`), and `Setting.sources` every file, as an absolute path, or variable that supplied a value in force. `Setting.report()` gives the whole setting for a status or doctor surface with the password, in a URL's authority or query or as a field, replaced by `***`; the repr never shows the password or the URL.
 
 ## Connect
 
 ```python
 from capabilities_contract.db import DbError, Step, connect, migrate
 
-conn = connect(application_name="automations")
+conn = connect(application_name="automations", project_root=root)
 ```
 
-`connect(*, application_name, setting=None, connect_timeout=10)` returns a psycopg 3 connection whose `search_path` is the configured schema alone, never `public`, so unqualified names land in that schema. The schema need not exist yet: `migrate` creates it. Pass `setting=` to use a `Setting` other than the machine's. A store that does not answer within `connect_timeout` seconds (`CONNECT_TIMEOUT_SECONDS`) is refused as `store_unreachable`. Both ends of the connection send TCP keepalives - after 30 seconds idle, every 10 seconds, giving up after 3 unanswered probes - so the store drops a client that died without closing and the client learns of a store that went away.
+`connect(*, application_name, project_root=None, setting=None, connect_timeout=10)` returns a psycopg 3 connection to the database `resolve_setting(project_root)` names, or to `setting` when one is passed, whose `search_path` is that setting's schema alone, never `public`, so unqualified names land in that schema. The schema need not exist yet: `migrate` creates it, in the schema the connection is bound to. A store that does not answer within `connect_timeout` seconds (`CONNECT_TIMEOUT_SECONDS`) is refused as `store_unreachable`. Both ends of the connection send TCP keepalives - after 30 seconds idle, every 10 seconds, giving up after 3 unanswered probes - so the store drops a client that died without closing and the client learns of a store that went away.
 
 ## Migrate
 
@@ -69,4 +81,4 @@ uv venv && uv pip install -e ".[dev]"
 uv run pytest
 ```
 
-The suite starts a throwaway PostgreSQL cluster with TLS under a temporary directory (`initdb` and `pg_ctl` on `PATH`, or in `$PG_BIN`) on a random port. Set `CAPABILITIES_CONTRACT_TEST_URL` to a TLS-enabled server's admin URL to run it against that server instead, as CI does. The tests that compare the setting reader with the manager's own run only when `CAPABILITIES_STORE_TIER` names the manager's `contract/store.py`; otherwise they skip.
+The suite starts a throwaway PostgreSQL cluster with TLS under a temporary directory (`initdb` and `pg_ctl` on `PATH`, or in `$PG_BIN`) on a random port. Set `CAPABILITIES_CONTRACT_TEST_URL` to a TLS-enabled server's admin URL to run it against that server instead, as CI does. The tests that compare the machine file reader with the manager's own run only when `CAPABILITIES_STORE_TIER` names the manager's `contract/store.py`; otherwise they skip.

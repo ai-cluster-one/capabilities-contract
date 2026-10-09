@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 import textwrap
@@ -11,8 +10,9 @@ import time
 
 import psycopg
 import pytest
+from conftest import child_env
 
-from capabilities_contract.db import DbError, Step, connect, migrate, read_setting
+from capabilities_contract.db import DbError, Step, connect, migrate, resolve_setting
 from capabilities_contract.version import __version__
 
 
@@ -55,8 +55,8 @@ def test_connect_binds_the_configured_schema_never_public(store):
                            "WHERE pid = pg_backend_pid()") == [("capabilities-contract-tests",)]
 
 
-def test_a_v1_setting_binds_agentkit(store):
-    store.write(schema="capabilities.store.v1", db_schema=None)
+def test_a_machine_file_naming_no_schema_binds_agentkit(store):
+    store.write(db_schema=None)
     with _connect() as conn:
         assert _rows(conn, "SHOW search_path") == [("agentkit",)]
 
@@ -90,17 +90,72 @@ def test_verify_full_refuses_a_certificate_it_cannot_verify(store, tmp_path):
 
 
 def test_plain_text_is_refused_by_the_server_and_the_password_is_not_shown(store, monkeypatch):
-    s = store.server
-    password = s.password or ""
-    from urllib.parse import quote
-    monkeypatch.setenv("CAPABILITIES_STORE_URL",
-                       f"postgresql://{quote(s.user)}:{quote(password, safe='')}@{s.host}:"
-                       f"{s.port}/{s.database}?sslmode=disable")
+    password = store.server.password or ""
+    monkeypatch.setenv("AGENTKIT_DB_URL", store.url(sslmode="disable"))
     with pytest.raises(DbError) as caught:
         _connect()
     assert caught.value.slug == "store_unreachable"
     if password:
         assert password not in str(caught.value)
+
+
+# --- each level of the cascade reaches the database ----------------------------
+
+def _bound(conn):
+    return _rows(conn, "SHOW search_path")[0][0], _rows(
+        conn, "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")[0][0]
+
+
+def _env_file(root, name, keys):
+    root.mkdir(parents=True, exist_ok=True)
+    (root / name).write_text("".join(f"{k}={v}\n" for k, v in keys.items()))
+
+
+def test_the_project_files_reach_the_database(store, tmp_path):
+    store.write(host="machine.invalid")  # the machine file would fail if it were read
+    project = tmp_path / "project"
+    _env_file(project, ".env", store.keys(AGENTKIT_DB_PASSWORD="wrong"))
+    _env_file(project, ".env.local", {"AGENTKIT_DB_PASSWORD": store.server.password or ""})
+    with connect(application_name="t", project_root=project) as conn:
+        assert _bound(conn) == (store.schema, True)
+
+
+def test_a_project_url_reaches_the_database_and_binds_its_schema(store, tmp_path):
+    store.write(host="machine.invalid")
+    project = tmp_path / "project"
+    _env_file(project, ".env.local", {"AGENTKIT_DB_URL": store.url(),
+                                      "AGENTKIT_DB_SCHEMA": store.schema,
+                                      "AGENTKIT_DB_HOST": "ignored.invalid"})
+    with connect(application_name="t", project_root=project) as conn:
+        assert _bound(conn) == (store.schema, True)
+
+
+def test_the_environment_fields_reach_the_database(store, monkeypatch, tmp_path):
+    store.write(host="machine.invalid")
+    for key, value in store.keys().items():
+        monkeypatch.setenv(key, value)
+    with connect(application_name="t", project_root=tmp_path / "no-env-files") as conn:
+        assert _bound(conn) == (store.schema, True)
+
+
+def test_an_environment_url_reaches_the_database_with_tls_by_default(store, monkeypatch):
+    store.write(host="machine.invalid")
+    url = store.url()
+    monkeypatch.setenv("AGENTKIT_DB_URL", url.replace("sslmode=require", "application_name=x"))
+    monkeypatch.setenv("AGENTKIT_DB_SCHEMA", store.schema)
+    with connect(application_name="t", project_root=None) as conn:
+        assert _bound(conn) == (store.schema, True)
+
+
+def test_a_url_without_a_schema_binds_agentkit(store, monkeypatch):
+    monkeypatch.setenv("AGENTKIT_DB_URL", store.url())
+    with connect(application_name="t") as conn:
+        assert _bound(conn) == ("agentkit", True)
+
+
+def test_the_machine_file_reaches_the_database(store, tmp_path):
+    with connect(application_name="t", project_root=tmp_path) as conn:
+        assert _bound(conn) == (store.schema, True)
 
 
 # --- migrate (C6) ----------------------------------------------------------------
@@ -210,9 +265,7 @@ def test_two_processes_migrating_one_owner_apply_each_step_exactly_once(store, t
     script = tmp_path / "worker.py"
     script.write_text(CONCURRENT)
     go = tmp_path / "go"
-    env = {**os.environ, "XDG_CONFIG_HOME": str(store.config_home)}
-    env.pop("CAPABILITIES_STORE_URL", None)
-    env.pop("AGENTKIT_STORE_URL", None)
+    env = child_env(store.config_home)
     procs = [subprocess.Popen([sys.executable, str(script), str(i), str(go)], env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
              for i in range(2)]
@@ -343,4 +396,4 @@ def test_skew_previous_minor_works_and_previous_major_refuses(store):
 
 
 def test_setting_in_force_is_the_fixture(store):
-    assert read_setting().schema == store.schema
+    assert resolve_setting(None).schema == store.schema

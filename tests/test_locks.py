@@ -7,7 +7,6 @@ waits without bound fails the case by its timeout instead of hanging the suite.
 from __future__ import annotations
 
 import json
-import os
 import signal
 import subprocess
 import sys
@@ -15,6 +14,7 @@ import textwrap
 import time
 
 import pytest
+from conftest import child_env
 
 from capabilities_contract.db import connect, migrate
 
@@ -46,9 +46,7 @@ CALLER = textwrap.dedent("""
 def caller(store, tmp_path):
     script = tmp_path / "caller.py"
     script.write_text(CALLER)
-    env = {**os.environ, "XDG_CONFIG_HOME": str(store.config_home)}
-    env.pop("CAPABILITIES_STORE_URL", None)
-    env.pop("AGENTKIT_STORE_URL", None)
+    env = child_env(store.config_home)
 
     def start(app: str, steps=STEPS, **args) -> subprocess.Popen:
         payload = json.dumps({"app": app, "steps": steps, **args})

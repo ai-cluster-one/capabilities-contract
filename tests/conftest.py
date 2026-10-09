@@ -1,4 +1,4 @@
-"""A throwaway PostgreSQL with TLS, and a machine store setting that points at it.
+"""A throwaway PostgreSQL with TLS, and a machine store setting file that points at it.
 
 By default the suite runs `initdb` in a temporary directory, turns TLS on with a
 self-signed certificate made here, refuses plain text in pg_hba.conf, and starts the
@@ -19,7 +19,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlencode, urlparse
 
 import pytest
 
@@ -143,14 +143,6 @@ def write_family_setting(config_home: Path, document) -> Path:
     return path
 
 
-def write_setting(config_home: Path, document: dict, password: str | None = None) -> None:
-    folder = config_home / "capabilities"
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / "store.json").write_text(json.dumps(document))
-    if password is not None:
-        (folder / "credentials.env").write_text(f"CAPABILITIES_STORE_PASSWORD={password}\n")
-
-
 @dataclass
 class Store:
     config_home: Path
@@ -158,24 +150,50 @@ class Store:
     server: Server
 
     def document(self, **overrides) -> dict:
-        doc = {"schema": "capabilities.store.v2", "host": self.server.host,
+        doc = {"schema": "agentkit.store.v1", "host": self.server.host,
                "port": self.server.port, "database": self.server.database,
-               "user": self.server.user, "sslmode": "require", "db_schema": self.schema}
+               "user": self.server.user, "password": self.server.password,
+               "sslmode": "require", "db_schema": self.schema}
         doc.update(overrides)
         return {k: v for k, v in doc.items() if v is not None}
 
     def write(self, **overrides) -> None:
-        write_setting(self.config_home, self.document(**overrides), self.server.password)
+        write_family_setting(self.config_home, self.document(**overrides))
+
+    def keys(self, **overrides) -> dict:
+        """The same database as AGENTKIT_DB_* fields."""
+        keys = {"AGENTKIT_DB_HOST": self.server.host, "AGENTKIT_DB_PORT": str(self.server.port),
+                "AGENTKIT_DB_NAME": self.server.database, "AGENTKIT_DB_USER": self.server.user,
+                "AGENTKIT_DB_PASSWORD": self.server.password, "AGENTKIT_DB_SCHEMA": self.schema}
+        keys.update(overrides)
+        return {k: v for k, v in keys.items() if v is not None}
+
+    def url(self, **query) -> str:
+        """The same database as an AGENTKIT_DB_URL, the password quoted."""
+        s = self.server
+        auth = quote(s.user, safe="")
+        if s.password:
+            auth += ":" + quote(s.password, safe="")
+        params = urlencode({"sslmode": "require", **query})
+        return f"postgresql://{auth}@{s.host}:{s.port}/{s.database}?{params}"
+
+
+def child_env(config_home: Path) -> dict:
+    """The environment for a child process: this one with the config home set and no
+    AGENTKIT_DB_* key, so the child resolves the machine file."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AGENTKIT_DB_")}
+    env["XDG_CONFIG_HOME"] = str(config_home)
+    return env
 
 
 @pytest.fixture()
 def clean_env(tmp_path, monkeypatch):
-    """An empty XDG_CONFIG_HOME and no URL override."""
+    """An empty XDG_CONFIG_HOME and no AGENTKIT_DB_* key in the environment."""
     home = tmp_path / "config"
     home.mkdir()
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home))
-    monkeypatch.delenv("CAPABILITIES_STORE_URL", raising=False)
-    monkeypatch.delenv("AGENTKIT_STORE_URL", raising=False)
+    for key in [k for k in os.environ if k.startswith("AGENTKIT_DB_")]:
+        monkeypatch.delenv(key)
     return home
 
 
