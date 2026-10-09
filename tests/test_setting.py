@@ -6,15 +6,17 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 from conftest import write_family_setting
 
-from capabilities_contract.db import DbError, resolve_setting, setting_path
+from capabilities_contract.db import DbError, Setting, resolve_setting, setting_path
 
 FAMILY = {"schema": "agentkit.store.v1", "host": "db.example.test", "port": 5432,
           "database": "app", "user": "agent", "sslmode": "require", "password": "pw"}
@@ -237,14 +239,15 @@ def test_a_url_to_a_local_host_may_disable_tls(clean_env, monkeypatch, url):
 
 def test_the_report_names_the_level_and_sources_and_redacts_secrets(clean_env, project,
                                                                     monkeypatch):
-    url = "postgresql://u:hunter22@h/d?sslmode=require&password=hunter22"
+    url = "postgresql://u:hunter22@h/d?sslmode=require&sslpassword=hunter23"
     monkeypatch.setenv("AGENTKIT_DB_URL", url)
     s = resolve_setting(project)
     report = s.report()
     assert report == {"level": "environment", "sources": ["AGENTKIT_DB_URL"],
                       "schema": "agentkit",
-                      "url": "postgresql://u:***@h/d?sslmode=require&password=***"}
-    assert "hunter22" not in repr(s) and "hunter22" not in json.dumps(report)
+                      "url": {"user": "u", "password": "***", "host": "h", "dbname": "d",
+                              "sslmode": "require", "sslpassword": "***"}}
+    assert "hunter2" not in repr(s) and "hunter2" not in json.dumps(report)
     monkeypatch.delenv("AGENTKIT_DB_URL")
     path = write_family_setting(clean_env, FAMILY)
     report = resolve_setting(project).report()
@@ -254,37 +257,110 @@ def test_the_report_names_the_level_and_sources_and_redacts_secrets(clean_env, p
                       "password": "***"}
 
 
-@pytest.mark.parametrize("query, shown", [
-    ("sslpassword=KEYPASS", "sslpassword=***"),
-    ("pass%77ord=ENCPASS", "pass%77ord=***"),
-    ("ssl%70assword=ENCKEY&sslmode=require", "ssl%70assword=***&sslmode=require"),
-    ("sslmode=require&PASSWORD=UPPER", "sslmode=require&PASSWORD=***"),
-])
-def test_the_report_redacts_every_secret_query_parameter(clean_env, monkeypatch, query, shown):
-    monkeypatch.setenv("AGENTKIT_DB_URL", f"postgresql://u@db.example.com/d?{query}")
-    report = resolve_setting(None).report()
-    assert report["url"] == f"postgresql://u@db.example.com/d?{shown}"
-    for secret in ("KEYPASS", "ENCPASS", "ENCKEY", "UPPER"):
-        assert secret not in json.dumps(report)
+def test_the_report_of_a_url_is_what_libpq_reads_with_the_default_sslmode(clean_env, monkeypatch):
+    monkeypatch.setenv("AGENTKIT_DB_URL", "postgresql://u@db.example.com:6432/d")
+    assert resolve_setting(None).report()["url"] == {
+        "user": "u", "host": "db.example.com", "port": "6432", "dbname": "d",
+        "sslmode": "require"}
 
 
-@pytest.mark.parametrize("url, shown, secret", [
-    ("postgresql://agent:pa#ss@db.example.com:5432/app",
-     "postgresql://agent:***@db.example.com:5432/app", "pa#ss"),
-    ("postgresql://agent:pa?ss@db.example.com/app?sslmode=require",
-     "postgresql://agent:***@db.example.com/app?sslmode=require", "pa?ss"),
-    ("postgresql://agent:pa@ss@db.example.com/app",
-     "postgresql://agent:***@db.example.com/app", "pa@ss"),
-    ("postgresql://agent@db.example.com/app?password=pa#ss&sslmode=require",
-     "postgresql://agent@db.example.com/app?password=***&sslmode=require", "pa#ss"),
-    ("postgresql://agent@db.example.com/app#x?password=pa#ss",
-     "postgresql://agent@db.example.com/app#x?password=***", "pa#ss"),
-])
-def test_the_report_splits_a_url_as_libpq_does(clean_env, monkeypatch, url, shown, secret):
-    monkeypatch.setenv("AGENTKIT_DB_URL", url)
-    report = resolve_setting(None).report()
-    assert report["url"] == shown
-    assert secret not in json.dumps(report)
+def test_a_url_libpq_cannot_parse_is_reported_without_its_text():
+    report = Setting(url="postgresql://u:SEKRET@h/d?bogus=1").report()
+    assert report["url"] == {"unparseable": True}
+    assert "SEKRET" not in json.dumps(report)
+
+
+def _libpq_reads(url: str) -> dict | None:
+    from psycopg import Error
+    from psycopg.conninfo import conninfo_to_dict
+
+    try:
+        return conninfo_to_dict(url)
+    except (Error, ValueError):
+        return None
+
+
+def _assert_no_secret_shown(url: str, read: dict) -> bool:
+    """Whether the URL carried a secret; every secret libpq reads from it is absent
+    from the report, unless the report shows the same text as something else libpq
+    reads, such as the host of an unencoded `pa@ss@host`, or as a key."""
+    report = Setting(url=url, level="environment", sources=("AGENTKIT_DB_URL",)).report()
+    shown = json.dumps(report, ensure_ascii=False)
+    public = json.dumps({**report, "url": {k: v for k, v in report["url"].items()
+                                           if k not in ("password", "sslpassword")}},
+                        ensure_ascii=False) + ' "password" "sslpassword"'
+    carried = False
+    for key in ("password", "sslpassword"):
+        if key in read:
+            carried = True
+            assert report["url"][key] == "***", url
+            if read[key] and read[key] not in public:
+                assert read[key] not in shown, url
+    return carried
+
+
+SHAPES = [
+    "postgresql://u:pw@db.example.com/db?sslpassword=KEYPASS&password=QPASS",
+    "postgresql://u@db.example.com/d?pass%77ord=ENCPASS",
+    "postgresql://u@db.example.com/d?ssl%70assword=ENCKEY&sslmode=require",
+    "postgresql://agent:pa#ss@db.example.com:5432/app",
+    "postgresql://agent:pa?ss@db.example.com/app?sslmode=require",
+    "postgresql://agent:pa@ss@db.example.com/app",
+    "postgresql://agent@db.example.com/app?password=pa#ss&sslmode=require",
+    "postgresql://agent@db.example.com/app#x?password=pa#ss",
+    "postgresql://agent:pw@db.example.com:5432?sslpassword=k@y&password=QX",
+    "postgresql://agent:pw@db.example.com:5432?application_name=a@b&password=QX",
+    "postgresql://ag?ent@db.example.com/app?password=QX",
+    "postgresql://ag?ent:pw@db.example.com/app?password=QX",
+]
+
+
+@pytest.mark.parametrize("url", SHAPES)
+def test_the_report_hides_every_secret_libpq_reads_from_a_named_shape(url):
+    read = _libpq_reads(url)
+    assert read is not None
+    assert _assert_no_secret_shown(url, read)
+
+
+def _generated_urls(count: int, seed: int = 20261009):
+    rng = random.Random(seed)
+    specials = "#?@/&=:%,[]+ ;"
+
+    def token(tag: str, n: int) -> str:
+        chars = [rng.choice(specials + "abcXYZ019") for _ in range(rng.randint(0, 6))]
+        chars.insert(rng.randint(0, len(chars)), f"{tag}{n:05d}")
+        return "".join(chars)
+
+    def maybe_encoded(text: str) -> str:
+        return quote(text, safe="") if rng.random() < 0.25 else text
+
+    for n in range(count):
+        user = rng.choice(["agent", token("Us", n)])
+        password = rng.choice(["", f":{maybe_encoded(token('Pw', n))}"])
+        auth = rng.choice([f"{user}{password}@", f"{user}@", ""])
+        host = rng.choice(["db.example.com", "127.0.0.1", "db.example.com:5432", ""])
+        path = rng.choice(["/app", "", "/", f"/{token('Db', n)}"])
+        params = []
+        for _ in range(rng.randint(0, 3)):
+            key = rng.choice(["password", "sslpassword", "pass%77ord", "ssl%70assword",
+                              "PASSWORD", "application_name", "sslmode"])
+            value = ("require" if key == "sslmode"
+                     else maybe_encoded(token("Qv", n)))
+            params.append(f"{key}={value}")
+        query = f"?{'&'.join(params)}" if params else ""
+        yield f"{rng.choice(['postgresql', 'postgres'])}://{auth}{host}{path}{query}"
+
+
+def test_the_report_hides_every_secret_libpq_reads_across_a_generated_corpus():
+    """Each generated URL libpq accepts, checked against libpq's own parse."""
+    accepted = carried = 0
+    for url in _generated_urls(6000):
+        read = _libpq_reads(url)
+        if read is None:
+            continue
+        accepted += 1
+        carried += _assert_no_secret_shown(url, read)
+    assert accepted > 1500 and carried > 1000, (accepted, carried)
 
 
 # --- the machine file ------------------------------------------------------------

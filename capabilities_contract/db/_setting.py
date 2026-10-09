@@ -24,7 +24,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 from capabilities_contract.db._errors import DbError
 
@@ -81,30 +81,21 @@ def check_schema_name(name: object) -> str:
     return name
 
 
-def redact_url(url: str) -> str:
-    """The URL with every secret replaced: the password in the authority, and each
-    query parameter whose key, percent-decoded as libpq decodes it, names a secret.
+def _url_report(url: str) -> dict:
+    """The parameters libpq reads from a URL, each secret replaced, with the sslmode
+    a URL naming none is connected with. Only libpq's own parse takes the URL apart,
+    so what it reads as a secret is what is hidden; a URL it cannot parse is reported
+    as such, without its text."""
+    import psycopg
+    from psycopg.conninfo import conninfo_to_dict
 
-    The URL is split as libpq splits it, not as a web URL: a URL has no fragment, so
-    `#` ends nothing; the credentials run to an `@` before the first `/` (the last
-    one, so a password carrying `@` or `?` is covered whole); and the query is
-    everything after the first `?` that follows them."""
-    scheme, sep, rest = url.partition("://")
-    if not sep:
-        return url
-    at = rest.split("/", 1)[0].rfind("@")
-    if at >= 0:
-        user, colon, _ = rest[:at].partition(":")
-        if colon:
-            rest = f"{user}:{_REDACTED}{rest[at:]}"
-    base, mark, query = rest.partition("?")
-    params = []
-    for param in query.split("&") if mark else []:
-        key, eq, _ = param.partition("=")
-        if eq and unquote(key).lower() in _SECRET_PARAMS:
-            param = f"{key}={_REDACTED}"
-        params.append(param)
-    return f"{scheme}://{base}{mark}{'&'.join(params)}"
+    try:
+        params = conninfo_to_dict(url)
+    except (psycopg.Error, ValueError):
+        return {"unparseable": True}
+    params.setdefault("sslmode", DEFAULT_SSLMODE)
+    return {key: _REDACTED if key in _SECRET_PARAMS else value
+            for key, value in params.items()}
 
 
 @dataclass(frozen=True)
@@ -114,7 +105,8 @@ class Setting:
     Either `url` or the host fields are set. `level` is `project`, `environment` or
     `machine`; `sources` names every file (an absolute path) or variable that supplied
     a value in force. The password and URL are never shown in the repr; `report()`
-    gives the whole setting with its secrets redacted."""
+    gives the whole setting with its secrets redacted, a URL as the parameters libpq
+    reads from it."""
 
     schema: str = DEFAULT_SCHEMA
     level: str = ""
@@ -148,7 +140,7 @@ class Setting:
         """The setting in force for a status or doctor surface, secrets redacted."""
         out = {"level": self.level, "sources": list(self.sources), "schema": self.schema}
         if self.url is not None:
-            out["url"] = redact_url(self.url)
+            out["url"] = _url_report(self.url)
             return out
         out.update(host=self.host, port=self.port, database=self.database, user=self.user,
                    sslmode=self.sslmode, sslrootcert=self.sslrootcert,
