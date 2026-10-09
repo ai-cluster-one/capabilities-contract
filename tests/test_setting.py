@@ -254,6 +254,20 @@ def test_the_report_names_the_level_and_sources_and_redacts_secrets(clean_env, p
                       "password": "***"}
 
 
+@pytest.mark.parametrize("query, shown", [
+    ("sslpassword=KEYPASS", "sslpassword=***"),
+    ("pass%77ord=ENCPASS", "pass%77ord=***"),
+    ("ssl%70assword=ENCKEY&sslmode=require", "ssl%70assword=***&sslmode=require"),
+    ("sslmode=require&PASSWORD=UPPER", "sslmode=require&PASSWORD=***"),
+])
+def test_the_report_redacts_every_secret_query_parameter(clean_env, monkeypatch, query, shown):
+    monkeypatch.setenv("AGENTKIT_DB_URL", f"postgresql://u@db.example.com/d?{query}")
+    report = resolve_setting(None).report()
+    assert report["url"] == f"postgresql://u@db.example.com/d?{shown}"
+    for secret in ("KEYPASS", "ENCPASS", "ENCKEY", "UPPER"):
+        assert secret not in json.dumps(report)
+
+
 # --- the machine file ------------------------------------------------------------
 
 def test_the_machine_file_is_under_agentkit(clean_env, monkeypatch):

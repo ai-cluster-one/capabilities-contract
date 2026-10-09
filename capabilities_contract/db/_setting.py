@@ -24,7 +24,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse, urlunparse
+from urllib.parse import parse_qs, unquote, urlparse, urlunparse
 
 from capabilities_contract.db._errors import DbError
 
@@ -64,6 +64,8 @@ NOT_CONFIGURED_HINT = ("set AGENTKIT_DB_URL or the AGENTKIT_DB_* fields in the p
 _IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 _SYSTEM_SCHEMAS = ("public", "information_schema")
 _REDACTED = "***"
+# The libpq connection parameters whose value is a secret.
+_SECRET_PARAMS = ("password", "sslpassword")
 
 
 def check_schema_name(name: object) -> str:
@@ -80,15 +82,21 @@ def check_schema_name(name: object) -> str:
 
 
 def redact_url(url: str) -> str:
-    """The URL with any password, in the authority or the query, replaced."""
+    """The URL with every secret replaced: the password in the authority, and each
+    query parameter whose key, percent-decoded as libpq decodes it, names a secret."""
     parsed = urlparse(url)
     netloc = parsed.netloc
     if parsed.password is not None:
         userinfo, _, hostport = netloc.rpartition("@")
         user = userinfo.split(":", 1)[0]
         netloc = f"{user}:{_REDACTED}@{hostport}"
-    query = re.sub(r"(^|&)(password=)[^&]*", rf"\g<1>\g<2>{_REDACTED}", parsed.query)
-    return urlunparse(parsed._replace(netloc=netloc, query=query))
+    params = []
+    for param in parsed.query.split("&") if parsed.query else []:
+        key, sep, _ = param.partition("=")
+        if sep and unquote(key).lower() in _SECRET_PARAMS:
+            param = f"{key}={_REDACTED}"
+        params.append(param)
+    return urlunparse(parsed._replace(netloc=netloc, query="&".join(params)))
 
 
 @dataclass(frozen=True)
