@@ -268,6 +268,25 @@ def test_the_report_redacts_every_secret_query_parameter(clean_env, monkeypatch,
         assert secret not in json.dumps(report)
 
 
+@pytest.mark.parametrize("url, shown, secret", [
+    ("postgresql://agent:pa#ss@db.example.com:5432/app",
+     "postgresql://agent:***@db.example.com:5432/app", "pa#ss"),
+    ("postgresql://agent:pa?ss@db.example.com/app?sslmode=require",
+     "postgresql://agent:***@db.example.com/app?sslmode=require", "pa?ss"),
+    ("postgresql://agent:pa@ss@db.example.com/app",
+     "postgresql://agent:***@db.example.com/app", "pa@ss"),
+    ("postgresql://agent@db.example.com/app?password=pa#ss&sslmode=require",
+     "postgresql://agent@db.example.com/app?password=***&sslmode=require", "pa#ss"),
+    ("postgresql://agent@db.example.com/app#x?password=pa#ss",
+     "postgresql://agent@db.example.com/app#x?password=***", "pa#ss"),
+])
+def test_the_report_splits_a_url_as_libpq_does(clean_env, monkeypatch, url, shown, secret):
+    monkeypatch.setenv("AGENTKIT_DB_URL", url)
+    report = resolve_setting(None).report()
+    assert report["url"] == shown
+    assert secret not in json.dumps(report)
+
+
 # --- the machine file ------------------------------------------------------------
 
 def test_the_machine_file_is_under_agentkit(clean_env, monkeypatch):

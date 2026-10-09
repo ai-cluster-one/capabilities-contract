@@ -24,7 +24,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse, urlunparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from capabilities_contract.db._errors import DbError
 
@@ -83,20 +83,28 @@ def check_schema_name(name: object) -> str:
 
 def redact_url(url: str) -> str:
     """The URL with every secret replaced: the password in the authority, and each
-    query parameter whose key, percent-decoded as libpq decodes it, names a secret."""
-    parsed = urlparse(url)
-    netloc = parsed.netloc
-    if parsed.password is not None:
-        userinfo, _, hostport = netloc.rpartition("@")
-        user = userinfo.split(":", 1)[0]
-        netloc = f"{user}:{_REDACTED}@{hostport}"
+    query parameter whose key, percent-decoded as libpq decodes it, names a secret.
+
+    The URL is split as libpq splits it, not as a web URL: a URL has no fragment, so
+    `#` ends nothing; the credentials run to an `@` before the first `/` (the last
+    one, so a password carrying `@` or `?` is covered whole); and the query is
+    everything after the first `?` that follows them."""
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        return url
+    at = rest.split("/", 1)[0].rfind("@")
+    if at >= 0:
+        user, colon, _ = rest[:at].partition(":")
+        if colon:
+            rest = f"{user}:{_REDACTED}{rest[at:]}"
+    base, mark, query = rest.partition("?")
     params = []
-    for param in parsed.query.split("&") if parsed.query else []:
-        key, sep, _ = param.partition("=")
-        if sep and unquote(key).lower() in _SECRET_PARAMS:
+    for param in query.split("&") if mark else []:
+        key, eq, _ = param.partition("=")
+        if eq and unquote(key).lower() in _SECRET_PARAMS:
             param = f"{key}={_REDACTED}"
         params.append(param)
-    return urlunparse(parsed._replace(netloc=netloc, query="&".join(params)))
+    return f"{scheme}://{base}{mark}{'&'.join(params)}"
 
 
 @dataclass(frozen=True)
