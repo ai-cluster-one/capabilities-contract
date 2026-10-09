@@ -1,6 +1,6 @@
 # capabilities-contract
 
-The capabilities contract as a Python library. Its first part, `capabilities_contract.db`, is the one way the capabilities manager, its capabilities and ContextKit reach the shared Postgres database: read the machine's store setting, connect bound to its schema, and migrate each owner's tables once under a ledger. It does nothing else: no SQLite, no project registry, no records.
+The capabilities contract as a Python library. Its first part, `capabilities_contract.db`, is the one way the capabilities manager, its capabilities and ContextKit reach the shared Postgres database: read the machine's store setting, connect bound to its schema, migrate each owner's tables once under a ledger, and report where they stand. It does nothing else: no SQLite, no project registry, no records.
 
 ## Install
 
@@ -8,11 +8,11 @@ The capabilities contract as a Python library. Its first part, `capabilities_con
 pip install capabilities-contract
 ```
 
-Its one dependency is `psycopg[binary]>=3.2,<4`, imported lazily: `import capabilities_contract.db` does not import psycopg, only `connect` and `migrate` do. In a PEP 723 script, pin the exact version:
+Its one dependency is `psycopg[binary]>=3.2,<4`, imported lazily: `import capabilities_contract.db` does not import psycopg, only `connect`, `migrate` and `status` do. In a PEP 723 script, pin the exact version:
 
 ```python
 # /// script
-# dependencies = ["capabilities-contract==0.2.1"]
+# dependencies = ["capabilities-contract==0.3.0"]
 # ///
 ```
 
@@ -28,7 +28,7 @@ from capabilities_contract.db import DbError, Step, connect, migrate
 conn = connect(application_name="automations")
 ```
 
-`connect(*, application_name, setting=None)` returns a psycopg 3 connection whose `search_path` is the configured schema alone, never `public`, so unqualified names land in that schema. The schema need not exist yet: `migrate` creates it. Pass `setting=` to use a `Setting` other than the machine's.
+`connect(*, application_name, setting=None, connect_timeout=10)` returns a psycopg 3 connection whose `search_path` is the configured schema alone, never `public`, so unqualified names land in that schema. The schema need not exist yet: `migrate` creates it. Pass `setting=` to use a `Setting` other than the machine's. A store that does not answer within `connect_timeout` seconds (`CONNECT_TIMEOUT_SECONDS`) is refused as `store_unreachable`. Both ends of the connection send TCP keepalives - after 30 seconds idle, every 10 seconds, giving up after 3 unanswered probes - so the store drops a client that died without closing and the client learns of a store that went away.
 
 ## Migrate
 
@@ -46,6 +46,17 @@ for warning in result.warnings:
 It refuses with a `DbError`, rolling the step back: an applied step whose SQL changed (`checksum_mismatch`); a step that creates a relation, index, sequence, type, function, collation, statistics object or schema not named `<owner>` or `<owner>_*` inside the configured schema, or named `schema_ledger` or `schema_version` (`naming_law`); a step that fails or ends its own transaction (`step_failed`). A step cannot use statements that refuse a transaction, such as `CREATE INDEX CONCURRENTLY`.
 
 The version rule lets tools at different releases share one database. When the store records a newer major for the owner than the caller's `major`, `migrate` refuses with `schema_too_new` before applying anything, and the hint says to update. When it records the same major with a newer minor, it proceeds and adds a warning to `result.warnings`, keeping the stored version. Otherwise it records the caller's version.
+
+## Status
+
+```python
+from capabilities_contract.db import status
+
+report = status(conn, "automations", steps, major=1, minor=1)
+print(report.state, report.pending)
+```
+
+`status(conn, owner, steps, *, major, minor)` reports what `migrate` would do with the same arguments, changing nothing and taking no lock, so it answers while another session holds one. It returns a `MigrateStatus` with `state`, `major` and `minor` (the caller's), `stored_major` and `stored_minor` (the store's, or `None`), and the step ids under `applied`, `pending` and `changed`, plus `warnings`. `state` is `current` when every step is applied and the store records the caller's version or a newer minor (which adds a warning), `pending` when `migrate` has something to apply or record, and `checksum_mismatch` or `schema_too_new` when `migrate` would refuse.
 
 ## Errors
 

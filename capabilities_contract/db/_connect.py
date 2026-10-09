@@ -12,6 +12,16 @@ from capabilities_contract.db._setting import Setting, check_schema_name, read_s
 # second argument naming it.
 _BOUND: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
+# A connect that gets no answer gives up after CONNECT_TIMEOUT_SECONDS. Both ends
+# probe an idle connection: after KEEPALIVE_IDLE_SECONDS without traffic, every
+# KEEPALIVE_INTERVAL_SECONDS, giving up after KEEPALIVE_COUNT unanswered probes,
+# so the store drops a client that died without closing and the client learns
+# of a store that went away.
+CONNECT_TIMEOUT_SECONDS = 10
+KEEPALIVE_IDLE_SECONDS = 30
+KEEPALIVE_INTERVAL_SECONDS = 10
+KEEPALIVE_COUNT = 3
+
 
 def _psycopg():
     try:
@@ -29,11 +39,23 @@ def bind_search_path(conn: Any, schema: str) -> None:
     conn.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
 
 
+def _keepalives(conn: Any) -> None:
+    """Ask the server to probe this client as the client probes the server. Over a
+    Unix socket the server ignores the settings."""
+    for name, value in (("tcp_keepalives_idle", KEEPALIVE_IDLE_SECONDS),
+                        ("tcp_keepalives_interval", KEEPALIVE_INTERVAL_SECONDS),
+                        ("tcp_keepalives_count", KEEPALIVE_COUNT)):
+        conn.execute("SELECT set_config(%s, %s, false)", (name, str(value)))
+
+
 def connect(*, application_name: str, setting: Setting | None = None,
-            connect_timeout: int = 10) -> Any:
+            connect_timeout: int = CONNECT_TIMEOUT_SECONDS) -> Any:
     """A psycopg connection to the store, with search_path set to the configured
     schema only (never `public`). The schema need not exist yet: `migrate` creates
-    it. The connection is returned idle, outside any transaction."""
+    it. The connection is returned idle, outside any transaction.
+
+    A store that does not answer within `connect_timeout` seconds is refused as
+    `store_unreachable`. Both ends send TCP keepalives on the connection."""
     if not isinstance(application_name, str) or not application_name:
         raise DbError("bad_application_name", "application_name must be a non-empty string")
     setting = setting if setting is not None else read_setting()
@@ -41,11 +63,15 @@ def connect(*, application_name: str, setting: Setting | None = None,
     psycopg, _ = _psycopg()
     try:
         conn = psycopg.connect(**setting.connect_kwargs(), application_name=application_name,
-                               connect_timeout=connect_timeout)
+                               connect_timeout=connect_timeout, keepalives=1,
+                               keepalives_idle=KEEPALIVE_IDLE_SECONDS,
+                               keepalives_interval=KEEPALIVE_INTERVAL_SECONDS,
+                               keepalives_count=KEEPALIVE_COUNT)
     except psycopg.OperationalError as exc:
         raise DbError("store_unreachable", f"cannot reach the store: {exc}",
                       "check the store setting with `capabilities store doctor`") from exc
     try:
+        _keepalives(conn)
         bind_search_path(conn, schema)
         conn.commit()
     except Exception:

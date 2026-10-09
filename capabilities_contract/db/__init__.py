@@ -1,12 +1,12 @@
 """The shared database layer: read the machine's store setting, connect bound to its
-schema, and migrate each owner's tables once under a ledger.
+schema, migrate each owner's tables once under a ledger, and report where they stand.
 
 Importing this module does not import psycopg; `connect` and `migrate` do.
 """
 
 from capabilities_contract.db._connect import connect
 from capabilities_contract.db._errors import DbError
-from capabilities_contract.db._migrate import MigrateResult, Step, migrate
+from capabilities_contract.db._migrate import MigrateResult, MigrateStatus, Step, migrate, status
 from capabilities_contract.db._setting import (
     DEFAULT_SCHEMA,
     SETTING_FORMAT,
@@ -25,6 +25,7 @@ __all__ = [
     "SETTING_SCHEMA_V2",
     "DbError",
     "MigrateResult",
+    "MigrateStatus",
     "Setting",
     "Step",
     "connect",
@@ -32,4 +33,5 @@ __all__ = [
     "read_setting",
     "setting_files",
     "setting_path",
+    "status",
 ]

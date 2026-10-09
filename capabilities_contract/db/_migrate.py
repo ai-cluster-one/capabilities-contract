@@ -63,6 +63,27 @@ class MigrateResult:
     minor: int | None = None
 
 
+@dataclass
+class MigrateStatus:
+    """Where `owner`'s tables stand against the caller's steps, read without a lock.
+
+    `state` is `current` when every step is applied and the store records the
+    caller's version or a newer minor; `pending` when `migrate` has something to
+    do; `checksum_mismatch` or `schema_too_new` when `migrate` would refuse."""
+
+    owner: str
+    schema: str
+    state: str
+    major: int
+    minor: int
+    stored_major: int | None = None
+    stored_minor: int | None = None
+    applied: list[str] = field(default_factory=list)
+    pending: list[str] = field(default_factory=list)
+    changed: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
 def check_owner(owner: object) -> str:
     if not isinstance(owner, str) or not _OWNER.fullmatch(owner) or owner in RESERVED_OWNERS:
         raise DbError("bad_owner", f"owner {owner!r} is not a lowercase identifier",
@@ -251,6 +272,57 @@ def _settled(conn: Any, schema: str, owner: str, plan: list[Step], major: int, m
     result.skipped = [step.id for step in plan]
     result.major, result.minor = stored
     return True
+
+
+def status(conn: Any, owner: str, steps: Iterable[Step | Sequence[str]], *,
+           major: int, minor: int, schema: str | None = None) -> MigrateStatus:
+    """Report what `migrate` would do for `owner`, changing nothing and taking no
+    lock. `conn` comes from `connect` and must be idle."""
+    psycopg, sql = _psycopg()
+    owner = check_owner(owner)
+    major, minor = _check_version_numbers(major, minor)
+    schema = check_schema_name(schema if schema is not None else bound_schema(conn))
+    plan = _normalise_steps(steps)
+    if conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+        raise DbError("connection_busy", "status needs an idle connection",
+                      "commit or roll back before asking")
+    report = MigrateStatus(owner=owner, schema=schema, state="pending",
+                           major=major, minor=minor)
+    applied: dict[str, str] = {}
+    stored = None
+    with conn.transaction():
+        books = all(conn.execute("SELECT to_regclass(%s)",
+                                 (f'"{schema}".{table}',)).fetchone()[0] is not None
+                    for table in (LEDGER_TABLE, VERSION_TABLE))
+        if books:
+            stored = _stored_version(conn, schema, owner)
+            applied = dict(conn.execute(
+                sql.SQL("SELECT step, checksum FROM {}.{} WHERE owner = %s").format(
+                    sql.Identifier(schema), sql.Identifier(LEDGER_TABLE)),
+                (owner,)).fetchall())
+    if stored is not None:
+        report.stored_major, report.stored_minor = stored
+    for step in plan:
+        if step.id not in applied:
+            report.pending.append(step.id)
+        elif applied[step.id] != step.checksum:
+            report.changed.append(step.id)
+        else:
+            report.applied.append(step.id)
+    if stored is not None and stored[0] > major:
+        report.state = "schema_too_new"
+    elif report.changed:
+        report.state = "checksum_mismatch"
+    elif report.pending or stored is None or stored < (major, minor):
+        report.state = "pending"
+    else:
+        report.state = "current"
+        if stored > (major, minor):
+            report.warnings.append(
+                f"the store's {owner} tables are at schema version {stored[0]}.{stored[1]}, "
+                f"a newer minor than the {major}.{minor} this code knows; "
+                "it works, but an update is available")
+    return report
 
 
 def migrate(conn: Any, owner: str, steps: Iterable[Step | Sequence[str]], *,
