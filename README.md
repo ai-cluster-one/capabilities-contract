@@ -12,7 +12,7 @@ Its one dependency is `psycopg[binary]>=3.2,<4`, imported lazily: `import capabi
 
 ```python
 # /// script
-# dependencies = ["capabilities-contract==0.2.0"]
+# dependencies = ["capabilities-contract==0.2.1"]
 # ///
 ```
 
@@ -41,7 +41,7 @@ for warning in result.warnings:
     print(warning)
 ```
 
-`migrate(conn, owner, steps, *, major, minor)` applies each step that is not yet applied, in order, once. The owner is the tool that owns the tables, a lowercase identifier without underscores. The first call creates the schema and two platform tables in it: `schema_ledger(owner, step, checksum, applied_at, library_version)` and `schema_version(owner, major, minor, updated_at)`. Each step runs in its own transaction under a per-owner advisory lock together with its ledger row, so concurrent processes apply it exactly once. It returns a `MigrateResult` with `applied`, `skipped`, `warnings`, `major` and `minor`.
+`migrate(conn, owner, steps, *, major, minor)` applies each step that is not yet applied, in order, once. The owner is the tool that owns the tables, a lowercase identifier without underscores. The first call creates the schema and two platform tables in it: `schema_ledger(owner, step, checksum, applied_at, library_version)` and `schema_version(owner, major, minor, updated_at)`. Each step runs in its own transaction under a per-owner advisory lock together with its ledger row, so concurrent processes apply it exactly once. When every step is already applied and the store records the caller's version, it reads that without taking any lock, so a session holding one stops no tool whose tables are in place. Otherwise a lock is tried rather than queued for, so a process that dies while waiting leaves nothing in the queue: after 10 seconds held elsewhere (`LOCK_WAIT_SECONDS`) `migrate` refuses with `store_busy`, and a session that holds a lock and then issues no statement for 5 seconds (`LOCK_IDLE_SECONDS`) is ended by the server, which frees the lock. It returns a `MigrateResult` with `applied`, `skipped`, `warnings`, `major` and `minor`.
 
 It refuses with a `DbError`, rolling the step back: an applied step whose SQL changed (`checksum_mismatch`); a step that creates a relation, index, sequence, type, function, collation, statistics object or schema not named `<owner>` or `<owner>_*` inside the configured schema, or named `schema_ledger` or `schema_version` (`naming_law`); a step that fails or ends its own transaction (`step_failed`). A step cannot use statements that refuse a transaction, such as `CREATE INDEX CONCURRENTLY`.
 
@@ -49,7 +49,7 @@ The version rule lets tools at different releases share one database. When the s
 
 ## Errors
 
-Every failure is a `DbError` with `slug` (stable, for the caller to map to an exit code), `message` and `hint` (possibly `None`). Slugs: `store_not_configured`, `store_not_postgres`, `store_setting_unreadable`, `store_setting_too_new`, `bad_store_setting`, `sslmode_too_weak`, `bad_schema_name`, `store_unreachable`, `driver_missing`, `bad_application_name`, `bad_owner`, `bad_version`, `bad_step`, `connection_busy`, `checksum_mismatch`, `naming_law`, `step_failed`, `schema_too_new`.
+Every failure is a `DbError` with `slug` (stable, for the caller to map to an exit code), `message` and `hint` (possibly `None`). Slugs: `store_not_configured`, `store_not_postgres`, `store_setting_unreadable`, `store_setting_too_new`, `bad_store_setting`, `sslmode_too_weak`, `bad_schema_name`, `store_unreachable`, `driver_missing`, `bad_application_name`, `bad_owner`, `bad_version`, `bad_step`, `connection_busy`, `checksum_mismatch`, `naming_law`, `step_failed`, `schema_too_new`, `store_busy`.
 
 ## Development
 

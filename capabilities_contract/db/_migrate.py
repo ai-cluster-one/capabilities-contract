@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -23,6 +24,12 @@ LEDGER_TABLE = "schema_ledger"
 VERSION_TABLE = "schema_version"
 RESERVED_NAMES = (LEDGER_TABLE, VERSION_TABLE)
 RESERVED_OWNERS = ("schema", "pg")
+
+# A lock is waited for this long at most, without queueing for it, and a session
+# holding one that goes this long without a statement is ended by the server.
+LOCK_WAIT_SECONDS = 10.0
+LOCK_IDLE_SECONDS = 5
+_LOCK_POLL_SECONDS = 0.1
 
 # No underscore: then no owner's `<owner>_` prefix can cover another owner's.
 _OWNER = re.compile(r"[a-z][a-z0-9]{0,30}")
@@ -141,7 +148,22 @@ def _violations(before: set[tuple], after: set[tuple], owner: str, schema: str) 
 
 
 def _lock(conn: Any, key: str) -> None:
-    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (key,))
+    """Take `key`'s lock for the open transaction. The lock is tried, never queued
+    for, so a caller that dies while waiting leaves no session behind in the queue;
+    the wait is bounded and reported as `store_busy`. While the transaction holds
+    it, a session that stops issuing statements is ended by the server."""
+    conn.execute("SELECT set_config('idle_in_transaction_session_timeout', %s, true)",
+                 (f"{int(LOCK_IDLE_SECONDS * 1000)}ms",))
+    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    while not conn.execute("SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))",
+                           (key,)).fetchone()[0]:
+        if time.monotonic() >= deadline:
+            raise DbError("store_busy",
+                          f"another session has held the store lock {key} for longer "
+                          f"than {LOCK_WAIT_SECONDS:g}s",
+                          "try again shortly; a session that holds it without working is "
+                          f"ended by the store within {LOCK_IDLE_SECONDS:g}s")
+        time.sleep(_LOCK_POLL_SECONDS)
 
 
 def _bootstrap(conn: Any, schema: str) -> None:
@@ -200,6 +222,37 @@ def _check_version(conn: Any, schema: str, owner: str, major: int, minor: int,
     return stored
 
 
+def _settled(conn: Any, schema: str, owner: str, plan: list[Step], major: int, minor: int,
+             result: MigrateResult) -> bool:
+    """Whether there is nothing to do: the platform tables exist, every step is
+    applied with its SQL, and the store records the caller's version or a newer
+    minor. Read without a lock, so a session holding one stops no caller whose
+    tables are already in place. Refuses as the locked path would."""
+    _, sql = _psycopg()
+    with conn.transaction():
+        for table in (LEDGER_TABLE, VERSION_TABLE):
+            if conn.execute("SELECT to_regclass(%s)",
+                            (f'"{schema}".{table}',)).fetchone()[0] is None:
+                return False
+        stored = _check_version(conn, schema, owner, major, minor, result)
+        if stored is None or stored < (major, minor):
+            return False
+        applied = dict(conn.execute(sql.SQL("SELECT step, checksum FROM {}.{} WHERE owner = %s")
+                                    .format(sql.Identifier(schema),
+                                            sql.Identifier(LEDGER_TABLE)),
+                                    (owner,)).fetchall())
+        for step in plan:
+            if step.id not in applied:
+                return False
+            if applied[step.id] != step.checksum:
+                raise DbError("checksum_mismatch",
+                              f"step {step.id} of {owner} was applied with different SQL",
+                              "never edit an applied step; add a new step instead")
+    result.skipped = [step.id for step in plan]
+    result.major, result.minor = stored
+    return True
+
+
 def migrate(conn: Any, owner: str, steps: Iterable[Step | Sequence[str]], *,
             major: int, minor: int, schema: str | None = None) -> MigrateResult:
     """Apply `owner`'s steps that are not yet applied, in order, each once.
@@ -212,7 +265,9 @@ def migrate(conn: Any, owner: str, steps: Iterable[Step | Sequence[str]], *,
     `<owner>`/`<owner>_*` in the schema (`naming_law`, rolled back), and a failing
     step (`step_failed`, rolled back). A newer stored minor proceeds with a warning
     in the result. Afterwards the caller's version is recorded unless the store's is
-    newer."""
+    newer. When every step is applied and the version recorded, it takes no lock at
+    all; otherwise a lock held elsewhere is waited for at most LOCK_WAIT_SECONDS
+    and then refused (`store_busy`)."""
     psycopg, sql = _psycopg()
     owner = check_owner(owner)
     major, minor = _check_version_numbers(major, minor)
@@ -226,9 +281,13 @@ def migrate(conn: Any, owner: str, steps: Iterable[Step | Sequence[str]], *,
     ledger = sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(LEDGER_TABLE))
     versions = sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(VERSION_TABLE))
 
-    _bootstrap(conn, schema)
+    settled = _settled(conn, schema, owner, plan, major, minor, result)
+    if not settled:
+        _bootstrap(conn, schema)
     bind_search_path(conn, schema)
     conn.commit()
+    if settled:
+        return result
 
     for step in plan:
         with conn.transaction():
