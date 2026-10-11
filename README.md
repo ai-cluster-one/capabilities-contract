@@ -42,6 +42,8 @@ conn = connect(application_name="automations", project_root=root)
 
 `connect(*, application_name, project_root=None, setting=None, connect_timeout=10)` returns a psycopg 3 connection to the database `resolve_setting(project_root)` names, or to `setting` when one is passed, whose `search_path` is that setting's schema alone, never `public`, so unqualified names land in that schema. The schema need not exist yet: `migrate` creates it, in the schema the connection is bound to. A store that does not answer within `connect_timeout` seconds (`CONNECT_TIMEOUT_SECONDS`) is refused as `store_unreachable`. Both ends of the connection send TCP keepalives - after 30 seconds idle, every 10 seconds, giving up after 3 unanswered probes - so the store drops a client that died without closing and the client learns of a store that went away.
 
+A transaction-mode pooler is not supported: it keeps no session between transactions, so the schema binding, psycopg's prepared statements and `LISTEN` are lost. `connect` refuses Supabase's transaction pooler - a host under `pooler.supabase.com` on port 6543 - as `transaction_pooler` before anything is sent to it, and the hint names its session pooler, the same host on port 5432. Use a direct connection or a session-mode pooler.
+
 ## Migrate
 
 ```python
@@ -72,7 +74,7 @@ print(report.state, report.pending)
 
 ## Errors
 
-Every failure is a `DbError` with `slug` (stable, for the caller to map to an exit code), `message` and `hint` (possibly `None`). Slugs: `store_not_configured`, `store_not_postgres`, `store_setting_unreadable`, `store_setting_too_new`, `bad_store_setting`, `sslmode_too_weak`, `bad_schema_name`, `store_unreachable`, `driver_missing`, `bad_application_name`, `bad_owner`, `bad_version`, `bad_step`, `connection_busy`, `checksum_mismatch`, `naming_law`, `step_failed`, `schema_too_new`, `store_busy`.
+Every failure is a `DbError` with `slug` (stable, for the caller to map to an exit code), `message` and `hint` (possibly `None`). Slugs: `store_not_configured`, `store_not_postgres`, `store_setting_unreadable`, `store_setting_too_new`, `bad_store_setting`, `sslmode_too_weak`, `bad_schema_name`, `store_unreachable`, `transaction_pooler`, `driver_missing`, `bad_application_name`, `bad_owner`, `bad_version`, `bad_step`, `connection_busy`, `checksum_mismatch`, `naming_law`, `step_failed`, `schema_too_new`, `store_busy`.
 
 ## Development
 

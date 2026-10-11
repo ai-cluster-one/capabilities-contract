@@ -23,6 +23,13 @@ KEEPALIVE_IDLE_SECONDS = 30
 KEEPALIVE_INTERVAL_SECONDS = 10
 KEEPALIVE_COUNT = 3
 
+# Supabase's transaction pooler: a host under its pooler domain on this port. It keeps
+# no session between transactions, so what a connection sets for its session - the
+# schema binding, prepared statements, LISTEN - is lost. Its session pooler is the
+# same host on SESSION_POOLER_PORT.
+SUPABASE_POOLER_DOMAIN = ".pooler.supabase.com"
+TRANSACTION_POOLER_PORT = 6543
+SESSION_POOLER_PORT = 5432
 
 def _psycopg():
     try:
@@ -49,6 +56,41 @@ def _keepalives(conn: Any) -> None:
         conn.execute("SELECT set_config(%s, %s, false)", (name, str(value)))
 
 
+def _endpoints(setting: Setting) -> list[tuple[str, int]]:
+    """Each host and port libpq would try for the setting, read by libpq's own parse.
+    A setting it cannot parse gives none; connecting reports it."""
+    import psycopg
+    from psycopg.conninfo import conninfo_to_dict
+
+    try:
+        params = conninfo_to_dict(**setting.connect_kwargs())
+    except (psycopg.Error, ValueError):
+        return []
+    hosts = str(params.get("host") or "").split(",")
+    ports = str(params.get("port") or "").split(",")
+    if len(ports) == 1:
+        ports = ports * len(hosts)
+    out = []
+    for host, port in zip(hosts, ports, strict=False):
+        port = port.strip() or str(SESSION_POOLER_PORT)
+        out.append((host.strip(), int(port) if port.isdigit() else 0))
+    return out
+
+
+def _refuse_transaction_pooler(setting: Setting) -> None:
+    """Refuse, before anything is sent, a store reached through Supabase's
+    transaction pooler."""
+    for host, port in _endpoints(setting):
+        if host.lower().endswith(SUPABASE_POOLER_DOMAIN) and port == TRANSACTION_POOLER_PORT:
+            raise DbError(
+                "transaction_pooler",
+                f"the store at {host}:{port} is Supabase's transaction pooler, which keeps "
+                "no session between transactions, so the schema binding, prepared statements "
+                "and notifications a connection relies on are lost; it is not supported",
+                f"use Supabase's session pooler: the same host, {host}, on port "
+                f"{SESSION_POOLER_PORT}")
+
+
 def connect(*, application_name: str, project_root: Path | str | None = None,
             setting: Setting | None = None,
             connect_timeout: int = CONNECT_TIMEOUT_SECONDS) -> Any:
@@ -58,12 +100,15 @@ def connect(*, application_name: str, project_root: Path | str | None = None,
     idle, outside any transaction.
 
     A store that does not answer within `connect_timeout` seconds is refused as
-    `store_unreachable`. Both ends send TCP keepalives on the connection."""
+    `store_unreachable`. Both ends send TCP keepalives on the connection. A store
+    reached through Supabase's transaction pooler is refused as `transaction_pooler`
+    before anything is sent to it."""
     if not isinstance(application_name, str) or not application_name:
         raise DbError("bad_application_name", "application_name must be a non-empty string")
     setting = setting if setting is not None else resolve_setting(project_root)
     schema = check_schema_name(setting.schema)
     psycopg, _ = _psycopg()
+    _refuse_transaction_pooler(setting)
     try:
         conn = psycopg.connect(**setting.connect_kwargs(), application_name=application_name,
                                connect_timeout=connect_timeout, keepalives=1,
