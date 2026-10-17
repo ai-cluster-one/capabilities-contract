@@ -12,8 +12,14 @@ a level is never completed from a lower one:
    "The store setting".
 
 Within one level `AGENTKIT_DB_URL` wins and that level's separate fields are ignored,
-except `AGENTKIT_DB_SCHEMA`, which applies beside a URL. This module reads and writes
-nothing else.
+except `AGENTKIT_DB_SCHEMA` and the transaction address, which apply beside a URL. This
+module reads and writes nothing else.
+
+A level may also name the store's transaction address: `AGENTKIT_DB_TRANSACTION_HOST`
+and `AGENTKIT_DB_TRANSACTION_PORT`, or `transaction_host` and `transaction_port` in the
+machine file. It is the same store reached at another endpoint, typically a
+transaction-mode pooler, with the level's own database, user, password, sslmode and
+schema. Without one, the store has one address and every connection uses it.
 """
 
 from __future__ import annotations
@@ -35,8 +41,9 @@ SSLMODES = ("require", "verify-ca", "verify-full")
 SSLMODES_REFUSED = ("disable", "allow", "prefer")
 SSLMODE_LOCAL = "disable"
 SETTING_FIELDS = ("host", "port", "database", "user", "sslmode", "sslrootcert")
+TRANSACTION_FIELDS = ("transaction_host", "transaction_port")
 SCHEMA_FIELD = "db_schema"
-FORMAT_FIELDS = ("schema", *SETTING_FIELDS, "password", SCHEMA_FIELD)
+FORMAT_FIELDS = ("schema", *SETTING_FIELDS, *TRANSACTION_FIELDS, "password", SCHEMA_FIELD)
 DEFAULT_SCHEMA = "agentkit"
 DEFAULT_PORT = 5432
 DEFAULT_SSLMODE = "require"
@@ -45,6 +52,11 @@ KEY_PREFIX = "AGENTKIT_DB_"
 URL_KEY = "AGENTKIT_DB_URL"
 SCHEMA_KEY = "AGENTKIT_DB_SCHEMA"
 PASSWORD_KEY = "AGENTKIT_DB_PASSWORD"
+# The transaction address, each key with the setting field it fills.
+TRANSACTION_KEYS = {
+    "AGENTKIT_DB_TRANSACTION_HOST": "transaction_host",
+    "AGENTKIT_DB_TRANSACTION_PORT": "transaction_port",
+}
 # The separate fields, each key with the setting field it fills.
 FIELD_KEYS = {
     "AGENTKIT_DB_HOST": "host",
@@ -54,7 +66,7 @@ FIELD_KEYS = {
     "AGENTKIT_DB_SSLMODE": "sslmode",
     "AGENTKIT_DB_SSLROOTCERT": "sslrootcert",
 }
-KEYS = (URL_KEY, *FIELD_KEYS, PASSWORD_KEY, SCHEMA_KEY)
+KEYS = (URL_KEY, *FIELD_KEYS, PASSWORD_KEY, SCHEMA_KEY, *TRANSACTION_KEYS)
 
 LEVELS = ("project", "environment", "machine")
 PROJECT_FILES = (".env.local", ".env")
@@ -120,7 +132,11 @@ class Setting:
     `machine`; `sources` names every file (an absolute path) or variable that supplied
     a value in force. The password and URL are never shown in the repr; `report()`
     gives the whole setting with its secrets redacted, a URL as the parameters libpq
-    reads from it."""
+    reads from it.
+
+    `transaction_host` and `transaction_port` name the store's transaction address
+    when the level set one (either may be None, standing for the session address's
+    own host or port); `has_transaction_address` says whether it did."""
 
     schema: str = DEFAULT_SCHEMA
     level: str = ""
@@ -133,6 +149,23 @@ class Setting:
     sslmode: str | None = None
     sslrootcert: str | None = None
     password: str | None = field(default=None, repr=False)
+    transaction_host: str | None = None
+    transaction_port: int | None = None
+
+    @property
+    def has_transaction_address(self) -> bool:
+        return self.transaction_host is not None or self.transaction_port is not None
+
+    def transaction_kwargs(self) -> dict:
+        """Arguments for `psycopg.connect` to the transaction address: the session
+        address's, with its host and port replaced by the transaction address's. A
+        setting naming no transaction address gives the session address's."""
+        out = self.connect_kwargs()
+        if self.transaction_host is not None:
+            out["host"] = self.transaction_host
+        if self.transaction_port is not None:
+            out["port"] = self.transaction_port
+        return out
 
     def connect_kwargs(self) -> dict:
         """Arguments for `psycopg.connect`: a conninfo string, or keyword values. A URL
@@ -153,6 +186,8 @@ class Setting:
     def report(self) -> dict:
         """The setting in force for a status or doctor surface, secrets redacted."""
         out = {"level": self.level, "sources": list(self.sources), "schema": self.schema}
+        if self.has_transaction_address:
+            out["transaction"] = {"host": self.transaction_host, "port": self.transaction_port}
         if self.url is not None:
             out["url"] = _url_report(self.url)
             return out
@@ -197,13 +232,44 @@ def _check_sslmode(sslmode: object, local: bool) -> None:
                   f"use one of {', '.join(SSLMODES)}")
 
 
+def _check_port(port: object, what: str) -> int:
+    if isinstance(port, str) and port.isdigit():
+        port = int(port)
+    if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
+        raise DbError("bad_store_setting", f"the {what} must be 1-65535")
+    return port
+
+
+def check_transaction_address(values: dict, sslmode: object, host: object) -> dict:
+    """The transaction address's fields among `values`, checked, or DbError: a host
+    with no whitespace, a port 1-65535, and a host the session's sslmode may reach
+    (`disable` only for a local one). `host` is the session address's host, which a
+    transaction address naming none keeps."""
+    out: dict = {}
+    found = values.get("transaction_host")
+    if found is not None:
+        if not isinstance(found, str) or not found or any(
+                ch.isspace() or ch == "\0" for ch in found):
+            raise DbError("bad_store_setting",
+                          "the store setting's transaction_host must have no whitespace")
+        out["transaction_host"] = found
+    port = values.get("transaction_port")
+    if port is not None:
+        out["transaction_port"] = _check_port(port, "transaction port")
+    if out.get("transaction_host") is not None and sslmode == SSLMODE_LOCAL \
+            and not host_is_local(out["transaction_host"]):
+        _check_sslmode(sslmode, False)
+    return out
+
+
 def check_setting(values: dict) -> dict:
     """The setting's non-secret values, checked and normalised, or DbError: no unknown
     field, host/database/user without whitespace, port 1-65535, sslmode at least
-    `require`, or `disable` for a local host."""
+    `require`, or `disable` for a local host. A transaction address is checked as
+    `check_transaction_address` checks it."""
     if not isinstance(values, dict):
         raise DbError("bad_store_setting", "the store setting is not an object")
-    unknown = sorted(set(values) - set(SETTING_FIELDS))
+    unknown = sorted(set(values) - set(SETTING_FIELDS) - set(TRANSACTION_FIELDS))
     if unknown:
         raise DbError("bad_store_setting",
                       f"the store setting carries unknown fields: {', '.join(unknown)}")
@@ -215,12 +281,7 @@ def check_setting(values: dict) -> dict:
             raise DbError("bad_store_setting",
                           f"the store setting needs a {name} with no whitespace")
         out[name] = value
-    port = values.get("port", DEFAULT_PORT)
-    if isinstance(port, str) and port.isdigit():
-        port = int(port)
-    if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
-        raise DbError("bad_store_setting", "the store port must be 1-65535")
-    out["port"] = port
+    out["port"] = _check_port(values.get("port", DEFAULT_PORT), "store port")
     sslmode = values.get("sslmode")
     _check_sslmode(sslmode, host_is_local(out["host"]))
     out["sslmode"] = sslmode
@@ -230,7 +291,17 @@ def check_setting(values: dict) -> dict:
             raise DbError("bad_store_setting",
                           "sslrootcert must be a certificate file path or `system`")
         out["sslrootcert"] = root
+    out.update(check_transaction_address(values, sslmode, out["host"]))
     return out
+
+
+def _url_host(url: str) -> str | None:
+    parsed = urlparse(url)
+    return (parse_qs(parsed.query).get("host") or [parsed.hostname])[-1]
+
+
+def _url_sslmode(url: str) -> str:
+    return (parse_qs(urlparse(url).query).get("sslmode") or [DEFAULT_SSLMODE])[-1]
 
 
 def check_url(url: str) -> str:
@@ -294,15 +365,20 @@ def _from_keys(level: str, found: dict[str, tuple[str, str]]) -> Setting:
                       f"the {level} level sets keys the database setting does not have: "
                       f"{', '.join(unknown)} ({_where(found, unknown)})",
                       f"use only {', '.join(KEYS)}")
-    used = [URL_KEY, SCHEMA_KEY] if URL_KEY in found else list(found)
+    used = [URL_KEY, SCHEMA_KEY, *TRANSACTION_KEYS] if URL_KEY in found else list(found)
     used = [key for key in used if key in found]
+    transaction = {name: found[key][0] for key, name in TRANSACTION_KEYS.items()
+                   if key in found}
     try:
         schema = check_schema_name(found[SCHEMA_KEY][0]) if SCHEMA_KEY in found \
             else DEFAULT_SCHEMA
         if URL_KEY in found:
+            url = check_url(found[URL_KEY][0])
             return Setting(schema=schema, level=level, sources=_sources(found, used),
-                           url=check_url(found[URL_KEY][0]))
+                           url=url, **check_transaction_address(
+                               transaction, _url_sslmode(url), _url_host(url)))
         values = {name: found[key][0] for key, name in FIELD_KEYS.items() if key in found}
+        values.update(transaction)
         values.setdefault("sslmode", DEFAULT_SSLMODE)
         password = found[PASSWORD_KEY][0] if PASSWORD_KEY in found else None
         return Setting(schema=schema, level=level, sources=_sources(found, used),
@@ -375,7 +451,8 @@ def _read_machine_file(path: Path, raw: str) -> Setting:
                       f"{path} carries fields {SETTING_FORMAT} does not have: "
                       f"{', '.join(unknown)}",
                       "rewrite it with `capabilities store set`")
-    values = check_setting({k: v for k, v in data.items() if k in SETTING_FIELDS})
+    values = check_setting({k: v for k, v in data.items()
+                            if k in SETTING_FIELDS or k in TRANSACTION_FIELDS})
     schema = DEFAULT_SCHEMA
     if data.get(SCHEMA_FIELD) is not None:
         schema = check_schema_name(data[SCHEMA_FIELD])
