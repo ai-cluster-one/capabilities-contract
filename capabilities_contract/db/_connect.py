@@ -5,12 +5,26 @@ A session connection binds the schema for its session and may hold session state
 `LISTEN`, session advisory locks, session settings. A transaction connection carries no
 session state at all, so it works through a transaction-mode pooler: psycopg prepares
 no statement on it, and the schema is bound with `SET LOCAL` at the start of every
-transaction rather than once for the session."""
+transaction rather than once for the session.
+
+Because a transaction connection carries no session state, one serves every operation
+of a process: it is the process's working connection. It is opened on the first
+`connect(..., transaction=True)` and lent to each later one; `close()` ends the loan
+and keeps it for the next, and it is closed when the process exits. A loan taken while
+another is still out gets a working connection of its own. A connect that fails is
+tried again with a short pause, and a statement that finds its connection gone before
+anything of its transaction reached the store runs again on a new one."""
 
 from __future__ import annotations
 
 import contextlib
+import functools
+import math
+import os
 import re
+import sys
+import threading
+import time
 import weakref
 from contextlib import contextmanager
 from pathlib import Path
@@ -32,6 +46,21 @@ CONNECT_TIMEOUT_SECONDS = 10
 KEEPALIVE_IDLE_SECONDS = 30
 KEEPALIVE_INTERVAL_SECONDS = 10
 KEEPALIVE_COUNT = 3
+
+# A connect that fails before the store answers - refused, reset, timed out - is tried
+# again after a short pause, at most CONNECT_ATTEMPTS times, while CONNECT_TIMEOUT
+# seconds are not spent: each try waits at most half of them, so a try that hangs
+# leaves time for one more. A store that answers with a refusal of its own - a
+# password, a database that is not there - is not tried again.
+CONNECT_ATTEMPTS = 3
+CONNECT_PAUSE_SECONDS = 0.25
+
+# The working connection: a loan of one that sat idle for PING_AFTER_SECONDS proves it
+# still answers with one round trip, cut at the connect timeout. Each working
+# connection beyond the first kept for the same address is closed once it sits idle
+# for SPARE_IDLE_SECONDS.
+PING_AFTER_SECONDS = 10
+SPARE_IDLE_SECONDS = 30
 
 # Supabase's transaction pooler: a host under its pooler domain on this port. It keeps
 # no session between transactions, so what a session connection sets for its session -
@@ -72,6 +101,21 @@ _SESSION_STATE = re.compile(
     r"|\bpg_(?:try_)?advisory_lock(?:_shared)?\s*\("
     r"|\bset_config\s*\([^;]*,\s*(?:false|'f'|'false')\s*\)",
     re.IGNORECASE | re.DOTALL)
+
+# A plain read: a statement that only reads, under READ COMMITTED, where every
+# statement sees the store as it is when it starts. A transaction that has run
+# nothing else leaves nothing a later statement depends on, so a read it loses
+# with its connection runs on a new one in a transaction of its own.
+_READS = re.compile(r"^\s*(?:SELECT|WITH|VALUES|TABLE|SHOW)\b", re.IGNORECASE)
+_NOT_ONLY_READS = re.compile(
+    r"\b(?:INSERT|UPDATE|DELETE|MERGE|INTO|SHARE)\b"
+    r"|nextval|setval|advisory|set_config|notify|lo_\w+|txid_current|xact_id|pg_sleep",
+    re.IGNORECASE)
+
+
+def _plain_read(text: str) -> bool:
+    return bool(_READS.match(text)) and not _NOT_ONLY_READS.search(text)
+
 
 _TRANSACTION_CLASS = None
 
@@ -135,9 +179,11 @@ def _transaction_class():
         return _TRANSACTION_CLASS
     psycopg, sql = _psycopg()
     from psycopg import pq
+    from psycopg.rows import tuple_row
 
     idle = pq.TransactionStatus.IDLE
     failed = pq.TransactionStatus.INERROR
+    read_committed = psycopg.IsolationLevel.READ_COMMITTED
 
     def text_of(conn: Any, query: Any) -> str:
         if isinstance(query, bytes):
@@ -155,6 +201,8 @@ def _transaction_class():
 
         def _ready(self, query: Any) -> None:
             conn = self.connection
+            if not conn._lent:
+                raise psycopg.OperationalError("the connection is closed")
             if _SESSION_STATE.search(text_of(conn, query)):
                 raise DbError("session_state",
                               "a transaction connection keeps no session state: LISTEN, "
@@ -164,25 +212,65 @@ def _transaction_class():
                               "transaction-level lock (pg_advisory_xact_lock)")
             conn._bind_transaction()
 
-        def execute(self, query, params=None, **kwargs):
+        def _again(self, conn: Any, err: BaseException) -> bool:
+            """Whether a statement that failed with `err` runs again: its
+            connection is gone, so nothing of its transaction stays in the
+            store, and a new connection replaces it. Once per statement."""
+            if not isinstance(err, psycopg.OperationalError) or not conn._gone():
+                return False
+            if not conn._renew():
+                return False
+            self._pgconn = conn.pgconn
+            return True
+
+        def _run(self, query: Any, call: Any) -> Any:
             conn = self.connection
-            if conn.autocommit and conn.info.transaction_status == idle:
-                # Autocommit runs each statement as its own transaction, which a
-                # SET LOCAL cannot reach; run it in one that binds the schema first.
-                with conn.transaction():
+            for attempt in (0, 1):
+                if conn.autocommit and conn.info.transaction_status == idle:
+                    # Autocommit runs each statement as its own transaction, which a
+                    # SET LOCAL cannot reach; run it in one that binds the schema
+                    # first. Its commit may have reached the store when the
+                    # connection breaks, so a failed commit never runs it again.
+                    sent = False
+                    try:
+                        with conn.transaction():
+                            self._ready(query)
+                            # The block may have begun on a new connection.
+                            self._pgconn = conn.pgconn
+                            out = call()
+                            sent = True
+                        return out
+                    except psycopg.OperationalError as err:
+                        if attempt or sent or not self._again(conn, err):
+                            raise
+                    continue
+                # A statement that opens its transaction runs again on a new
+                # connection when the old one is gone: the store rolls back a
+                # transaction that never committed. So does a plain read in a
+                # transaction that has only read.
+                opens = conn.info.transaction_status == idle
+                plain = _plain_read(text_of(conn, query))
+                reads = (not opens and plain and conn._reads_only
+                         and not conn._num_transactions
+                         and conn.isolation_level in (None, read_committed))
+                try:
                     self._ready(query)
-                    return super().execute(query, params, **kwargs)
-            self._ready(query)
-            return super().execute(query, params, **kwargs)
+                    if not plain:
+                        conn._reads_only = False
+                    return call()
+                except psycopg.OperationalError as err:
+                    if attempt or not (opens or reads) or not self._again(conn, err):
+                        raise
+            raise AssertionError("unreachable")
+
+        def execute(self, query, params=None, **kwargs):
+            sup = super()
+            return self._run(query, lambda: sup.execute(query, params, **kwargs))
 
         def executemany(self, query, params_seq, **kwargs):
-            conn = self.connection
-            if conn.autocommit and conn.info.transaction_status == idle:
-                with conn.transaction():
-                    self._ready(query)
-                    return super().executemany(query, params_seq, **kwargs)
-            self._ready(query)
-            return super().executemany(query, params_seq, **kwargs)
+            sup = super()
+            params_seq = list(params_seq)
+            return self._run(query, lambda: sup.executemany(query, params_seq, **kwargs))
 
         def stream(self, query, params=None, **kwargs):
             self._ready(query)
@@ -199,6 +287,8 @@ def _transaction_class():
         _bound_schema: str = ""
         _bound_now: bool = False
         _local_settings: tuple = ()
+        # Whether the open transaction has run only plain reads.
+        _reads_only: bool = False
 
         def _binding(self) -> Any:
             """One statement setting, for the open transaction only, the
@@ -232,6 +322,7 @@ def _transaction_class():
                 # bound, so the statement runs inside it.
                 psycopg.Cursor(self).execute(self._binding())
                 self._bound_now = True
+                self._reads_only = True
                 return
             if status == failed or self._bound_now:
                 return
@@ -239,27 +330,159 @@ def _transaction_class():
 
         @contextmanager
         def transaction(self, savepoint_name=None, force_rollback=False):
+            # The block reads the connection as it opens: take a due new one first.
+            self._take_due()
             outer = self.info.transaction_status == idle
-            if outer:
-                self._bound_now = False
-            with super().transaction(savepoint_name, force_rollback) as tx:
+            for attempt in (0, 1):
                 if outer:
-                    self._bind_now()
+                    self._bound_now = False
+                block = super().transaction(savepoint_name, force_rollback)
+                try:
+                    tx = block.__enter__()
+                except psycopg.OperationalError:
+                    # Nothing of the block reached the store: run it on a new
+                    # connection when this one is gone.
+                    if attempt or not outer or not self._gone() or not self._renew():
+                        raise
+                    continue
+                try:
+                    if outer:
+                        self._bind_now()
+                        self._reads_only = True
+                except psycopg.OperationalError as err:
+                    with contextlib.suppress(Exception):
+                        block.__exit__(type(err), err, err.__traceback__)
+                    if attempt or not self._gone() or not self._renew():
+                        raise
+                    continue
+                break
+            try:
                 yield tx
-            if self.info.transaction_status == idle:
-                self._bound_now = False
+            except BaseException:
+                if not block.__exit__(*sys.exc_info()):
+                    raise
+            else:
+                block.__exit__(None, None, None)
+            finally:
+                if self.info.transaction_status == idle:
+                    self._bound_now = False
 
         def commit(self) -> None:
+            """Commit the open transaction. One that has only read has nothing
+            to commit, so its connection being gone is not refused."""
             try:
                 super().commit()
+            except psycopg.OperationalError:
+                if not (self._gone() and self._reads_only):
+                    raise
+                self._renew_due = True
             finally:
                 self._bound_now = False
 
         def rollback(self) -> None:
+            """Roll back the open transaction. On a connection that is gone the
+            store has rolled it back already, so there is nothing to refuse, and
+            a new connection takes its place when the next statement comes."""
             try:
                 super().rollback()
+            except psycopg.OperationalError:
+                if not self._gone():
+                    raise
             finally:
                 self._bound_now = False
+            self._renew_due = self._gone()
+
+        # -- the working connection ------------------------------------------------
+
+        # Whether the connection is lent: between its `connect` and its `close`.
+        _lent: bool = False
+        # The address it is kept under, the arguments it was opened with, the
+        # process that opened it, and since when it sits idle.
+        _key: str = ""
+        _opened_with: tuple = ()
+        _pid: int = 0
+        _idle_since: float = 0.0
+        _startup_name: str = ""
+
+        @property
+        def closed(self) -> bool:
+            """True once `close()` ended the loan, as for any closed connection."""
+            return not self._lent or super().closed
+
+        # Set by a rollback on a connection that is gone: nothing of a
+        # transaction is pending, so the next statement may take a new one.
+        _renew_due: bool = False
+
+        def _take_due(self) -> None:
+            if self._renew_due and self._lent:
+                self._renew_due = False
+                if self._gone():
+                    self._renew()
+
+        def _check_connection_ok(self) -> None:
+            if not self._lent:
+                raise psycopg.OperationalError("the connection is closed")
+            self._take_due()
+            super()._check_connection_ok()
+
+        def _gone(self) -> bool:
+            return self.pgconn.status == psycopg.pq.ConnStatus.BAD
+
+        def _renew(self) -> bool:
+            """Take a new connection to the same address in place of this one,
+            which is gone. False, and this one left as it is, when the store
+            cannot be reached."""
+            kwargs, own_address, budget = self._opened_with
+            try:
+                fresh = _open_transaction(kwargs, own_address, budget)
+            except DbError:
+                return False
+            old = self.pgconn
+            pgconn = fresh.pgconn
+            mine = weakref.ref(self)
+            pgconn.notice_handler = functools.partial(psycopg.Connection._notice_handler, mine)
+            pgconn.notify_handler = functools.partial(psycopg.Connection._notify_handler, mine)
+            # The fresh object no longer owns the link it opened.
+            fresh._pool = None
+            self.pgconn = pgconn
+            self._num_transactions = 0
+            self._prepared = type(self._prepared)()
+            self._bound_now = False
+            with contextlib.suppress(Exception):
+                old.finish()
+            return True
+
+        def close(self) -> None:
+            """End the loan. The connection is kept, idle and outside any
+            transaction, for the next loan in this process; one that broke is
+            closed instead."""
+            if not self._lent:
+                return
+            keep = self._pid == os.getpid() and not self._gone()
+            if keep:
+                try:
+                    if self.info.transaction_status != idle:
+                        self.rollback()
+                    self.autocommit = False
+                    self.read_only = None
+                    self.isolation_level = None
+                    self.deferrable = None
+                    self.row_factory = tuple_row
+                    self.cursor_factory = BindingCursor
+                    self.prepare_threshold = None
+                    self._adapters = None
+                    self._notice_handlers.clear()
+                    self._notify_handlers.clear()
+                    keep = self.info.transaction_status == idle
+                except Exception:
+                    keep = False
+            self._lent = False
+            self._renew_due = False
+            _BOUND.pop(self, None)
+            if keep:
+                _keep(self)
+            else:
+                _finish(self)
 
     TransactionConnection.BindingCursor = BindingCursor
     _TRANSACTION_CLASS = TransactionConnection
@@ -338,7 +561,25 @@ def connect(*, application_name: str, project_root: Path | str | None = None,
     transaction connection at a transaction address of its own proves the
     store answers behind it within `connect_timeout`.
 
-    A store that does not answer within `connect_timeout` seconds is refused as
+    A transaction connection is the process's working connection for that address,
+    lent: the first `connect` opens it, `close()` (or leaving `with`) ends the loan,
+    rolling back what was not committed, and the next `connect` is lent the same
+    connection rather than opening one, its schema, local settings and
+    application_name bound for each of its transactions as this call names them. A
+    loan taken while another is out gets one of its own, and each working
+    connection is closed when the process exits or `disconnect()` closes it. One the
+    store closed, or that sat idle for PING_AFTER_SECONDS and does not answer, is
+    replaced as it is lent; a statement that finds it gone before anything of its
+    transaction reached the store - the statement that opens the transaction, or
+    one in autocommit before its commit is sent - runs once more on a new
+    connection, and a commit is never sent twice; so does a plain read in a
+    transaction that has only read. A rollback on a connection that is gone is
+    not refused, nor the commit of a transaction that has only read, and the
+    next statement takes a new connection.
+
+    A connect that fails before the store answers is tried again, at most
+    CONNECT_ATTEMPTS times with a short pause, while `connect_timeout` seconds are
+    not spent; a store that still does not answer is refused as
     `store_unreachable`. Both ends send TCP keepalives on a session connection; a
     transaction connection sends them from the client only. A session address that is
     Supabase's transaction pooler is refused as `transaction_pooler` before anything
@@ -350,31 +591,37 @@ def connect(*, application_name: str, project_root: Path | str | None = None,
     psycopg, _ = _psycopg()
     if not (transaction and setting.has_transaction_address):
         _refuse_transaction_pooler(setting)
-    options = dict(application_name=application_name, connect_timeout=connect_timeout,
+    options = dict(application_name=application_name,
                    keepalives=1, keepalives_idle=KEEPALIVE_IDLE_SECONDS,
                    keepalives_interval=KEEPALIVE_INTERVAL_SECONDS,
                    keepalives_count=KEEPALIVE_COUNT)
-    try:
-        if transaction:
-            kind = _transaction_class()
-            startup = _startup_settings(setting)
-            # No startup option is sent: each one is set for every transaction.
-            conn = kind.connect(**{**setting.transaction_kwargs(), "options": ""}, **options,
-                                prepare_threshold=None, cursor_factory=kind.BindingCursor)
-        else:
-            conn = psycopg.connect(**setting.connect_kwargs(), **options)
-    except psycopg.OperationalError as exc:
-        raise DbError("store_unreachable", f"cannot reach the store: {exc}",
-                      "check the database setting with `capabilities store doctor`") from exc
     settings = tuple((str(name), str(value))
                      for name, value in (local_settings or {}).items())
     if transaction:
+        startup = _startup_settings(setting)
+        # No startup option is sent: each one is set for every transaction.
+        kwargs = {**setting.transaction_kwargs(), "options": "", **options}
+        key = repr(sorted((name, str(value)) for name, value in kwargs.items()
+                          if name != "application_name"))
+        conn = _lend(key, connect_timeout)
+        if conn is None:
+            conn = _open_transaction(kwargs, setting.has_transaction_address,
+                                     connect_timeout)
+            conn._key = key
+            conn._lent = True
+        named = ()
+        if application_name != conn._startup_name:
+            named = (("application_name", application_name),)
         conn._bound_schema = schema
-        conn._local_settings = startup + settings
+        conn._local_settings = startup + settings + named
         _BOUND[conn] = schema
-        if setting.has_transaction_address:
-            _answers_within(conn, connect_timeout)
         return conn
+    try:
+        conn = _attempts(lambda seconds: psycopg.connect(
+            **setting.connect_kwargs(), **options, connect_timeout=seconds), connect_timeout)
+    except psycopg.OperationalError as exc:
+        raise DbError("store_unreachable", f"cannot reach the store: {exc}",
+                      "check the database setting with `capabilities store doctor`") from exc
     try:
         _keepalives(conn)
         bind_search_path(conn, schema)
@@ -388,14 +635,95 @@ def connect(*, application_name: str, project_root: Path | str | None = None,
     return conn
 
 
-def _answers_within(conn: Any, seconds: float) -> None:
-    """Prove a pooler in front of the store reaches it: one round trip, severed
-    when it is not back within `seconds`, so a pooler holding the client while
-    the store behind it does not answer is refused as `store_unreachable`
-    rather than waited on for as long as the pooler waits."""
-    import os
+def _transient(exc: BaseException) -> bool:
+    """Whether a failed connect may succeed when tried again: the store gave no
+    answer of its own - refused, reset, timed out - or said it cannot take one now."""
+    state = getattr(exc, "sqlstate", None)
+    if state:
+        return state.startswith(("08", "57P"))
+    text = str(exc).lower()
+    return not any(word in text for word in ("password", "certificate", "pg_hba"))
+
+
+def _attempts(open_one: Any, budget: float) -> Any:
+    """`open_one(seconds)` tried up to CONNECT_ATTEMPTS times, pausing between
+    tries, while `budget` seconds are not spent; each try may take at most half of
+    them, and never less than libpq's least timeout of 2 seconds."""
+    psycopg, _ = _psycopg()
+    began = time.monotonic()
+    last: BaseException | None = None
+    for attempt in range(CONNECT_ATTEMPTS):
+        left = budget - (time.monotonic() - began)
+        if attempt and left < 1:
+            break
+        seconds = max(2, min(math.ceil(budget / 2), math.ceil(left)))
+        try:
+            return open_one(seconds)
+        except psycopg.OperationalError as exc:
+            if not _transient(exc):
+                raise
+            last = exc
+        if attempt + 1 < CONNECT_ATTEMPTS:
+            time.sleep(CONNECT_PAUSE_SECONDS * (2 ** attempt))
+    assert last is not None
+    raise last
+
+
+def _open_transaction(kwargs: dict, own_address: bool, budget: float) -> Any:
+    """A new working connection: a transaction connection opened with `kwargs`,
+    proven to answer behind a transaction address of its own. Raises DbError."""
+    psycopg, _ = _psycopg()
+    kind = _transaction_class()
+
+    def open_one(seconds: int) -> Any:
+        conn = kind.connect(**kwargs, connect_timeout=seconds, prepare_threshold=None,
+                            cursor_factory=kind.BindingCursor)
+        conn._lent = True
+        if own_address:
+            failure = _round_trip(conn, seconds)
+            if failure is not None:
+                _finish(conn)
+                if isinstance(failure, psycopg.OperationalError):
+                    raise failure
+                raise psycopg.OperationalError(str(failure)) from failure
+        return conn
+
+    try:
+        conn = _attempts(open_one, budget)
+    except psycopg.OperationalError as exc:
+        why = str(exc) if isinstance(exc, _unanswered()) else f"cannot reach the store: {exc}"
+        raise DbError("store_unreachable", why,
+                      "check the database setting with `capabilities store doctor`") from exc
+    conn._opened_with = (kwargs, own_address, budget)
+    conn._startup_name = str(kwargs.get("application_name") or "")
+    conn._pid = os.getpid()
+    _track(conn)
+    return conn
+
+
+_UNANSWERED = None
+
+
+def _unanswered() -> type:
+    """The failure of a round trip severed for want of an answer: a pooler took the
+    connection while the store behind it did not answer in time."""
+    global _UNANSWERED
+    if _UNANSWERED is None:
+        psycopg, _ = _psycopg()
+
+        class Unanswered(psycopg.OperationalError):
+            pass
+
+        _UNANSWERED = Unanswered
+    return _UNANSWERED
+
+
+def _round_trip(conn: Any, seconds: float) -> BaseException | None:
+    """One round trip on `conn`, severed when it is not back within `seconds`:
+    None when it came back, else the failure, so a pooler holding the client while
+    the store behind it does not answer is known in that time rather than after
+    the pooler's own wait."""
     import socket
-    import threading
 
     psycopg, _ = _psycopg()
     held = socket.socket(fileno=os.dup(conn.pgconn.socket))
@@ -413,15 +741,135 @@ def _answers_within(conn: Any, seconds: float) -> None:
         conn.autocommit = True
         psycopg.Cursor(conn).execute("SELECT 1")
         conn.autocommit = False
+        return None
     except psycopg.Error as exc:
-        conn.close()
-        why = (f"the store did not answer at its transaction address within {seconds:g}s"
-               if cut.is_set() else f"cannot reach the store: {exc}")
-        raise DbError("store_unreachable", why,
-                      "check the database setting with `capabilities store doctor`") from exc
+        if cut.is_set():
+            return _unanswered()(
+                f"the store did not answer at its transaction address within {seconds:g}s")
+        return exc
     finally:
         timer.cancel()
         held.close()
+
+
+# The working connections of this process: those idle, by address, newest last, and
+# every one open, so each is closed when the process exits. A child of a fork never
+# uses or closes its parent's: they are only held, so the child's exit leaves them.
+_LOCK = threading.Lock()
+_IDLE: dict[str, list] = {}
+_OPEN: weakref.WeakSet = weakref.WeakSet()
+_INHERITED: list = []
+_HOOKED = False
+
+
+def _track(conn: Any) -> None:
+    global _HOOKED
+    with _LOCK:
+        _OPEN.add(conn)
+        if not _HOOKED:
+            _HOOKED = True
+            import atexit
+            atexit.register(disconnect, every=True)
+            if hasattr(os, "register_at_fork"):
+                os.register_at_fork(after_in_child=_forget_after_fork)
+
+
+def _forget_after_fork() -> None:
+    global _LOCK
+    _LOCK = threading.Lock()
+    _INHERITED.extend(_OPEN)
+    _OPEN.clear()
+    _IDLE.clear()
+
+
+def _finish(conn: Any) -> None:
+    """Close a working connection for good; one a fork inherited is only held."""
+    conn._lent = False
+    with _LOCK:
+        _OPEN.discard(conn)
+    if conn._pid and conn._pid != os.getpid():
+        _INHERITED.append(conn)
+        return
+    conn._closed = True
+    with contextlib.suppress(Exception):
+        conn.pgconn.finish()
+
+
+def _spares(idle: list) -> list:
+    """The idle connections of one address to close: each but the newest that sat
+    idle for SPARE_IDLE_SECONDS. Called under the lock; removes them from `idle`."""
+    if len(idle) < 2:
+        return []
+    now = time.monotonic()
+    old = [c for c in idle[:-1] if now - c._idle_since >= SPARE_IDLE_SECONDS]
+    for conn in old:
+        idle.remove(conn)
+    return old
+
+
+def _keep(conn: Any) -> None:
+    conn._idle_since = time.monotonic()
+    with _LOCK:
+        idle = _IDLE.setdefault(conn._key, [])
+        idle.append(conn)
+        spare = _spares(idle)
+    for old in spare:
+        _finish(old)
+
+
+def _fit(conn: Any, seconds: float) -> bool:
+    """Whether an idle working connection can be lent again: it is this process's,
+    the store has not closed it, and, after PING_AFTER_SECONDS idle, it answers."""
+    import select
+
+    psycopg, _ = _psycopg()
+    if conn._pid != os.getpid() or conn._gone():
+        return False
+    if conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+        return False
+    try:
+        ready, _w, _x = select.select([conn.pgconn.socket], [], [], 0)
+        if ready:
+            # The store said something unasked: it is closing the connection.
+            conn.pgconn.consume_input()
+            if conn._gone() or conn.pgconn.is_busy():
+                return False
+    except Exception:
+        return False
+    if time.monotonic() - conn._idle_since < PING_AFTER_SECONDS:
+        return True
+    return _round_trip(conn, seconds) is None and not conn._gone()
+
+
+def _lend(key: str, seconds: float) -> Any:
+    """An idle working connection for `key`, lent, or None where there is none."""
+    while True:
+        with _LOCK:
+            idle = _IDLE.get(key) or []
+            spare = _spares(idle)
+            conn = idle.pop() if idle else None
+        for old in spare:
+            _finish(old)
+        if conn is None:
+            return None
+        conn._lent = True
+        if _fit(conn, min(seconds, CONNECT_TIMEOUT_SECONDS)):
+            return conn
+        _finish(conn)
+
+
+def disconnect(*, every: bool = False) -> int:
+    """Close this process's idle working connections, so it holds none until its
+    next `connect(..., transaction=True)`; with `every`, the lent ones as well, as
+    the process does when it exits. Returns how many were closed."""
+    with _LOCK:
+        closing = [conn for idle in _IDLE.values() for conn in idle]
+        _IDLE.clear()
+        if every:
+            closing += [conn for conn in _OPEN if conn not in closing]
+    for conn in closing:
+        _finish(conn)
+    return len(closing)
 
 
 def bound_schema(conn: Any) -> str | None:

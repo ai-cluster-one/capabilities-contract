@@ -8,6 +8,7 @@ import psycopg
 import pytest
 
 from capabilities_contract.db import DbError, Setting, connect
+from capabilities_contract.db._connect import CONNECT_ATTEMPTS
 
 POOLER = "aws-0-region.pooler.supabase.com"
 PASSWORD = "not-a-real-secret"
@@ -65,4 +66,7 @@ def test_every_other_endpoint_is_connected_to(reached, setting):
     with pytest.raises(DbError) as caught:
         connect(application_name="test", setting=setting)
     assert caught.value.slug == "store_unreachable"
-    assert len(reached) == 1
+    # A connect the driver fails is tried again, at the same endpoint each time.
+    assert len(reached) == CONNECT_ATTEMPTS
+    assert all({**call, "connect_timeout": None} == {**reached[0], "connect_timeout": None}
+               for call in reached)

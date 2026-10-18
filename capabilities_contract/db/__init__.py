@@ -4,7 +4,7 @@ its schema, migrate each owner's tables once under a ledger, and report where th
 Importing this module does not import psycopg; `connect` and `migrate` do.
 """
 
-from capabilities_contract.db._connect import connect
+from capabilities_contract.db._connect import connect, disconnect
 from capabilities_contract.db._errors import DbError
 from capabilities_contract.db._migrate import MigrateResult, MigrateStatus, Step, migrate, status
 from capabilities_contract.db._setting import (
@@ -28,6 +28,7 @@ __all__ = [
     "Setting",
     "Step",
     "connect",
+    "disconnect",
     "migrate",
     "resolve_setting",
     "setting_path",

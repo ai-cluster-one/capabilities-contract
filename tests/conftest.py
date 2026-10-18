@@ -186,6 +186,16 @@ def child_env(config_home: Path) -> dict:
     return env
 
 
+@pytest.fixture(autouse=True)
+def no_working_connection():
+    """Each test starts and ends with no working connection held by this process,
+    as a process does when it starts and once it exits."""
+    from capabilities_contract.db import disconnect
+    disconnect(every=True)
+    yield
+    disconnect(every=True)
+
+
 @pytest.fixture()
 def clean_env(tmp_path, monkeypatch):
     """An empty XDG_CONFIG_HOME and no AGENTKIT_DB_* key in the environment."""
@@ -203,6 +213,8 @@ def store(server, clean_env):
     found = Store(config_home=clean_env, schema=f"t_{uuid.uuid4().hex[:12]}", server=server)
     found.write()
     yield found
+    from capabilities_contract.db import disconnect
+    disconnect(every=True)  # a loan a failed test left open would hold its locks
     try:
         with server.admin() as admin:
             admin.execute(f'DROP SCHEMA IF EXISTS "{found.schema}" CASCADE')

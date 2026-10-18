@@ -14,7 +14,7 @@ from pathlib import Path
 import psycopg
 import pytest
 
-from capabilities_contract.db import DbError, connect, migrate
+from capabilities_contract.db import DbError, connect, disconnect, migrate
 
 PGBOUNCER_ENV = "CAPABILITIES_CONTRACT_TEST_PGBOUNCER"
 
@@ -62,6 +62,8 @@ def pooler(server, tmp_path):
                 pytest.fail("pgbouncer did not start")
             time.sleep(0.1)
     yield port
+    # PgBouncer shuts down once its clients are gone: close this process's.
+    disconnect(every=True)
     proc.terminate()
     proc.wait(timeout=10)
 
