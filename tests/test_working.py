@@ -237,6 +237,58 @@ def test_a_read_in_a_transaction_that_has_only_read_runs_on_a_new_connection(
         assert conn.execute("SELECT count(*) FROM demo_rows").fetchone() == (0,)
 
 
+def test_a_read_in_a_block_that_has_only_read_runs_on_a_new_connection(table, server):
+    with connect(application_name="blocks", transaction=True) as conn:
+        with conn.transaction():
+            assert conn.execute("SELECT count(*) FROM demo_rows").fetchone() == (0,)
+            first = _pid(conn)
+            with conn.transaction():
+                _terminate(server, first)
+                assert conn.execute("SELECT count(*) FROM demo_rows").fetchone() == (0,)
+            assert conn.execute("SELECT 1").fetchone() == (1,)
+        assert _pid(conn) != first
+        # The block that only read commits on a connection that is gone.
+        with conn.transaction():
+            conn.execute("SELECT 1").fetchone()
+            _terminate(server, _pid(conn))
+        assert conn.execute("SELECT count(*) FROM demo_rows").fetchone() == (0,)
+
+
+def test_a_read_in_a_block_after_a_write_is_not_run_again(table, server):
+    conn = connect(application_name="blocks", transaction=True)
+    try:
+        with pytest.raises(psycopg.OperationalError), conn.transaction():
+            conn.execute("INSERT INTO demo_rows VALUES (1)")
+            _terminate(server, _pid(conn))
+            conn.execute("SELECT count(*) FROM demo_rows")
+    finally:
+        conn.close()
+    with connect(application_name="blocks", transaction=True) as conn:
+        assert conn.execute("SELECT count(*) FROM demo_rows").fetchone() == (0,)
+
+
+def test_an_autocommit_read_whose_commit_was_lost_is_answered(table, server, monkeypatch):
+    kind = connect_module._transaction_class()
+    real = kind._exec_command
+
+    def lose_the_answer(self, command, *args, **kwargs):
+        result = yield from real(self, command, *args, **kwargs)
+        if command == b"COMMIT":
+            self.pgconn.finish()
+            raise psycopg.OperationalError("server closed the connection unexpectedly")
+        return result
+
+    conn = connect(application_name="answered", transaction=True)
+    try:
+        conn.autocommit = True
+        monkeypatch.setattr(kind, "_exec_command", lose_the_answer)
+        assert conn.execute("SELECT count(*) FROM demo_rows").fetchone() == (0,)
+        monkeypatch.setattr(kind, "_exec_command", real)
+        assert conn.execute("SELECT 1").fetchone() == (1,)
+    finally:
+        conn.close()
+
+
 def test_a_read_after_a_write_is_not_run_again(table, server):
     conn = connect(application_name="writer", transaction=True)
     try:
@@ -333,6 +385,32 @@ def test_a_cut_network_mid_command_is_crossed(table, proxy):
         proxy.cut()
         time.sleep(0.2)
         assert conn.execute("SELECT count(*) FROM demo_rows").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("mode", ["autocommit", "block", "implicit"])
+def test_a_read_after_the_network_cut_the_connection_is_answered(table, proxy, mode):
+    table.write(port=proxy.port)
+    with connect(application_name="cut", transaction=True) as conn:
+        if mode == "autocommit":
+            conn.autocommit = True
+            conn.execute("SELECT 1").fetchone()
+            proxy.cut()
+            time.sleep(0.2)
+            assert conn.execute("SELECT 2").fetchone() == (2,)
+        elif mode == "block":
+            with conn.transaction():
+                conn.execute("SELECT 1").fetchone()
+                proxy.cut()
+                time.sleep(0.2)
+                assert conn.execute("SELECT 2").fetchone() == (2,)
+        else:
+            conn.execute("SELECT 1").fetchone()
+            proxy.cut()
+            time.sleep(0.2)
+            assert conn.execute("SELECT 2").fetchone() == (2,)
+            proxy.cut()
+            time.sleep(0.2)
+            conn.commit()  # a transaction that only read has nothing to commit
 
 
 def test_a_connection_that_stopped_answering_is_replaced_when_lent(store, proxy,

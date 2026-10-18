@@ -113,6 +113,11 @@ _NOT_ONLY_READS = re.compile(
     re.IGNORECASE)
 
 
+# The errors the store sends as it ends a session: an administrator ended it, the
+# server is shutting down or crashed.
+_SESSION_ENDED = ("57P01", "57P02", "57P03")
+
+
 def _plain_read(text: str) -> bool:
     return bool(_READS.match(text)) and not _NOT_ONLY_READS.search(text)
 
@@ -216,7 +221,7 @@ def _transaction_class():
             """Whether a statement that failed with `err` runs again: its
             connection is gone, so nothing of its transaction stays in the
             store, and a new connection replaces it. Once per statement."""
-            if not isinstance(err, psycopg.OperationalError) or not conn._gone():
+            if not isinstance(err, psycopg.OperationalError) or not conn._gone(err):
                 return False
             if not conn._renew():
                 return False
@@ -232,9 +237,12 @@ def _transaction_class():
                     # first. Its commit may have reached the store when the
                     # connection breaks, so a failed commit never runs it again.
                     sent = False
+                    plain = _plain_read(text_of(conn, query))
                     try:
                         with conn.transaction():
                             self._ready(query)
+                            if not plain:
+                                conn._reads_only = False
                             # The block may have begun on a new connection.
                             self._pgconn = conn.pgconn
                             out = call()
@@ -247,11 +255,11 @@ def _transaction_class():
                 # A statement that opens its transaction runs again on a new
                 # connection when the old one is gone: the store rolls back a
                 # transaction that never committed. So does a plain read in a
-                # transaction that has only read.
+                # transaction that has only read, inside `transaction()` blocks
+                # too: the new connection opens the blocks again before it.
                 opens = conn.info.transaction_status == idle
                 plain = _plain_read(text_of(conn, query))
                 reads = (not opens and plain and conn._reads_only
-                         and not conn._num_transactions
                          and conn.isolation_level in (None, read_committed))
                 try:
                     self._ready(query)
@@ -289,6 +297,8 @@ def _transaction_class():
         _local_settings: tuple = ()
         # Whether the open transaction has run only plain reads.
         _reads_only: bool = False
+        # The open `transaction()` blocks, outermost first.
+        _blocks: list | None = None  # set per connection when it is opened
 
         def _binding(self) -> Any:
             """One statement setting, for the open transaction only, the
@@ -339,10 +349,10 @@ def _transaction_class():
                 block = super().transaction(savepoint_name, force_rollback)
                 try:
                     tx = block.__enter__()
-                except psycopg.OperationalError:
+                except psycopg.OperationalError as err:
                     # Nothing of the block reached the store: run it on a new
                     # connection when this one is gone.
-                    if attempt or not outer or not self._gone() or not self._renew():
+                    if attempt or not outer or not self._gone(err) or not self._renew():
                         raise
                     continue
                 try:
@@ -352,17 +362,28 @@ def _transaction_class():
                 except psycopg.OperationalError as err:
                     with contextlib.suppress(Exception):
                         block.__exit__(type(err), err, err.__traceback__)
-                    if attempt or not self._gone() or not self._renew():
+                    if attempt or not self._gone(err) or not self._renew():
                         raise
                     continue
                 break
+            # The block, as a new connection would open it again: the outer one
+            # with BEGIN, an inner one with its savepoint.
+            self._blocks.append(tx)
             try:
                 yield tx
             except BaseException:
+                self._blocks.pop()
                 if not block.__exit__(*sys.exc_info()):
                     raise
             else:
-                block.__exit__(None, None, None)
+                self._blocks.pop()
+                try:
+                    block.__exit__(None, None, None)
+                except psycopg.OperationalError as err:
+                    # A transaction that has only read has nothing to commit.
+                    if not (self._gone(err) and self._reads_only):
+                        raise
+                    self._renew_now()
             finally:
                 if self.info.transaction_status == idle:
                     self._bound_now = False
@@ -372,10 +393,10 @@ def _transaction_class():
             to commit, so its connection being gone is not refused."""
             try:
                 super().commit()
-            except psycopg.OperationalError:
-                if not (self._gone() and self._reads_only):
+            except psycopg.OperationalError as err:
+                if not (self._gone(err) and self._reads_only):
                     raise
-                self._renew_due = True
+                self._renew_now()
             finally:
                 self._bound_now = False
 
@@ -383,14 +404,16 @@ def _transaction_class():
             """Roll back the open transaction. On a connection that is gone the
             store has rolled it back already, so there is nothing to refuse, and
             a new connection takes its place when the next statement comes."""
+            ended = False
             try:
                 super().rollback()
-            except psycopg.OperationalError:
-                if not self._gone():
+            except psycopg.OperationalError as err:
+                if not self._gone(err):
                     raise
+                ended = True
             finally:
                 self._bound_now = False
-            self._renew_due = self._gone()
+            self._renew_due = ended or self._gone()
 
         # -- the working connection ------------------------------------------------
 
@@ -413,11 +436,18 @@ def _transaction_class():
         # transaction is pending, so the next statement may take a new one.
         _renew_due: bool = False
 
+        def _renew_now(self) -> None:
+            """After a read-only transaction's commit on a lost connection: the
+            caller carries on, so the new connection is taken at once, idle as
+            after any commit; when the store does not answer, at the next
+            statement."""
+            if not self._renew():
+                self._renew_due = True
+
         def _take_due(self) -> None:
             if self._renew_due and self._lent:
                 self._renew_due = False
-                if self._gone():
-                    self._renew()
+                self._renew()
 
         def _check_connection_ok(self) -> None:
             if not self._lent:
@@ -425,7 +455,15 @@ def _transaction_class():
             self._take_due()
             super()._check_connection_ok()
 
-        def _gone(self) -> bool:
+        def _gone(self, err: BaseException | None = None) -> bool:
+            """Whether the connection is lost: broken, ended by the store with
+            `err`, the error it sends as it closes the session, or failed with
+            `err` below any answer of the store's - the network gave way under
+            the driver before libpq marked the connection broken."""
+            if err is not None and isinstance(err, psycopg.OperationalError):
+                state = getattr(err, "sqlstate", None)
+                if state in _SESSION_ENDED or not state:
+                    return True
             return self.pgconn.status == psycopg.pq.ConnStatus.BAD
 
         def _renew(self) -> bool:
@@ -450,6 +488,26 @@ def _transaction_class():
             self._bound_now = False
             with contextlib.suppress(Exception):
                 old.finish()
+            if not self._blocks:
+                return True
+            # Open again the blocks the caller is inside: its transaction, bound,
+            # and each savepoint, so the blocks end on this connection as they
+            # would have on the old one.
+            try:
+                with self.lock:
+                    self.wait(self._exec_command(self._get_tx_start_command()))
+                psycopg.Cursor(self).execute(self._binding())
+                self._bound_now = True
+                for block in self._blocks:
+                    # Each block ends on the connection it now runs on.
+                    block.pgconn = pgconn
+                    if block.savepoint_name:
+                        with self.lock:
+                            self.wait(self._exec_command(sql.SQL("SAVEPOINT {}").format(
+                                sql.Identifier(block.savepoint_name))))
+            except psycopg.Error:
+                return False
+            self._num_transactions = len(self._blocks)
             return True
 
         def close(self) -> None:
@@ -478,6 +536,7 @@ def _transaction_class():
                     keep = False
             self._lent = False
             self._renew_due = False
+            self._blocks = []
             _BOUND.pop(self, None)
             if keep:
                 _keep(self)
@@ -695,6 +754,7 @@ def _open_transaction(kwargs: dict, own_address: bool, budget: float) -> Any:
         raise DbError("store_unreachable", why,
                       "check the database setting with `capabilities store doctor`") from exc
     conn._opened_with = (kwargs, own_address, budget)
+    conn._blocks = []
     conn._startup_name = str(kwargs.get("application_name") or "")
     conn._pid = os.getpid()
     _track(conn)

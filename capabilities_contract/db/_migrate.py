@@ -15,12 +15,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from capabilities_contract.db._connect import (
-    _psycopg,
-    _transaction_class,
-    bind_search_path,
-    bound_schema,
-)
+from capabilities_contract.db._connect import _psycopg, bind_search_path, bound_schema
 from capabilities_contract.db._errors import DbError
 from capabilities_contract.db._setting import check_schema_name
 from capabilities_contract.version import __version__
@@ -358,15 +353,7 @@ def migrate(conn: Any, owner: str, steps: Iterable[Step | Sequence[str]], *,
     ledger = sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(LEDGER_TABLE))
     versions = sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(VERSION_TABLE))
 
-    try:
-        settled = _settled(conn, schema, owner, plan, major, minor, result)
-    except psycopg.OperationalError:
-        # The check only reads: a working connection lost under it is replaced,
-        # and the check asked once more.
-        if not (isinstance(conn, _transaction_class()) and conn._gone()):
-            raise
-        conn.rollback()
-        settled = _settled(conn, schema, owner, plan, major, minor, result)
+    settled = _settled(conn, schema, owner, plan, major, minor, result)
     if not settled:
         _bootstrap(conn, schema)
     bind_search_path(conn, schema)
