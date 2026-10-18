@@ -280,3 +280,29 @@ def test_local_settings_apply_to_every_transaction_and_never_to_the_session(stor
                  local_settings={"statement_timeout": "1234"}) as conn:
         conn.commit()
         assert _raw(conn, "SHOW statement_timeout") == [("1234ms",)]
+
+
+def test_startup_options_reach_each_transaction_and_read_only_holds(store, monkeypatch):
+    """A transaction connection sends no startup option: PGOPTIONS reaches each
+    transaction as its settings, and a read-only default makes each read-only."""
+    monkeypatch.setenv("PGOPTIONS", "-c default_transaction_read_only=on -c lock_timeout=5s")
+    with connect(application_name="tx-test", transaction=True) as conn:
+        assert _rows(conn, "SHOW transaction_read_only") == [("on",)]
+        assert _rows(conn, "SHOW lock_timeout") == [("5s",)]
+        with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
+            conn.execute("CREATE TABLE demo_written (id int)")
+        conn.rollback()
+        conn.autocommit = True
+        with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
+            conn.execute("CREATE TABLE demo_written (id int)")
+        # The session itself carries none of it.
+        assert _raw(conn, "SHOW lock_timeout") != [("5s",)]
+    with connect(application_name="session-test") as conn:
+        assert _rows(conn, "SHOW transaction_read_only") == [("on",)]
+
+
+def test_a_startup_option_that_is_no_setting_is_refused(store, monkeypatch):
+    monkeypatch.setenv("PGOPTIONS", "-e")
+    with pytest.raises(DbError) as caught:
+        connect(application_name="tx-test", transaction=True)
+    assert caught.value.slug == "session_state"

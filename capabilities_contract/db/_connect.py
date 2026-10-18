@@ -9,6 +9,7 @@ transaction rather than once for the session."""
 
 from __future__ import annotations
 
+import contextlib
 import re
 import weakref
 from contextlib import contextmanager
@@ -73,6 +74,58 @@ _SESSION_STATE = re.compile(
     re.IGNORECASE | re.DOTALL)
 
 _TRANSACTION_CLASS = None
+
+# Startup options - libpq's `options`, from the setting or PGOPTIONS - reach a
+# transaction connection as settings of each of its transactions, since a
+# transaction-mode pooler refuses them at startup. A session default that only
+# a new transaction reads also sets that transaction itself.
+_FOR_THIS_TRANSACTION = {"default_transaction_read_only": "transaction_read_only",
+                         "default_transaction_isolation": None,
+                         "default_transaction_deferrable": None}
+
+
+def _startup_settings(setting: Setting) -> tuple[tuple[str, str], ...]:
+    """The run-time parameters the startup options of `setting` and PGOPTIONS
+    name, as (name, value): `-c name=value`, `-cname=value` or `--name=value`.
+    Any other startup option is refused, since a transaction connection could
+    not carry it."""
+    import os
+    import shlex
+
+    from psycopg.conninfo import conninfo_to_dict
+
+    texts = []
+    try:
+        named = conninfo_to_dict(**setting.connect_kwargs()).get("options")
+    except Exception:
+        named = None
+    for text in (os.environ.get("PGOPTIONS"), named):
+        if text:
+            texts.append(str(text))
+    out: list[tuple[str, str]] = []
+    for text in texts:
+        words = shlex.split(text)
+        i = 0
+        while i < len(words):
+            word = words[i]
+            if word == "-c" and i + 1 < len(words):
+                pair, i = words[i + 1], i + 2
+            elif (word.startswith("-c") and len(word) > 2) or \
+                    (word.startswith("--") and "=" in word):
+                pair, i = word[2:], i + 1
+            else:
+                raise DbError("session_state",
+                              f"the startup option {word!r} cannot reach a transaction "
+                              "connection, which a transaction-mode pooler serves",
+                              "name run-time parameters as -c name=value")
+            name, eq, value = pair.partition("=")
+            if not eq or not name:
+                raise DbError("session_state", f"the startup option {pair!r} names no value")
+            out.append((name.replace("-", "_"), value))
+            target = _FOR_THIS_TRANSACTION.get(name.replace("-", "_"))
+            if target is not None:
+                out.append((target, value))
+    return tuple(out)
 
 
 def _transaction_class():
@@ -278,7 +331,12 @@ def connect(*, application_name: str, project_root: Path | str | None = None,
     advisory lock) is refused as `session_state` before it is sent.
     `local_settings`, run-time parameters such as `statement_timeout`, are set
     beside the schema for every transaction of a transaction connection, and
-    once for the session of a session connection.
+    once for the session of a session connection. A transaction connection
+    sends no startup option: the run-time parameters the setting's `options`
+    and PGOPTIONS name are set for each of its transactions instead, and
+    `default_transaction_read_only` makes each of them read-only. A
+    transaction connection at a transaction address of its own proves the
+    store answers behind it within `connect_timeout`.
 
     A store that does not answer within `connect_timeout` seconds is refused as
     `store_unreachable`. Both ends send TCP keepalives on a session connection; a
@@ -299,7 +357,9 @@ def connect(*, application_name: str, project_root: Path | str | None = None,
     try:
         if transaction:
             kind = _transaction_class()
-            conn = kind.connect(**setting.transaction_kwargs(), **options,
+            startup = _startup_settings(setting)
+            # No startup option is sent: each one is set for every transaction.
+            conn = kind.connect(**{**setting.transaction_kwargs(), "options": ""}, **options,
                                 prepare_threshold=None, cursor_factory=kind.BindingCursor)
         else:
             conn = psycopg.connect(**setting.connect_kwargs(), **options)
@@ -310,8 +370,10 @@ def connect(*, application_name: str, project_root: Path | str | None = None,
                      for name, value in (local_settings or {}).items())
     if transaction:
         conn._bound_schema = schema
-        conn._local_settings = settings
+        conn._local_settings = startup + settings
         _BOUND[conn] = schema
+        if setting.has_transaction_address:
+            _answers_within(conn, connect_timeout)
         return conn
     try:
         _keepalives(conn)
@@ -324,6 +386,42 @@ def connect(*, application_name: str, project_root: Path | str | None = None,
         raise
     _BOUND[conn] = schema
     return conn
+
+
+def _answers_within(conn: Any, seconds: float) -> None:
+    """Prove a pooler in front of the store reaches it: one round trip, severed
+    when it is not back within `seconds`, so a pooler holding the client while
+    the store behind it does not answer is refused as `store_unreachable`
+    rather than waited on for as long as the pooler waits."""
+    import os
+    import socket
+    import threading
+
+    psycopg, _ = _psycopg()
+    held = socket.socket(fileno=os.dup(conn.pgconn.socket))
+    cut = threading.Event()
+
+    def sever() -> None:
+        cut.set()
+        with contextlib.suppress(OSError):
+            held.shutdown(socket.SHUT_RDWR)
+
+    timer = threading.Timer(seconds, sever)
+    timer.daemon = True
+    timer.start()
+    try:
+        conn.autocommit = True
+        psycopg.Cursor(conn).execute("SELECT 1")
+        conn.autocommit = False
+    except psycopg.Error as exc:
+        conn.close()
+        why = (f"the store did not answer at its transaction address within {seconds:g}s"
+               if cut.is_set() else f"cannot reach the store: {exc}")
+        raise DbError("store_unreachable", why,
+                      "check the database setting with `capabilities store doctor`") from exc
+    finally:
+        timer.cancel()
+        held.close()
 
 
 def bound_schema(conn: Any) -> str | None:

@@ -14,7 +14,7 @@ from pathlib import Path
 import psycopg
 import pytest
 
-from capabilities_contract.db import connect, migrate
+from capabilities_contract.db import DbError, connect, migrate
 
 PGBOUNCER_ENV = "CAPABILITIES_CONTRACT_TEST_PGBOUNCER"
 
@@ -101,3 +101,60 @@ def test_a_session_binding_through_the_pooler_would_leak(store, pooler):
         one.execute("SET search_path TO leaked_schema")
         assert two.execute("SHOW search_path").fetchone() == ("leaked_schema",)
         one.execute("RESET search_path")
+
+
+def test_a_read_only_default_works_through_the_pooler(store, pooler, monkeypatch):
+    """A pooler in transaction mode refuses startup options; the read-only
+    default reaches each transaction instead."""
+    store.write(transaction_host="127.0.0.1", transaction_port=pooler)
+    monkeypatch.setenv("PGOPTIONS", "-c default_transaction_read_only=on")
+    with connect(application_name="pooled", transaction=True) as conn:
+        assert conn.execute("SHOW transaction_read_only").fetchone() == ("on",)
+        with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
+            conn.execute("CREATE TABLE demo_written (id int)")
+
+
+def test_a_store_that_does_not_answer_behind_the_pooler_is_refused_in_time(
+        store, server, tmp_path):
+    """The pooler accepts the client and holds it while the store behind it
+    does not answer; the client gives up within its connect timeout."""
+    binary = os.environ.get(PGBOUNCER_ENV)
+    if not binary or not Path(binary).is_file():
+        pytest.skip(f"{PGBOUNCER_ENV} does not name a pgbouncer executable")
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        dead = sock.getsockname()[1]
+    port = _free_port()
+    cert = Path(server.rootcert)
+    (tmp_path / "users.txt").write_text(f'"{server.user}" "{server.password}"\n')
+    (tmp_path / "pgbouncer.ini").write_text(
+        "[databases]\n"
+        f"{server.database} = host=127.0.0.1 port={dead} dbname={server.database}\n"
+        "[pgbouncer]\n"
+        f"listen_addr = 127.0.0.1\nlisten_port = {port}\nunix_socket_dir =\n"
+        f"auth_type = plain\nauth_file = {tmp_path / 'users.txt'}\n"
+        "pool_mode = transaction\ndefault_pool_size = 1\n"
+        f"client_tls_sslmode = require\nclient_tls_cert_file = {cert}\n"
+        f"client_tls_key_file = {cert.parent / 'server.key'}\n"
+        f"logfile = {tmp_path / 'pgbouncer.log'}\n")
+    proc = subprocess.Popen([binary, str(tmp_path / "pgbouncer.ini")],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                break
+            except OSError:
+                assert time.monotonic() < deadline and proc.poll() is None
+                time.sleep(0.1)
+        store.write(transaction_host="127.0.0.1", transaction_port=port)
+        started = time.monotonic()
+        with pytest.raises(DbError) as caught:
+            connect(application_name="pooled", transaction=True, connect_timeout=3)
+        took = time.monotonic() - started
+        assert caught.value.slug == "store_unreachable"
+        assert took < 8, took
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
