@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+import uuid
 
 import pytest
 from _proxy import Proxy
@@ -72,6 +73,51 @@ def test_migrate_creates_the_versions_table_also_on_a_store_made_before_it(migra
         assert result.skipped == ["0001"] and result.applied == []
         assert announce(conn, "demo_rows", "p1") == 1
         conn.commit()
+
+
+@pytest.mark.parametrize("limit", ["no_create", "read_only"])
+def test_a_role_that_may_not_create_migrates_a_store_made_before_the_versions_table(
+        migrated, server, limit):
+    steps = [("0001", "CREATE TABLE demo_rows (id int)")]
+    schema, role = migrated.schema, f"tool_{uuid.uuid4().hex[:12]}"
+    with server.admin() as admin:
+        admin.execute(f'DROP TABLE "{schema}".schema_channel')
+        admin.execute(f"CREATE ROLE {role} LOGIN PASSWORD 'tool-pw'")
+        admin.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO {role}')
+        admin.execute(f'GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA "{schema}" TO {role}')
+        if limit == "read_only":
+            admin.execute(f'GRANT CREATE ON SCHEMA "{schema}" TO {role}')
+            admin.execute(f"ALTER ROLE {role} SET default_transaction_read_only = on")
+    try:
+        migrated.write(user=role, password="tool-pw")
+        with connect(application_name="tool", transaction=True) as conn:
+            result = migrate(conn, "demo", steps, major=1, minor=0)
+            assert result.skipped == ["0001"] and result.applied == []
+            if limit == "no_create":
+                assert migrate(conn, "demo", steps, major=1, minor=1).minor == 1
+                with pytest.raises(DbError) as refused:
+                    announce(conn, "demo_rows", "p1")
+                assert refused.value.slug == "not_migrated"
+                conn.rollback()
+        disconnect()
+        migrated.write()
+        with connect(application_name="owner", transaction=True) as conn:
+            migrate(conn, "demo", steps, major=1, minor=1)
+        disconnect()
+        if limit == "no_create":
+            with server.admin() as admin:
+                admin.execute(f'GRANT SELECT, INSERT, UPDATE ON "{schema}".schema_channel '
+                              f"TO {role}")
+            migrated.write(user=role, password="tool-pw")
+            with connect(application_name="tool", transaction=True) as conn:
+                assert announce(conn, "demo_rows", "p1") == 1
+                conn.commit()
+            disconnect()
+    finally:
+        disconnect(every=True)
+        with server.admin() as admin:
+            admin.execute(f'DROP OWNED BY {role}')
+            admin.execute(f"DROP ROLE {role}")
 
 
 def test_a_raise_is_seen_by_a_follower_within_two_seconds(migrated):

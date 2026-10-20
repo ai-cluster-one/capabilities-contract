@@ -189,10 +189,20 @@ def _lock(conn: Any, key: str) -> None:
         time.sleep(_LOCK_POLL_SECONDS)
 
 
+def _may_create(conn: Any, schema: str) -> bool:
+    """Whether this session may create a table in `schema`: its role holds CREATE
+    on it and the transaction is not read-only."""
+    return conn.execute("SELECT has_schema_privilege(%s, 'CREATE') "
+                        "AND current_setting('transaction_read_only') = 'off'",
+                        (schema,)).fetchone()[0]
+
+
 def _bootstrap(conn: Any, schema: str) -> None:
     """Create the schema and the platform tables if missing, under the schema lock.
     Existence is checked first, so a role that may not create them can still use them
-    once they exist."""
+    once they exist. `schema_channel` came later than the other two, so a store made
+    before it is left without it by a session that may not create it, and gets it
+    from the first one that may."""
     _, sql = _psycopg()
     with conn.transaction():
         _lock(conn, f"capabilities_contract:{schema}")
@@ -217,7 +227,7 @@ def _bootstrap(conn: Any, schema: str) -> None:
                     sql.Identifier(schema), sql.Identifier(VERSION_TABLE)))
         channel = conn.execute("SELECT to_regclass(%s)",
                                (f'"{schema}".{CHANNEL_TABLE}',)).fetchone()[0]
-        if channel is None:
+        if channel is None and _may_create(conn, schema):
             table = sql.SQL("{}.{}").format(sql.Identifier(schema),
                                             sql.Identifier(CHANNEL_TABLE))
             conn.execute(sql.SQL(
@@ -269,12 +279,14 @@ def _settled(conn: Any, schema: str, owner: str, plan: list[Step], major: int, m
     """Whether there is nothing to do: the platform tables exist, every step is
     applied with its SQL, and the store records the caller's version or a newer
     minor. Read without a lock, so a session holding one stops no caller whose
-    tables are already in place. Refuses as the locked path would."""
+    tables are already in place. Refuses as the locked path would. A missing
+    `schema_channel` leaves work only for a session that may create it."""
     _, sql = _psycopg()
     with conn.transaction():
         for table in (LEDGER_TABLE, VERSION_TABLE, CHANNEL_TABLE):
-            if conn.execute("SELECT to_regclass(%s)",
-                            (f'"{schema}".{table}',)).fetchone()[0] is None:
+            missing = conn.execute("SELECT to_regclass(%s)",
+                                   (f'"{schema}".{table}',)).fetchone()[0] is None
+            if missing and (table != CHANNEL_TABLE or _may_create(conn, schema)):
                 return False
         stored = _check_version(conn, schema, owner, major, minor, result)
         if stored is None or stored < (major, minor):

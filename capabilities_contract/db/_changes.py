@@ -55,7 +55,8 @@ def _table(conn: Any) -> Any:
 
 def _missing() -> DbError:
     return DbError("not_migrated", f"the store has no {CHANNEL_TABLE} table",
-                   "run migrate with this library version once; it creates the table")
+                   "run migrate with this library version once, as a role that may create "
+                   "in the schema; it creates the table")
 
 
 def announce(conn: Any, channel: str, scope: str) -> int:
