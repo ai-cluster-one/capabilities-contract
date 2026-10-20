@@ -1,10 +1,10 @@
 """The shared database layer: resolve which database a project uses, connect bound to
 its schema, migrate each owner's tables once under a ledger, and report where they stand.
 
-Importing this module does not import psycopg; `connect` and `migrate` do.
+Importing this module does not import psycopg; `connect`, `batch` and `migrate` do.
 """
 
-from capabilities_contract.db._connect import connect, disconnect
+from capabilities_contract.db._connect import batch, connect, disconnect
 from capabilities_contract.db._errors import DbError
 from capabilities_contract.db._migrate import MigrateResult, MigrateStatus, Step, migrate, status
 from capabilities_contract.db._setting import (
@@ -27,6 +27,7 @@ __all__ = [
     "MigrateStatus",
     "Setting",
     "Step",
+    "batch",
     "connect",
     "disconnect",
     "migrate",

@@ -351,12 +351,26 @@ def test_a_commit_whose_answer_was_lost_is_never_sent_again(table, server, monke
             raise psycopg.OperationalError("server closed the connection unexpectedly")
         return result
 
-    monkeypatch.setattr(kind, "_exec_command", lose_the_answer)
+    # In autocommit the statement and its commit go to the store as one
+    # message: the store ran and committed it, and its answer was lost.
+    real_wait = kind.wait
+    armed = [True]
+
+    def lose_the_message_answer(self, gen, *args, **kwargs):
+        result = real_wait(self, gen, *args, **kwargs)
+        if armed and armed.pop():
+            self.pgconn.finish()
+            raise psycopg.OperationalError("server closed the connection unexpectedly")
+        return result
+
     conn = connect(application_name="committed", transaction=True)
     conn.autocommit = True
+    monkeypatch.setattr(kind, "wait", lose_the_message_answer)
     with pytest.raises(psycopg.OperationalError):
         conn.execute("INSERT INTO demo_rows VALUES (1)")
+    monkeypatch.setattr(kind, "wait", real_wait)
     conn.close()
+    monkeypatch.setattr(kind, "_exec_command", lose_the_answer)
     with pytest.raises(psycopg.OperationalError), \
             connect(application_name="committed", transaction=True) as block, \
             block.transaction():

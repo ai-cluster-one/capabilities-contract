@@ -12,8 +12,16 @@ of a process: it is the process's working connection. It is opened on the first
 `connect(..., transaction=True)` and lent to each later one; `close()` ends the loan
 and keeps it for the next, and it is closed when the process exits. A loan taken while
 another is still out gets a working connection of its own. A connect that fails is
-tried again with a short pause, and a statement that finds its connection gone before
-anything of its transaction reached the store runs again on a new one."""
+tried again after a short jittered pause, a store that still did not answer is not
+dialled again before a doubling pause has passed, and a statement that finds its
+connection gone before anything of its transaction reached the store runs again on a
+new one.
+
+A statement that would open a transaction and is one of its own - any statement in
+autocommit, a plain read otherwise - reaches the store in one round trip, its
+transaction's start, binding and commit with it, and leaves the connection idle; a
+transaction-mode pooler then hands the server session on as soon as it answers.
+`batch` sends independent statements as one pipeline, answered in one round trip."""
 
 from __future__ import annotations
 
@@ -21,6 +29,7 @@ import contextlib
 import functools
 import math
 import os
+import random
 import re
 import sys
 import threading
@@ -54,6 +63,13 @@ KEEPALIVE_COUNT = 3
 # password, a database that is not there - is not tried again.
 CONNECT_ATTEMPTS = 3
 CONNECT_PAUSE_SECONDS = 0.25
+
+# After a connect to an address that no store answered, a further connect to it
+# is refused at once as `store_unreachable` for a pause drawn between half and
+# all of RECONNECT_FIRST_SECONDS, doubling with each failure in a row up to
+# RECONNECT_LONGEST_SECONDS; the first connect after the pause dials again.
+RECONNECT_FIRST_SECONDS = 1.0
+RECONNECT_LONGEST_SECONDS = 30.0
 
 # The working connection: a loan of one that sat idle for PING_AFTER_SECONDS proves it
 # still answers with one round trip, cut at the connect timeout. Each working
@@ -204,7 +220,9 @@ def _transaction_class():
         """A cursor whose statements run with the connection's schema bound for the
         transaction they run in, and never leave state in the session."""
 
-        def _ready(self, query: Any) -> None:
+        def _check(self, query: Any) -> None:
+            """Refuse, before anything is sent, a statement on a connection whose
+            loan ended or one that would leave state in the session."""
             conn = self.connection
             if not conn._lent:
                 raise psycopg.OperationalError("the connection is closed")
@@ -215,7 +233,10 @@ def _transaction_class():
                               "lock belong on a session connection",
                               "open it with connect(..., transaction=False), or take a "
                               "transaction-level lock (pg_advisory_xact_lock)")
-            conn._bind_transaction()
+
+        def _ready(self, query: Any) -> None:
+            self._check(query)
+            self.connection._bind_transaction()
 
         def _again(self, conn: Any, err: BaseException) -> bool:
             """Whether a statement that failed with `err` runs again: its
@@ -228,8 +249,18 @@ def _transaction_class():
             self._pgconn = conn.pgconn
             return True
 
-        def _run(self, query: Any, call: Any) -> Any:
+        def _run(self, query: Any, call: Any, alone: Any = None) -> Any:
             conn = self.connection
+            text = text_of(conn, query)
+            plain = _plain_read(text)
+            # A statement that would open a transaction and runs as one of its
+            # own - any statement in autocommit, a plain read otherwise - goes
+            # to the store with the transaction's start, its binding and its
+            # commit in one round trip, and leaves the connection idle.
+            if alone is not None and conn._stands_alone(plain):
+                self._check(query)
+                kind, run = alone
+                return conn._alone([(self, run)], plain, pipelined=kind == "pipeline")
             for attempt in (0, 1):
                 if conn.autocommit and conn.info.transaction_status == idle:
                     # Autocommit runs each statement as its own transaction, which a
@@ -237,7 +268,6 @@ def _transaction_class():
                     # first. Its commit may have reached the store when the
                     # connection breaks, so a failed commit never runs it again.
                     sent = False
-                    plain = _plain_read(text_of(conn, query))
                     try:
                         with conn.transaction():
                             self._ready(query)
@@ -258,7 +288,6 @@ def _transaction_class():
                 # transaction that has only read, inside `transaction()` blocks
                 # too: the new connection opens the blocks again before it.
                 opens = conn.info.transaction_status == idle
-                plain = _plain_read(text_of(conn, query))
                 reads = (not opens and plain and conn._reads_only
                          and conn.isolation_level in (None, read_committed))
                 try:
@@ -273,12 +302,44 @@ def _transaction_class():
 
         def execute(self, query, params=None, **kwargs):
             sup = super()
-            return self._run(query, lambda: sup.execute(query, params, **kwargs))
+            alone = None
+            if isinstance(query, (str, bytes, sql.Composable)) and text_of(
+                    self.connection, query).strip():
+                if not kwargs.get("binary") and self.format != pq.Format.BINARY and (
+                        params is None or (not params and "%" not in text_of(
+                            self.connection, query))):
+                    # Sent as a simple query behind the binding: one message.
+                    alone = ("simple", functools.partial(
+                        self._simple_behind_binding, query, kwargs))
+                elif psycopg.Pipeline.is_supported():
+                    alone = ("pipeline", lambda: sup.execute(query, params, **kwargs))
+            return self._run(query, lambda: sup.execute(query, params, **kwargs), alone)
+
+        def _simple_behind_binding(self, query: Any, kwargs: dict) -> None:
+            """Run `query`, which takes no parameter, as one simple query behind
+            the binding, so the store answers both in one round trip as one
+            implicit transaction; the cursor then stands on the query's own
+            first result."""
+            conn = self.connection
+            if isinstance(query, bytes):
+                body = query
+            elif isinstance(query, str):
+                body = sql.SQL(query).as_bytes(conn)
+            else:
+                body = query.as_bytes(conn)
+            psycopg.Cursor.execute(self, conn._binding().as_bytes(conn) + b";\n" + body,
+                                   None, **kwargs)
+            self.nextset()
+            return self
 
         def executemany(self, query, params_seq, **kwargs):
             sup = super()
             params_seq = list(params_seq)
-            return self._run(query, lambda: sup.executemany(query, params_seq, **kwargs))
+            alone = None
+            if psycopg.Pipeline.is_supported():
+                alone = ("pipeline", lambda: sup.executemany(query, params_seq, **kwargs))
+            return self._run(query, lambda: sup.executemany(query, params_seq, **kwargs),
+                             alone)
 
         def stream(self, query, params=None, **kwargs):
             self._ready(query)
@@ -337,6 +398,145 @@ def _transaction_class():
             if status == failed or self._bound_now:
                 return
             self._bind_now()
+
+        # -- a statement as a transaction of its own -------------------------------
+
+        def _stands_alone(self, plain: bool) -> bool:
+            """Whether a statement runs as a transaction of its own, in one round
+            trip: it would open a transaction, and either autocommit asks for one
+            per statement or it is a plain read at READ COMMITTED, which sees the
+            store as it is when it starts whatever transaction it runs in."""
+            return (self._pipeline is None
+                    and self.info.transaction_status == idle
+                    and (self.autocommit or plain)
+                    and self.isolation_level in (None, read_committed)
+                    and self.read_only is None and self.deferrable is None)
+
+        def _lost_unasked(self) -> bool:
+            """Whether the idle connection is gone already, known without a round
+            trip: the store or the network closed it, or the store said something
+            unasked, which on an idle connection that listens to nothing is its
+            farewell - the error it sends as it ends the session."""
+            if self.pgconn.status == psycopg.pq.ConnStatus.BAD:
+                return True
+            try:
+                return _readable(self.pgconn.socket)
+            except Exception:
+                return True
+
+        def _alone(self, runs: list, plain: bool, *, pipelined: bool) -> Any:
+            """Run each `(cursor, send)` of `runs` as one transaction of its own:
+            the schema bound, the statements and the commit reach the store
+            together and the store answers once, leaving the connection idle.
+            `pipelined` sends them as a pipeline behind the binding; otherwise
+            the one `send` carries the binding itself, as one simple query.
+
+            A connection found gone before anything is sent is replaced first.
+            A plain read that loses its connection runs once more on a new one;
+            anything else does once only when its commit was never sent, since a
+            commit that reached the store is never sent twice."""
+            for attempt in (0, 1):
+                self._take_due()
+                if self._lost_unasked():
+                    self._renew()
+                was, self._autocommit = self._autocommit, True
+                committed = False
+                out = None
+                try:
+                    if not pipelined:
+                        cursor, send = runs[0]
+                        cursor._pgconn = self.pgconn
+                        committed = True  # one message: its commit goes with it
+                        return send()
+                    block = self.pipeline()
+                    block.__enter__()
+                    try:
+                        psycopg.Cursor(self).execute(self._binding())
+                        for cursor, send in runs:
+                            cursor._pgconn = self.pgconn
+                            got = send()
+                            out = got if out is None else out
+                    except BaseException:
+                        with contextlib.suppress(Exception):
+                            block.__exit__(None, None, None)
+                        raise
+                    committed = True  # the sync commits what the pipeline ran
+                    block.__exit__(None, None, None)
+                    return out
+                except psycopg.OperationalError as err:
+                    if attempt or (committed and not plain) or not self._gone(err) \
+                            or not self._renew():
+                        raise
+                finally:
+                    self._autocommit = was
+                    self._bound_now = False
+            raise AssertionError("unreachable")
+
+        def _together(self, statements: list) -> list:
+            """The rows of each `(query, params)` of `statements`, sent as one
+            pipeline and answered in one round trip, with the schema bound: as a
+            transaction of its own where each would open one alone, else inside
+            the transaction that is open, or that the first of them opens."""
+            cursors = [self.cursor() for _ in statements]
+            for cursor, (query, _params) in zip(cursors, statements, strict=True):
+                cursor._check(query)
+            plain = all(_plain_read(text_of(self, query)) for query, _p in statements)
+
+            def sender(cursor: Any, query: Any, params: Any) -> Any:
+                return lambda: psycopg.Cursor.execute(cursor, query, params)
+
+            runs = [(cursor, sender(cursor, query, params))
+                    for cursor, (query, params) in zip(cursors, statements, strict=True)]
+            if self._stands_alone(plain):
+                self._alone(runs, plain, pipelined=True)
+            elif self.info.transaction_status == idle and self.autocommit:
+                # Autocommit at another isolation level: one transaction each.
+                for cursor, (query, params) in zip(cursors, statements, strict=True):
+                    cursor.execute(query, params)
+            else:
+                self._in_pipeline(runs)
+            return [cursor.fetchall() if cursor.description is not None else []
+                    for cursor in cursors]
+
+        def _in_pipeline(self, runs: list) -> None:
+            """Send `runs` as one pipeline inside the open transaction, or
+            inside the one it opens, bound, which stays open for the caller's
+            commit. Opening it runs again on a new connection when this one is
+            gone, since nothing of it was committed."""
+            for attempt in (0, 1):
+                opens = self.info.transaction_status == idle
+                if opens:
+                    self._take_due()
+                    if self._lost_unasked():
+                        self._renew()
+                was, self._autocommit = self._autocommit, True
+                try:
+                    block = self.pipeline()
+                    block.__enter__()
+                    try:
+                        if opens:
+                            self._bound_now = False
+                            self.wait(self._exec_command(self._get_tx_start_command()))
+                        if not self._bound_now:
+                            psycopg.Cursor(self).execute(self._binding())
+                            self._bound_now = True
+                        for cursor, send in runs:
+                            cursor._pgconn = self.pgconn
+                            send()
+                    except BaseException:
+                        with contextlib.suppress(Exception):
+                            block.__exit__(None, None, None)
+                        raise
+                    block.__exit__(None, None, None)
+                    if opens:
+                        self._reads_only = False
+                    return
+                except psycopg.OperationalError as err:
+                    if attempt or not opens or not self._gone(err) or not self._renew():
+                        raise
+                finally:
+                    self._autocommit = was
+            raise AssertionError("unreachable")
 
         @contextmanager
         def transaction(self, savepoint_name=None, force_rollback=False):
@@ -548,6 +748,18 @@ def _transaction_class():
     return TransactionConnection
 
 
+def _readable(fd: int) -> bool:
+    """Whether `fd` has something to read now, without waiting."""
+    import select
+
+    if hasattr(select, "poll"):
+        poller = select.poll()
+        poller.register(fd, select.POLLIN | select.POLLERR | select.POLLHUP)
+        return bool(poller.poll(0))
+    ready, _w, _x = select.select([fd], [], [], 0)
+    return bool(ready)
+
+
 def _keepalives(conn: Any) -> None:
     """Ask the server to probe this client as the client probes the server. Over a
     Unix socket the server ignores the settings."""
@@ -620,6 +832,18 @@ def connect(*, application_name: str, project_root: Path | str | None = None,
     transaction connection at a transaction address of its own proves the
     store answers behind it within `connect_timeout`.
 
+    On a transaction connection, a statement that would open a transaction and
+    is one of its own - any statement in autocommit, or a plain read (a
+    `SELECT`, `WITH`, `VALUES`, `TABLE` or `SHOW` naming no write, lock,
+    sequence or setting) at READ COMMITTED - is sent with the schema binding
+    and its commit as one message, or one pipeline where it takes parameters,
+    so the store answers it in one round trip and the connection is idle after
+    it, never left inside a transaction. A read inside a transaction that is
+    open - a `transaction()` block, or after a write not yet committed - runs
+    in that transaction, and a write that opens one leaves it open for
+    `commit()`. A connection set to another isolation level, or to read-only
+    or deferrable, opens a transaction for a read as before.
+
     A transaction connection is the process's working connection for that address,
     lent: the first `connect` opens it, `close()` (or leaving `with`) ends the loan,
     rolling back what was not committed, and the next `connect` is lent the same
@@ -628,21 +852,29 @@ def connect(*, application_name: str, project_root: Path | str | None = None,
     loan taken while another is out gets one of its own, and each working
     connection is closed when the process exits or `disconnect()` closes it. One the
     store closed, or that sat idle for PING_AFTER_SECONDS and does not answer, is
-    replaced as it is lent; a statement that finds it gone before anything of its
+    replaced as it is lent, and one the store or the network closed while it
+    was lent is replaced before a statement that is a transaction of its own is
+    sent on it; a statement that finds it gone before anything of its
     transaction reached the store - the statement that opens the transaction, or
-    one in autocommit before its commit is sent - runs once more on a new
-    connection, and a commit is never sent twice; so does a plain read in a
-    transaction that has only read. A rollback on a connection that is gone is
-    not refused, nor the commit of a transaction that has only read, and the
-    next statement takes a new connection.
+    one in autocommit before it is sent - runs once more on a new connection,
+    and a commit is never sent twice; so does a plain read that is a
+    transaction of its own, and a plain read in a transaction that has only
+    read. A rollback on a connection that is gone is not refused, nor the
+    commit of a transaction that has only read, and the next statement takes a
+    new connection.
 
     A connect that fails before the store answers is tried again, at most
-    CONNECT_ATTEMPTS times with a short pause, while `connect_timeout` seconds are
-    not spent; a store that still does not answer is refused as
-    `store_unreachable`. Both ends send TCP keepalives on a session connection; a
-    transaction connection sends them from the client only. A session address that is
-    Supabase's transaction pooler is refused as `transaction_pooler` before anything
-    is sent to it."""
+    CONNECT_ATTEMPTS times with a short jittered, doubling pause, while
+    `connect_timeout` seconds are not spent; a store that still does not answer
+    is refused as `store_unreachable`. Then a further transaction connection to
+    that address - a `connect` or a lost connection's replacement - is refused
+    at once as `store_unreachable` for a pause of between half and all of
+    RECONNECT_FIRST_SECONDS, doubling with each failure in a row up to
+    RECONNECT_LONGEST_SECONDS, and the first after the pause dials again; the
+    first connect of a process always dials. Both ends send TCP keepalives on a
+    session connection; a transaction connection sends them from the client only.
+    A session address that is Supabase's transaction pooler is refused as
+    `transaction_pooler` before anything is sent to it."""
     if not isinstance(application_name, str) or not application_name:
         raise DbError("bad_application_name", "application_name must be a non-empty string")
     setting = setting if setting is not None else resolve_setting(project_root)
@@ -660,8 +892,7 @@ def connect(*, application_name: str, project_root: Path | str | None = None,
         startup = _startup_settings(setting)
         # No startup option is sent: each one is set for every transaction.
         kwargs = {**setting.transaction_kwargs(), "options": "", **options}
-        key = repr(sorted((name, str(value)) for name, value in kwargs.items()
-                          if name != "application_name"))
+        key = _address_key(kwargs)
         conn = _lend(key, connect_timeout)
         if conn is None:
             conn = _open_transaction(kwargs, setting.has_transaction_address,
@@ -723,9 +954,59 @@ def _attempts(open_one: Any, budget: float) -> Any:
                 raise
             last = exc
         if attempt + 1 < CONNECT_ATTEMPTS:
-            time.sleep(CONNECT_PAUSE_SECONDS * (2 ** attempt))
+            time.sleep(_jittered(CONNECT_PAUSE_SECONDS * (2 ** attempt)))
     assert last is not None
     raise last
+
+
+def _jittered(seconds: float) -> float:
+    """A pause of at most `seconds` and at least half of it, drawn at random, so
+    processes that lost one store together do not dial it again in step."""
+    return random.uniform(seconds / 2, seconds)
+
+
+# The addresses whose last connect found no store answering, each with how many
+# connects in a row failed, until when no new one is dialled, and why the last
+# failed. Kept per process, so the first connect of a process always dials.
+_PAUSED: dict[str, tuple[int, float, BaseException]] = {}
+
+
+def _address_key(kwargs: dict) -> str:
+    """The address a transaction connection opened with `kwargs` is kept under."""
+    return repr(sorted((name, str(value)) for name, value in kwargs.items()
+                       if name != "application_name"))
+
+
+def _paused(key: str) -> None:
+    """Refuse at once a connect to an address within the pause that followed its
+    last failed connect."""
+    with _LOCK:
+        held = _PAUSED.get(key)
+    if held is None:
+        return
+    failures, until, why = held
+    left = until - time.monotonic()
+    if left <= 0:
+        return
+    raise DbError("store_unreachable",
+                  f"cannot reach the store: {why}".rstrip() +
+                  f" (no answer to {failures} connect(s) in a row; not dialled again "
+                  f"for {left:.1f}s)",
+                  "check the database setting with `capabilities store doctor`") from why
+
+
+def _note_connect(key: str, failure: BaseException | None) -> None:
+    """Record how a connect to `key` ended: a store that did not answer pauses
+    the next connects for a doubling, jittered while, at most
+    RECONNECT_LONGEST_SECONDS; one that answered ends the pause."""
+    with _LOCK:
+        if failure is None:
+            _PAUSED.pop(key, None)
+            return
+        failures = (_PAUSED.get(key) or (0, 0.0, failure))[0] + 1
+        pause = min(RECONNECT_LONGEST_SECONDS,
+                    RECONNECT_FIRST_SECONDS * (2 ** min(failures - 1, 16)))
+        _PAUSED[key] = (failures, time.monotonic() + _jittered(pause), failure)
 
 
 def _open_transaction(kwargs: dict, own_address: bool, budget: float) -> Any:
@@ -733,6 +1014,8 @@ def _open_transaction(kwargs: dict, own_address: bool, budget: float) -> Any:
     proven to answer behind a transaction address of its own. Raises DbError."""
     psycopg, _ = _psycopg()
     kind = _transaction_class()
+    key = _address_key(kwargs)
+    _paused(key)
 
     def open_one(seconds: int) -> Any:
         conn = kind.connect(**kwargs, connect_timeout=seconds, prepare_threshold=None,
@@ -750,9 +1033,13 @@ def _open_transaction(kwargs: dict, own_address: bool, budget: float) -> Any:
     try:
         conn = _attempts(open_one, budget)
     except psycopg.OperationalError as exc:
-        why = str(exc) if isinstance(exc, _unanswered()) else f"cannot reach the store: {exc}"
+        unanswered = isinstance(exc, _unanswered())
+        if unanswered or _transient(exc):
+            _note_connect(key, exc)
+        why = str(exc) if unanswered else f"cannot reach the store: {exc}"
         raise DbError("store_unreachable", why,
                       "check the database setting with `capabilities store doctor`") from exc
+    _note_connect(key, None)
     conn._opened_with = (kwargs, own_address, budget)
     conn._blocks = []
     conn._startup_name = str(kwargs.get("application_name") or "")
@@ -840,6 +1127,7 @@ def _forget_after_fork() -> None:
     _INHERITED.extend(_OPEN)
     _OPEN.clear()
     _IDLE.clear()
+    _PAUSED.clear()
 
 
 def _finish(conn: Any) -> None:
@@ -930,6 +1218,61 @@ def disconnect(*, every: bool = False) -> int:
     for conn in closing:
         _finish(conn)
     return len(closing)
+
+
+def batch(conn: Any, statements: Any) -> list[list]:
+    """Send `statements` - each a query, or a `(query, params)` pair - to the store
+    as one pipeline on `conn`, a connection from `connect`, and return each one's
+    rows, in order: a list of rows for a statement that returns rows, an empty
+    list for one that does not. The store answers them all in one round trip.
+    Each is one statement; the statements are independent, none reading what an
+    earlier one returns.
+
+    On a transaction connection the schema is bound for them. Where each would
+    open a transaction of its own - in autocommit, or when every one is a plain
+    read - they run as one transaction of their own and leave the connection
+    idle, and when every one is a plain read a lost connection runs them again
+    on a new one. Otherwise they run inside the transaction that is open, or
+    the one the first of them opens, which stays open for the caller's
+    commit. A statement that fails fails the pipeline: its error is raised and
+    the statements after it are not run."""
+    items = []
+    for statement in statements:
+        if isinstance(statement, tuple):
+            query, params = statement
+        else:
+            query, params = statement, None
+        items.append((query, params))
+    if not items:
+        return []
+    psycopg, _ = _psycopg()
+    if isinstance(conn, _transaction_class()):
+        if psycopg.Pipeline.is_supported():
+            return conn._together(items)
+        cursors = [conn.cursor() for _ in items]
+        for cursor, (query, params) in zip(cursors, items, strict=True):
+            cursor.execute(query, params)
+    else:
+        cursors = [conn.cursor() for _ in items]
+        if psycopg.Pipeline.is_supported():
+            # A transaction this opens is begun inside the pipeline, not
+            # synced on its own.
+            opens = (not conn.autocommit
+                     and conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE)
+            was, conn._autocommit = conn._autocommit, True
+            try:
+                with conn.pipeline():
+                    if opens:
+                        conn.wait(conn._exec_command(conn._get_tx_start_command()))
+                    for cursor, (query, params) in zip(cursors, items, strict=True):
+                        cursor.execute(query, params)
+            finally:
+                conn._autocommit = was
+        else:
+            for cursor, (query, params) in zip(cursors, items, strict=True):
+                cursor.execute(query, params)
+    return [cursor.fetchall() if cursor.description is not None else []
+            for cursor in cursors]
 
 
 def bound_schema(conn: Any) -> str | None:

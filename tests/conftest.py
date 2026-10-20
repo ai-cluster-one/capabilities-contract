@@ -188,12 +188,14 @@ def child_env(config_home: Path) -> dict:
 
 @pytest.fixture(autouse=True)
 def no_working_connection():
-    """Each test starts and ends with no working connection held by this process,
-    as a process does when it starts and once it exits."""
-    from capabilities_contract.db import disconnect
+    """Each test starts and ends with no working connection held by this process
+    and no address paused, as a process does when it starts and once it exits."""
+    from capabilities_contract.db import _connect, disconnect
     disconnect(every=True)
+    _connect._PAUSED.clear()
     yield
     disconnect(every=True)
+    _connect._PAUSED.clear()
 
 
 @pytest.fixture()

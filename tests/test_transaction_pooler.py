@@ -14,7 +14,7 @@ from pathlib import Path
 import psycopg
 import pytest
 
-from capabilities_contract.db import DbError, connect, disconnect, migrate
+from capabilities_contract.db import DbError, batch, connect, disconnect, migrate
 
 PGBOUNCER_ENV = "CAPABILITIES_CONTRACT_TEST_PGBOUNCER"
 
@@ -88,6 +88,35 @@ def test_transaction_connections_share_one_server_session_cleanly(store, pooler)
         assert first.execute("SELECT count(*) FROM pg_prepared_statements").fetchone() == (0,)
         assert first.execute("SELECT count(*) FROM pg_listening_channels()").fetchone() == (0,)
         first.commit()
+
+
+def test_a_read_alone_and_a_batch_run_through_the_pooler(store, pooler):
+    """A read that runs as a transaction of its own and a pipeline of
+    statements reach the store through a transaction-mode pooler bound, and a
+    read leaves the pooler's one server session to the next client."""
+    store.write(transaction_host="127.0.0.1", transaction_port=pooler)
+    idle = psycopg.pq.TransactionStatus.IDLE
+    with connect(application_name="pooled", transaction=True) as first, \
+            connect(application_name="pooled", transaction=True) as second:
+        migrate(first, "demo", [("0001", "CREATE TABLE demo_rows (id int, who text)")],
+                major=1, minor=0)
+        first.execute("INSERT INTO demo_rows VALUES (%s, %s)", (1, "a"))
+        first.commit()
+        for conn in (first, second, first, second):
+            assert conn.execute("SELECT count(*) FROM demo_rows").fetchone() == (1,)
+            assert conn.execute("SELECT who FROM demo_rows WHERE id = %s",
+                                (1,)).fetchone() == ("a",)
+            assert conn.info.transaction_status == idle
+        assert batch(second, ["SHOW search_path",
+                              ("SELECT count(*) FROM demo_rows WHERE who = %s", ("a",))]) \
+            == [[(store.schema,)], [(1,)]]
+        assert batch(first, [("INSERT INTO demo_rows VALUES (%s, %s)", (2, "b")),
+                             "SELECT count(*) FROM demo_rows"]) == [[], [(2,)]]
+        first.commit()
+        second.autocommit = True
+        second.execute("INSERT INTO demo_rows VALUES (%s, %s)", (3, "c"))
+        assert batch(second, ["SELECT count(*) FROM demo_rows"]) == [[(3,)]]
+        assert first.execute("SELECT count(*) FROM pg_prepared_statements").fetchone() == (0,)
 
 
 def test_a_session_binding_through_the_pooler_would_leak(store, pooler):
