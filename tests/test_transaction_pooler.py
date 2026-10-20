@@ -14,7 +14,15 @@ from pathlib import Path
 import psycopg
 import pytest
 
-from capabilities_contract.db import DbError, batch, connect, disconnect, migrate
+from capabilities_contract.db import (
+    DbError,
+    Follower,
+    announce,
+    batch,
+    connect,
+    disconnect,
+    migrate,
+)
 
 PGBOUNCER_ENV = "CAPABILITIES_CONTRACT_TEST_PGBOUNCER"
 
@@ -118,6 +126,24 @@ def test_a_read_alone_and_a_batch_run_through_the_pooler(store, pooler):
         assert batch(second, ["SELECT count(*) FROM demo_rows"]) == [[(3,)]]
         assert first.execute("SELECT count(*) FROM pg_prepared_statements").fetchone() == (0,)
 
+
+def test_announce_and_follow_run_through_the_pooler(store, pooler):
+    store.write(transaction_host="127.0.0.1", transaction_port=pooler)
+    with connect(application_name="pooled", transaction=True) as conn:
+        migrate(conn, "demo", [("0001", "CREATE TABLE demo_rows (id int)")],
+                major=1, minor=0)
+    follower = Follower([("demo_rows", "p1"), "demo_runs"], application_name="pooled")
+    assert follower.poll() == {("demo_rows", "p1"): 0}
+    with connect(application_name="pooled", transaction=True) as writer:
+        writer.execute("INSERT INTO demo_rows VALUES (1)")
+        assert announce(writer, "demo_rows", "p1") == 1
+        writer.rollback()
+        writer.execute("INSERT INTO demo_rows VALUES (2)")
+        assert announce(writer, "demo_rows", "p1") == 1
+        assert announce(writer, "demo_runs", "p9") == 1
+        writer.commit()
+    assert follower.poll() == {("demo_rows", "p1"): 1, ("demo_runs", "p9"): 1}
+    assert follower.poll() == {}
 
 def test_a_session_binding_through_the_pooler_would_leak(store, pooler):
     """Why the transaction path binds per transaction: a session SET made by one client

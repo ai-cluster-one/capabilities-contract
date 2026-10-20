@@ -178,7 +178,8 @@ def test_migrate_creates_the_ledger_and_applies_each_step_once(store):
         cols = _rows(conn, "SELECT table_name, column_name FROM information_schema.columns "
                            "WHERE table_schema = %s AND table_name LIKE 'schema_%%' "
                            "ORDER BY table_name, ordinal_position", (store.schema,))
-        assert cols == [("schema_ledger", c) for c in
+        assert cols == [("schema_channel", c) for c in ("channel", "scope", "version")] + \
+                       [("schema_ledger", c) for c in
                         ("owner", "step", "checksum", "applied_at", "library_version")] + \
                        [("schema_version", c) for c in ("owner", "major", "minor", "updated_at")]
         again = migrate(conn, "demo", STEPS, major=1, minor=0)

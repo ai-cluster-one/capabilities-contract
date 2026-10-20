@@ -4,6 +4,7 @@ An owner is the tool that owns a set of tables, named for it: every relation, in
 sequence, type and function its steps create is named `<owner>` or `<owner>_*`, in
 the configured schema. Two platform tables in the same schema keep the books:
 `schema_ledger` (one row per applied step) and `schema_version` (one row per owner).
+A third, `schema_channel`, holds the change versions processes follow by polling.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from capabilities_contract.db._changes import CHANNEL_TABLE
 from capabilities_contract.db._connect import _psycopg, bind_search_path, bound_schema
 from capabilities_contract.db._errors import DbError
 from capabilities_contract.db._setting import check_schema_name
@@ -22,7 +24,7 @@ from capabilities_contract.version import __version__
 
 LEDGER_TABLE = "schema_ledger"
 VERSION_TABLE = "schema_version"
-RESERVED_NAMES = (LEDGER_TABLE, VERSION_TABLE)
+RESERVED_NAMES = (LEDGER_TABLE, VERSION_TABLE, CHANNEL_TABLE)
 RESERVED_OWNERS = ("schema", "pg")
 
 # A lock is waited for this long at most, without queueing for it, and a session
@@ -213,6 +215,25 @@ def _bootstrap(conn: Any, schema: str) -> None:
                 "CREATE TABLE {}.{} (owner text PRIMARY KEY, major integer NOT NULL, "
                 "minor integer NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())").format(
                     sql.Identifier(schema), sql.Identifier(VERSION_TABLE)))
+        channel = conn.execute("SELECT to_regclass(%s)",
+                               (f'"{schema}".{CHANNEL_TABLE}',)).fetchone()[0]
+        if channel is None:
+            table = sql.SQL("{}.{}").format(sql.Identifier(schema),
+                                            sql.Identifier(CHANNEL_TABLE))
+            conn.execute(sql.SQL(
+                "CREATE TABLE {} (channel text NOT NULL CHECK (channel <> ''), "
+                "scope text NOT NULL CHECK (scope <> ''), version bigint NOT NULL, "
+                "PRIMARY KEY (channel, scope))").format(table))
+            conn.execute(sql.SQL(
+                "COMMENT ON TABLE {} IS 'One version per channel and scope, raised by a "
+                "writer inside the transaction whose change it announces and read by "
+                "followers that poll for what moved.'").format(table))
+            conn.execute(sql.SQL(
+                "COMMENT ON COLUMN {}.scope IS 'What the change is about within the "
+                "channel, such as a project id.'").format(table))
+            conn.execute(sql.SQL(
+                "COMMENT ON COLUMN {}.version IS 'Raised by one on every announced change; "
+                "a pair with no row has version 0.'").format(table))
 
 
 def _stored_version(conn: Any, schema: str, owner: str) -> tuple[int, int] | None:
@@ -251,7 +272,7 @@ def _settled(conn: Any, schema: str, owner: str, plan: list[Step], major: int, m
     tables are already in place. Refuses as the locked path would."""
     _, sql = _psycopg()
     with conn.transaction():
-        for table in (LEDGER_TABLE, VERSION_TABLE):
+        for table in (LEDGER_TABLE, VERSION_TABLE, CHANNEL_TABLE):
             if conn.execute("SELECT to_regclass(%s)",
                             (f'"{schema}".{table}',)).fetchone()[0] is None:
                 return False

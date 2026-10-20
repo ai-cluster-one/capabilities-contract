@@ -8,11 +8,11 @@ The capabilities contract as a Python library. Its first part, `capabilities_con
 pip install capabilities-contract
 ```
 
-Its one dependency is `psycopg[binary]>=3.2,<4`, imported lazily: `import capabilities_contract.db` does not import psycopg, only `connect`, `batch`, `migrate` and `status` do. In a PEP 723 script, pin the exact version:
+Its one dependency is `psycopg[binary]>=3.2,<4`, imported lazily: `import capabilities_contract.db` does not import psycopg, only `connect`, `batch`, `migrate`, `status`, `announce` and `Follower` do. In a PEP 723 script, pin the exact version:
 
 ```python
 # /// script
-# dependencies = ["capabilities-contract==0.6.0"]
+# dependencies = ["capabilities-contract==0.7.0"]
 # ///
 ```
 
@@ -76,11 +76,34 @@ for warning in result.warnings:
     print(warning)
 ```
 
-`migrate(conn, owner, steps, *, major, minor)` applies each step that is not yet applied, in order, once. The owner is the tool that owns the tables, a lowercase identifier without underscores. The first call creates the schema and two platform tables in it: `schema_ledger(owner, step, checksum, applied_at, library_version)` and `schema_version(owner, major, minor, updated_at)`. Each step runs in its own transaction under a per-owner advisory lock together with its ledger row, so concurrent processes apply it exactly once. When every step is already applied and the store records the caller's version, it reads that without taking any lock, so a session holding one stops no tool whose tables are in place. Otherwise a lock is tried rather than queued for, so a process that dies while waiting leaves nothing in the queue: after 10 seconds held elsewhere (`LOCK_WAIT_SECONDS`) `migrate` refuses with `store_busy`, and a session that holds a lock and then issues no statement for 5 seconds (`LOCK_IDLE_SECONDS`) is ended by the server, which frees the lock. It returns a `MigrateResult` with `applied`, `skipped`, `warnings`, `major` and `minor`.
+`migrate(conn, owner, steps, *, major, minor)` applies each step that is not yet applied, in order, once. The owner is the tool that owns the tables, a lowercase identifier without underscores. The first call creates the schema and three platform tables in it: `schema_ledger(owner, step, checksum, applied_at, library_version)`, `schema_version(owner, major, minor, updated_at)` and `schema_channel(channel, scope, version)`, the change versions of [Changes](#changes); a store whose schema was made before `schema_channel` existed gets it on the next `migrate`, once, under the schema lock. Each step runs in its own transaction under a per-owner advisory lock together with its ledger row, so concurrent processes apply it exactly once. When every step is already applied and the store records the caller's version, it reads that without taking any lock, so a session holding one stops no tool whose tables are in place. Otherwise a lock is tried rather than queued for, so a process that dies while waiting leaves nothing in the queue: after 10 seconds held elsewhere (`LOCK_WAIT_SECONDS`) `migrate` refuses with `store_busy`, and a session that holds a lock and then issues no statement for 5 seconds (`LOCK_IDLE_SECONDS`) is ended by the server, which frees the lock. It returns a `MigrateResult` with `applied`, `skipped`, `warnings`, `major` and `minor`.
 
-It refuses with a `DbError`, rolling the step back: an applied step whose SQL changed (`checksum_mismatch`); a step that creates a relation, index, sequence, type, function, collation, statistics object or schema not named `<owner>` or `<owner>_*` inside the configured schema, or named `schema_ledger` or `schema_version` (`naming_law`); a step that fails or ends its own transaction (`step_failed`). A step cannot use statements that refuse a transaction, such as `CREATE INDEX CONCURRENTLY`.
+It refuses with a `DbError`, rolling the step back: an applied step whose SQL changed (`checksum_mismatch`); a step that creates a relation, index, sequence, type, function, collation, statistics object or schema not named `<owner>` or `<owner>_*` inside the configured schema, or named `schema_ledger`, `schema_version` or `schema_channel` (`naming_law`); a step that fails or ends its own transaction (`step_failed`). A step cannot use statements that refuse a transaction, such as `CREATE INDEX CONCURRENTLY`.
 
 The version rule lets tools at different releases share one database. When the store records a newer major for the owner than the caller's `major`, `migrate` refuses with `schema_too_new` before applying anything, and the hint says to update. When it records the same major with a newer minor, it proceeds and adds a warning to `result.warnings`, keeping the stored version. Otherwise it records the caller's version.
+
+## Changes
+
+```python
+from capabilities_contract.db import Follower, announce, connect
+
+with connect(application_name="automations", project_root=root, transaction=True) as conn:
+    conn.execute("UPDATE automations_jobs SET paused = true WHERE name = %s", (name,))
+    announce(conn, "automations_jobs", project_id)
+    conn.commit()
+
+follower = Follower([("automations_jobs", project_id), "automations_runs"],
+                    application_name="automations", project_root=root)
+follower.run(lambda moved: reload(moved), stop=stopping)
+```
+
+A change other processes must see is announced as a version, and a process follows it by polling, so neither side holds a session for it: both work on the process's working connection, directly or through a transaction-mode pooler. The store keeps one version per channel and scope in the platform table `schema_channel`; a pair that was never announced has version 0. A channel is a lowercase identifier of at most 63 characters, conventionally `<owner>_<event>`, and a scope is a non-empty string naming what the change is about, such as a project id.
+
+`announce(conn, channel, scope)` raises that pair's version by one and returns the new version. A writer calls it inside its own transaction, after the change it announces, on a connection from `connect`: the raise is committed with the change and rolled back with it, so a follower never sees a raise whose change did not happen. It is one statement, one round trip. The pair's row stays locked until the writer's transaction ends, so writers announcing the same pair take turns at it: announce last, just before the commit, so that each holds it for the shortest time.
+
+`Follower(follow, *, application_name, project_root=None, setting=None, seen=None)` follows each item of `follow`, a `(channel, scope)` pair or a channel alone, which means every scope of that channel. `read()` returns every followed version as the store holds it now, keyed by `(channel, scope)`, in one query and one round trip on the process's working connection, whatever the number of channels. `poll()` returns only the versions that moved since the previous poll, with their new values; the first poll returns every version it reads, unless `seen` - the `seen` property of an earlier follower, the versions it last read - is given, when it returns only those that moved since then. A follower that was not polling for a while, or whose process was down and started again with its `seen`, therefore gets every pair that moved meanwhile on its first poll, once, with its latest version.
+
+`run(on_change, *, interval=1.0, stop=None)` polls every `interval` seconds (`FOLLOW_INTERVAL_SECONDS`) until the `threading.Event` `stop` is set, and calls `on_change` with what moved: once for the first poll even when nothing moved, so the caller reads its state after the versions it starts from and misses nothing that changes later, and afterwards only when something moved. A poll that finds the store unreachable is tried again at the next interval, and the first one that reaches it reports everything that moved meanwhile. A store whose schema has no `schema_channel` yet is refused as `not_migrated`.
 
 ## Status
 
@@ -95,7 +118,7 @@ print(report.state, report.pending)
 
 ## Errors
 
-Every failure is a `DbError` with `slug` (stable, for the caller to map to an exit code), `message` and `hint` (possibly `None`). Slugs: `store_not_configured`, `store_not_postgres`, `store_setting_unreadable`, `store_setting_too_new`, `bad_store_setting`, `sslmode_too_weak`, `bad_schema_name`, `store_unreachable`, `transaction_pooler`, `session_state`, `driver_missing`, `bad_application_name`, `bad_owner`, `bad_version`, `bad_step`, `connection_busy`, `checksum_mismatch`, `naming_law`, `step_failed`, `schema_too_new`, `store_busy`.
+Every failure is a `DbError` with `slug` (stable, for the caller to map to an exit code), `message` and `hint` (possibly `None`). Slugs: `store_not_configured`, `store_not_postgres`, `store_setting_unreadable`, `store_setting_too_new`, `bad_store_setting`, `sslmode_too_weak`, `bad_schema_name`, `store_unreachable`, `transaction_pooler`, `session_state`, `driver_missing`, `bad_application_name`, `bad_owner`, `bad_version`, `bad_step`, `connection_busy`, `checksum_mismatch`, `naming_law`, `step_failed`, `schema_too_new`, `store_busy`, `bad_channel`, `bad_scope`, `bad_follow`, `bad_interval`, `not_migrated`.
 
 ## Development
 
