@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "capabilities-contract"
 dynamic = ["version"]
-description = "The shared database layer of the capabilities contract: resolve which database a project uses, connect bound to its schema, and migrate each owner's tables once under a ledger."
+description = "The capabilities contract as a library: the code every capability shares, and the shared database layer - resolve which database a project uses, connect bound to its schema, and migrate each owner's tables once under a ledger."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -41,6 +41,9 @@ include = ["/capabilities_contract", "/README.md", "/LICENSE"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# A tier is executed in a capability's namespace, not imported: the names it
+# reads are the capability's, so it is not linted as a module of its own.
+extend-exclude = ["capabilities_contract/capability/tiers"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]

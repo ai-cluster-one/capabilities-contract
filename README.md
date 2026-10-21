@@ -1,6 +1,6 @@
 # capabilities-contract
 
-The capabilities contract as a Python library. Its first part, `capabilities_contract.db`, is the one way the capabilities manager, its capabilities and ContextKit reach the shared PostgreSQL database: resolve which database a project uses, connect bound to its schema, migrate each owner's tables once under a ledger, and report where they stand. It does nothing else: no SQLite, no project registry, no records.
+The capabilities contract as a Python library, in two parts. `capabilities_contract.capability` is the code every capability shares - the core, store and connections tiers - which each capability binds rather than carries a copy of; see [Capability](#capability). `capabilities_contract.db` is the one way the capabilities manager, its capabilities and ContextKit reach the shared PostgreSQL database: resolve which database a project uses, connect bound to its schema, migrate each owner's tables once under a ledger, and report where they stand. It does nothing else: no SQLite, no project registry, no records.
 
 ## Install
 
@@ -8,13 +8,30 @@ The capabilities contract as a Python library. Its first part, `capabilities_con
 pip install capabilities-contract
 ```
 
-Its one dependency is `psycopg[binary]>=3.2,<4`, imported lazily: `import capabilities_contract.db` does not import psycopg, only `connect`, `batch`, `migrate`, `status`, `announce` and `Follower` do. In a PEP 723 script, pin the exact version:
+Its one dependency is `psycopg[binary]>=3.2,<4`, imported lazily: `import capabilities_contract.db` does not import psycopg, only `connect`, `batch`, `migrate`, `status`, `announce` and `Follower` do. A capability declares it in its PEP 723 header by a version range, so a release inside the range reaches it with no edit of its own:
 
 ```python
 # /// script
-# dependencies = ["capabilities-contract==0.7.2"]
+# dependencies = ["capabilities-contract>=0.8,<1"]
 # ///
 ```
+
+## Capability
+
+`capabilities_contract.capability` holds the code every capability of the capabilities package shares, as three tiers, each one file under `capabilities_contract/capability/tiers/`: `core` (the declaration surface - summary, manifest, references, guide, ids - and the file, project and I/O plumbing), `store` (the records adapter for identifiers, policy, settings, connections and documents, and a store-mode project's records in its store) and `connections` (the credential cascade and the connection resolver, for a capability that implements connections).
+
+A tier is not a module. `bind(namespace, *tiers)` executes each named tier, in order, in `namespace`, which a capability passes as its own `globals()` where it has defined its declarations:
+
+```python
+from capabilities_contract.capability import bind as _contract_bind
+_contract_bind(globals(), "core")
+_contract_bind(globals(), "store")
+_contract_bind(globals(), "connections")
+```
+
+So a tier reads the capability's declarations (`NAME`, `SCOPE`, `STATE`, `CRED_KEYS`, `WRITE_VERBS` and the others the package docstring lists) and calls its hooks (`_cmd_connections`, `_inventory`, `_tables` ...) as the capability's own code would, and every name it defines is the capability's: a test that replaces one on the capability's module replaces it for the tier as well. A tier is compiled under the namespace's own `from __future__ import annotations`, as its text would be were it part of the capability's file.
+
+`capabilities_contract.capability.store` is the store tier as a module of its own, for a process that carries no capability - the capabilities manager, a capability's bundled service, a test. `tier_path(tier)` gives a tier's file and `TIERS` names the three.
 
 ## Which database
 
@@ -127,4 +144,4 @@ uv venv && uv pip install -e ".[dev]"
 uv run pytest
 ```
 
-The suite starts a throwaway PostgreSQL cluster with TLS under a temporary directory (`initdb` and `pg_ctl` on `PATH`, or in `$PG_BIN`) on a random port. Set `CAPABILITIES_CONTRACT_TEST_URL` to a TLS-enabled server's admin URL to run it against that server instead, as CI does. The transaction-pooler tests run when `CAPABILITIES_CONTRACT_TEST_PGBOUNCER` names a `pgbouncer` executable: they put it in front of the test cluster in `pool_mode=transaction` with one server connection. The tests that compare the machine file reader with the manager's own run only when `CAPABILITIES_STORE_TIER` names the manager's `contract/store.py`; otherwise they skip.
+The suite starts a throwaway PostgreSQL cluster with TLS under a temporary directory (`initdb` and `pg_ctl` on `PATH`, or in `$PG_BIN`) on a random port. Set `CAPABILITIES_CONTRACT_TEST_URL` to a TLS-enabled server's admin URL to run it against that server instead, as CI does. The transaction-pooler tests run when `CAPABILITIES_CONTRACT_TEST_PGBOUNCER` names a `pgbouncer` executable: they put it in front of the test cluster in `pool_mode=transaction` with one server connection. The tests that compare the machine file reader with the manager's own run only when `CAPABILITIES_STORE_TIER` names a store tier module such as `capabilities_contract/capability/store.py`; otherwise they skip.
