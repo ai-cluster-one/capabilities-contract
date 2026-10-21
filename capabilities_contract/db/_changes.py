@@ -11,6 +11,7 @@ in the session, so both work through a transaction-mode pooler.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import threading
 import time
@@ -85,7 +86,8 @@ class Follower:
     `follow` names what is followed: each item a `(channel, scope)` pair, or a
     channel alone, meaning every scope of it. A pair that was never announced
     reads as version 0. Each `poll` is one query on the process's working
-    connection, whatever the number of channels.
+    connection, whatever the number of channels, or on the connection the
+    caller passes, so a process that holds its own needs no second one.
 
     `seen`, the versions a previous follower held (its `seen`), makes the first
     poll report only what moved since then; without it the first poll reports
@@ -118,11 +120,18 @@ class Follower:
         """The versions as last read, to hand to a later follower."""
         return dict(self._seen or {})
 
-    def read(self) -> dict[Key, int]:
-        """Every followed version as the store holds it now, in one round trip."""
+    def read(self, conn: Any = None) -> dict[Key, int]:
+        """Every followed version as the store holds it now, in one round trip.
+
+        With `conn`, a connection from `connect` that the caller already works
+        on, the query runs on it and it is left open, in whatever transaction it
+        was in; without it, on a loan of the process's working connection."""
         psycopg, sql = _psycopg()
-        with connect(application_name=self._application_name, setting=self._setting,
-                     transaction=True) as conn:
+        with contextlib.ExitStack() as stack:
+            if conn is None:
+                conn = stack.enter_context(connect(
+                    application_name=self._application_name, setting=self._setting,
+                    transaction=True))
             query = sql.SQL(
                 "SELECT channel, scope, version FROM {t} "
                 "WHERE (channel, scope) IN (SELECT * FROM unnest(%s::text[], %s::text[])) "
@@ -137,10 +146,11 @@ class Follower:
         current.update({(channel, scope): version for channel, scope, version in rows})
         return current
 
-    def poll(self) -> dict[Key, int]:
+    def poll(self, conn: Any = None) -> dict[Key, int]:
         """The followed versions that moved since the last poll, with their new
-        versions; on the first poll without `seen`, every version read."""
-        current = self.read()
+        versions; on the first poll without `seen`, every version read. `conn`
+        is polled on as `read` takes it."""
+        current = self.read(conn)
         if self._seen is None:
             moved = current
         else:

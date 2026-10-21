@@ -238,6 +238,29 @@ def test_one_poll_is_one_round_trip_whatever_the_number_of_channels(migrated, tm
     assert moved == {follow[0]: 2}
 
 
+def test_a_follower_given_the_connection_its_process_holds_polls_on_it_and_opens_no_other(
+        migrated, server, tmp_path):
+    follower = Follower([("demo_rows", "p1")], application_name="follower")
+    moved = {}
+    with connect(application_name="held", transaction=True) as conn:
+        conn.autocommit = True
+        assert _round_trips(conn, tmp_path / "first.trace",
+                            lambda: moved.update(follower.poll(conn))) == 1
+        assert moved == {("demo_rows", "p1"): 0}
+        _raise("demo_rows", "p1")
+        disconnect()  # the writer's loan, so only what the follower opens is left
+        moved.clear()
+        assert _round_trips(conn, tmp_path / "next.trace",
+                            lambda: moved.update(follower.poll(conn))) == 1
+        assert moved == {("demo_rows", "p1"): 1}
+        assert not conn.closed
+        with server.admin() as admin:
+            assert admin.execute(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = %s "
+                "AND backend_type = 'client backend' AND pid <> pg_backend_pid()",
+                (conn.info.dbname,)).fetchone()[0] == 1
+
+
 def test_announce_and_follow_refuse_what_they_cannot_name(migrated):
     with connect(application_name="writer", transaction=True) as conn:
         for channel, scope in (("Demo", "p1"), ("", "p1"), ("demo_rows", ""),
