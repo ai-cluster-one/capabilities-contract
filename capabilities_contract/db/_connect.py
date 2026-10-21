@@ -50,11 +50,15 @@ _BOUND: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 # probe an idle connection: after KEEPALIVE_IDLE_SECONDS without traffic, every
 # KEEPALIVE_INTERVAL_SECONDS, giving up after KEEPALIVE_COUNT unanswered probes,
 # so the store drops a client that died without closing and the client learns
-# of a store that went away.
+# of a store that went away. Probes never go out while sent data waits for its
+# acknowledgement, so the client also gives the connection up once what it sent
+# has gone unacknowledged for TCP_USER_TIMEOUT_MILLISECONDS: a flow that stopped
+# carrying packets fails in that time rather than when the store ends the session.
 CONNECT_TIMEOUT_SECONDS = 10
-KEEPALIVE_IDLE_SECONDS = 30
-KEEPALIVE_INTERVAL_SECONDS = 10
+KEEPALIVE_IDLE_SECONDS = 15
+KEEPALIVE_INTERVAL_SECONDS = 5
 KEEPALIVE_COUNT = 3
+TCP_USER_TIMEOUT_MILLISECONDS = 20000
 
 # A connect that fails before the store answers - refused, reset, timed out - is tried
 # again after a short pause, at most CONNECT_ATTEMPTS times, while CONNECT_TIMEOUT
@@ -873,6 +877,10 @@ def connect(*, application_name: str, project_root: Path | str | None = None,
     RECONNECT_LONGEST_SECONDS, and the first after the pause dials again; the
     first connect of a process always dials. Both ends send TCP keepalives on a
     session connection; a transaction connection sends them from the client only.
+    The client gives either kind up once data it sent has gone unacknowledged for
+    TCP_USER_TIMEOUT_MILLISECONDS, which keepalives, never sent meanwhile, cannot
+    notice: the statement fails as a lost connection, and a plain read that may
+    run again does so on a new one.
     A session address that is Supabase's transaction pooler is refused as
     `transaction_pooler` before anything is sent to it."""
     if not isinstance(application_name, str) or not application_name:
@@ -885,7 +893,8 @@ def connect(*, application_name: str, project_root: Path | str | None = None,
     options = dict(application_name=application_name,
                    keepalives=1, keepalives_idle=KEEPALIVE_IDLE_SECONDS,
                    keepalives_interval=KEEPALIVE_INTERVAL_SECONDS,
-                   keepalives_count=KEEPALIVE_COUNT)
+                   keepalives_count=KEEPALIVE_COUNT,
+                   tcp_user_timeout=TCP_USER_TIMEOUT_MILLISECONDS)
     settings = tuple((str(name), str(value))
                      for name, value in (local_settings or {}).items())
     if transaction:

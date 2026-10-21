@@ -490,3 +490,87 @@ def test_a_connect_that_hangs_stays_within_the_connect_timeout(store, proxy):
     assert caught.value.slug == "store_unreachable"
     assert proxy.accepted == 2  # two tries of half the timeout each
     assert spent < 4 + 1.5
+
+
+# --- a flow that stops carrying packets ------------------------------------------
+
+DEAD_FLOW_SECONDS = 25
+
+
+def _within(seconds: float, call, proxy):
+    """`call()` run in a thread: its answer or its error, and the seconds it took,
+    or None when it is still waiting after `seconds` - the proxy then ends what it
+    carries, so the waiting call returns and the test fails rather than hangs."""
+    import threading
+
+    out: dict = {}
+
+    def run():
+        began = time.monotonic()
+        try:
+            out["answer"] = call()
+        except Exception as exc:  # the error is what is measured
+            out["error"] = exc
+        out["spent"] = time.monotonic() - began
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(seconds)
+    if "spent" in out:
+        return out
+    proxy.cut()
+    worker.join(10)
+    return None
+
+
+def test_a_connection_asks_the_network_to_give_up_on_unacknowledged_data(store):
+    import socket
+
+    if not hasattr(socket, "TCP_USER_TIMEOUT"):
+        pytest.skip("the platform has no TCP_USER_TIMEOUT")
+    for transaction in (True, False):
+        with connect(application_name="probe", transaction=transaction) as conn:
+            sock = socket.socket(fileno=os.dup(conn.pgconn.socket))
+            try:
+                got = {name: sock.getsockopt(socket.IPPROTO_TCP, getattr(socket, name))
+                       for name in ("TCP_USER_TIMEOUT", "TCP_KEEPIDLE", "TCP_KEEPINTVL",
+                                    "TCP_KEEPCNT")}
+            finally:
+                sock.close()
+        assert got == {"TCP_USER_TIMEOUT": 20000, "TCP_KEEPIDLE": 15, "TCP_KEEPINTVL": 5,
+                       "TCP_KEEPCNT": 3}, transaction
+
+
+def test_a_read_whose_flow_died_is_answered_on_a_new_connection(store, proxy):
+    store.write(port=proxy.port)
+    with connect(application_name="dead-flow", transaction=True) as conn:
+        first = _pid(conn)
+        accepted = proxy.accepted
+        proxy.deafen()
+        # Larger than the windows, so the bytes stay unacknowledged.
+        got = _within(DEAD_FLOW_SECONDS + 15, lambda: conn.execute(
+            "SELECT length(%s::text), pg_backend_pid()", ("x" * (1 << 20),)).fetchone(), proxy)
+        assert got is not None, "still waiting on the dead flow"
+        assert "error" not in got, got.get("error")
+        assert got["answer"][0] == 1 << 20
+        assert got["answer"][1] != first
+        assert got["spent"] < DEAD_FLOW_SECONDS
+        assert proxy.accepted == accepted + 1
+
+
+def test_a_session_connection_whose_flow_died_fails_instead_of_waiting(store, proxy):
+    store.write(port=proxy.port)
+    conn = connect(application_name="dead-flow")
+    # In autocommit, so the large read is the first thing sent: a proxy's own TCP
+    # acknowledges the small BEGIN a transaction would send ahead of it.
+    conn.autocommit = True
+    try:
+        conn.execute("SELECT 1")
+        proxy.deafen()
+        got = _within(DEAD_FLOW_SECONDS + 15, lambda: conn.execute(
+            "SELECT length(%s::text)", ("x" * (1 << 20),)).fetchone(), proxy)
+        assert got is not None, "still waiting on the dead flow"
+        assert isinstance(got.get("error"), psycopg.OperationalError), got
+        assert got["spent"] < DEAD_FLOW_SECONDS
+    finally:
+        conn.close()

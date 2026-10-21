@@ -1,6 +1,6 @@
 """A TCP forwarder in front of the test server that can refuse a connect, cut every
-connection it carries, or stop forwarding, as a flapping network does. It forwards
-bytes unread, so TLS passes through it."""
+connection it carries, stop forwarding, or go deaf to the connections it carries, as a
+flapping network does. It forwards bytes unread, so TLS passes through it."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ class Proxy:
         self.refuse = 0
         self.stalled = threading.Event()
         self._pairs: list[tuple[socket.socket, socket.socket]] = []
+        self._deaf: set[socket.socket] = set()
         self._lock = threading.Lock()
         self._stop = threading.Event()
         threading.Thread(target=self._accept, daemon=True).start()
@@ -53,6 +54,9 @@ class Proxy:
         peers = {a: b, b: a}
         try:
             while not self._stop.is_set():
+                if a in self._deaf:
+                    self._stop.wait(0.05)
+                    continue
                 ready, _w, _x = select.select([a, b], [], [], 0.05)
                 if self.stalled.is_set():
                     continue
@@ -76,6 +80,18 @@ class Proxy:
             for sock in (a, b):
                 with contextlib.suppress(OSError):
                     sock.shutdown(socket.SHUT_RDWR)
+
+    def deafen(self) -> None:
+        """Stop reading and forwarding every connection carried now, and never end
+        them: a client's bytes stay unacknowledged once the window closes, as on a
+        network flow that died without a FIN or a reset. Connections made later are
+        carried as before."""
+        with self._lock:
+            pairs = list(self._pairs)
+        for client, _upstream in pairs:
+            with contextlib.suppress(OSError):
+                client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            self._deaf.add(client)
 
     def close(self) -> None:
         self._stop.set()

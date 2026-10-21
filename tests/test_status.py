@@ -101,7 +101,7 @@ def test_a_connection_asks_both_ends_for_keepalives(store, server):
                           "current_setting('tcp_keepalives_interval'), "
                           "current_setting('tcp_keepalives_count')").fetchone()
     conn.commit()
-    assert values == ("30", "10", "3")
+    assert values == ("15", "5", "3")
 
 
 def test_an_unanswering_store_is_refused_within_the_connect_bound(store):
