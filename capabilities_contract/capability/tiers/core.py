@@ -477,6 +477,7 @@ def _env_file_project_id(root: Path) -> str | None:
             lines = (root / name).read_text().splitlines()
         except OSError:
             continue
+        ident = ""  # the last line naming the key wins, as in any env file
         for line in lines:
             key, eq, value = line.strip().partition("=")
             key = key.strip()
@@ -484,8 +485,8 @@ def _env_file_project_id(root: Path) -> str | None:
                 key = key[len("export "):].strip()
             if eq and key == "CAPABILITIES_PROJECT_ID":
                 ident = value.strip().strip('"').strip("'")
-                if ident:
-                    return ident
+        if ident:
+            return ident
     return None
 
 

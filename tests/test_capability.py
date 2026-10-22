@@ -113,6 +113,17 @@ def test_the_project_id_is_read_from_env_local_before_env(tmp_path, monkeypatch,
     assert namespace["_project_id_state_at"](root)["id"] == "prj_00000000e0e0"
 
 
+def test_the_last_line_naming_the_id_in_a_file_wins(tmp_path, monkeypatch, excepthook):
+    """As in any env file, and as the manager reads it."""
+    namespace, root = _project(
+        tmp_path, monkeypatch,
+        **{".env.local": "CAPABILITIES_PROJECT_ID=prj_00000000a1a1\nOTHER=1\n"
+                         "CAPABILITIES_PROJECT_ID=prj_00000000b2b2\n"})
+    assert namespace["_project_id_state_at"](root)["id"] == "prj_00000000b2b2"
+    from capabilities_contract.capability.tiers import store
+    assert store._bound_project_id(root) == "prj_00000000b2b2"
+
+
 def test_the_environment_wins_over_the_env_files(tmp_path, monkeypatch, excepthook):
     namespace, root = _project(
         tmp_path, monkeypatch, **{".env.local": "CAPABILITIES_PROJECT_ID=prj_00000000a1a1\n"})
