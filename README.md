@@ -12,7 +12,7 @@ Its one dependency is `psycopg[binary]>=3.2,<4`, imported lazily: `import capabi
 
 ```python
 # /// script
-# dependencies = ["capabilities-contract>=0.8,<1"]
+# dependencies = ["capabilities-contract>=0.9,<1"]
 # ///
 ```
 

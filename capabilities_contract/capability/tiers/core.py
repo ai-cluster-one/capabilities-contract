@@ -148,7 +148,7 @@ def _project_root() -> Path | None:
             return None
         legacy = d / ".capabilities"
         # Either marker names a project. `settings.json` is the gate and
-        # `project.json` the identity; either one alone is enough.
+        # `project.json` the label; either one alone is enough.
         if ((d / "capabilities" / "settings.json").is_file()
                 or (d / "capabilities" / "project.json").is_file()
                 or (d / ".contextkit" / "config.toml").is_file()
@@ -411,10 +411,11 @@ def _project_capabilities_dir(root: Path) -> Path:
 
 
 def _manager_declared_id(root: Path) -> dict:
-    """The id the capabilities manager answers for a project whose project.json
-    declares none: it carries an id the project's ContextKit binding holds into
-    project.json once and answers it. `{"id"}`, or `{"error"}` when the manager
-    cannot answer."""
+    """The id the capabilities manager answers for a project whose environment
+    and env files declare none while it still holds an id in an older home -
+    `project.json`, or its ContextKit binding: the manager moves that id into
+    the project's `.env.local` once and answers it. `{"id"}`, or `{"error"}`
+    when the manager cannot answer."""
     reply, error = _ask_manager(root, "--identity")
     state = (reply or {}).get("project_identity")
     if error or not isinstance(state, dict):
@@ -432,22 +433,15 @@ def _identity_refusal(state: dict):
     `capabilities init`."""
     if state["state"] == "unresolved":
         return state["error"]
-    if state["state"] == "mismatch":
-        return {"code": "project_id_mismatch",
-                "message": f"project.json holds project id {state['project_json_id']}, "
-                           f"but the process that started this one handed down "
-                           f"{state['handed_id']}",
-                "hint": "start the command again from the project itself, so the id "
-                        "is read from its project.json"}
     return None
 
 
 def _handed_off_project_id(root: Path) -> str:
-    """The project id handed down for THIS root, or "" when there is none.
+    """The project id the environment gives THIS root, or "" when it gives none.
 
-    A process that resolved an id a write may stamp hands it to its descendants
-    beside the envelope, as `CAPABILITIES_PROJECT_ID`, scoped by
-    `CAPABILITIES_PROJECT_ID_ROOT` the way the envelope handoff is scoped: one
+    `CAPABILITIES_PROJECT_ID` is the project's binding: set by a deployment for
+    the agent it runs, or handed down by a process that resolved the id, scoped
+    by `CAPABILITIES_PROJECT_ID_ROOT` the way the envelope handoff is scoped. One
     that crossed a project boundary is passed over, and one supplied without the
     companion belongs to whoever launched the process and is honored as given.
     """
@@ -467,19 +461,59 @@ def _handed_off_project_id(root: Path) -> str:
 
 _PROJECT_ID_HANDED: dict = {}
 
+# The env files at the project root that may bind it to its id, the first
+# that names one winning; the process environment wins over both.
+PROJECT_ID_FILES = (".env.local", ".env")
+
+
+def _env_file_project_id(root: Path) -> str | None:
+    """The id the project's `.env.local`, else its `.env`, declares, or None.
+
+    Only the CAPABILITIES_PROJECT_ID line is read: the files hold the
+    project's secrets too, and resolving which project this is never needs
+    a value of theirs."""
+    for name in PROJECT_ID_FILES:
+        try:
+            lines = (root / name).read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            key, eq, value = line.strip().partition("=")
+            key = key.strip()
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            if eq and key == "CAPABILITIES_PROJECT_ID":
+                ident = value.strip().strip('"').strip("'")
+                if ident:
+                    return ident
+    return None
+
+
+def _id_left_to_move(root: Path) -> bool:
+    """Whether the project still holds its id where it was kept before the
+    env files - an `id` in the envelope's `project.json`, or a ContextKit
+    binding - which only the manager reads and moves."""
+    if (root / ".contextkit" / "config.toml").is_file():
+        return True
+    try:
+        identity = json.loads((_project_capabilities_dir(root) / "project.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(identity, dict) and bool(str(identity.get("id") or "").strip())
+
 
 def _project_id_state():
     """The id of the project this command stands in, where it came from, and
     whether a write may stamp it; None outside a project.
 
-    `capabilities/project.json` is the id's one home. A live handoff for this
-    root is that id as the launching process read it, so it is used as given
-    unless project.json now declares another, which a write refuses. Where
-    project.json declares none and the project carries a ContextKit binding,
-    the manager is asked: it copies an id that binding holds into project.json
-    once. An id a write may stamp is handed on to this process's descendants.
-    Reading it asks no records backend: the id is what selects a project's
-    records, so it is read before any of them."""
+    `CAPABILITIES_PROJECT_ID` binds a project to its id: the process
+    environment's value for this root first (`handed`), then the one the
+    project root's `.env.local`, else `.env`, declares (`declared`). Where none
+    does and the project still holds its id in an older home, the manager is
+    asked: it moves that id into `.env.local` once. An id a write may stamp is
+    handed on to this process's descendants. Reading it asks no records
+    backend: the id is what selects a project's records, so it is read before
+    any of them."""
     root = _project_root()
     if root is None:
         return None
@@ -488,29 +522,22 @@ def _project_id_state():
 
 def _project_id_state_at(root: Path) -> dict:
     """`_project_id_state` for a known project root."""
-    try:
-        declared = json.loads((_project_capabilities_dir(root) / "project.json").read_text())
-    except (OSError, ValueError):
-        declared = None
-    declared = (str(declared.get("id") or "").strip() or None
-                if isinstance(declared, dict) else None)
     handed = _handed_off_project_id(root)
     if handed and _PROJECT_ID_HANDED.get(str(root)) == handed:
         handed = ""  # this process's own hand-down, not its launcher's
-    if handed and declared and handed != declared:
-        state = {"state": "mismatch", "id": declared, "handed_id": handed}
-    elif handed:
+    if handed:
         state = {"state": "handed", "id": handed}
-    elif declared is None and (root / ".contextkit" / "config.toml").is_file():
-        answer = _manager_declared_id(root)
-        if "error" in answer:
-            state = {"state": "unresolved", "id": None, "error": answer["error"]}
-        else:
-            declared = answer["id"]
-            state = {"state": "declared" if declared else "undeclared", "id": declared}
     else:
-        state = {"state": "declared" if declared else "undeclared", "id": declared}
-    state["project_json_id"] = declared
+        declared = _env_file_project_id(root)
+        if declared is None and _id_left_to_move(root):
+            answer = _manager_declared_id(root)
+            if "error" in answer:
+                state = {"state": "unresolved", "id": None, "error": answer["error"]}
+            else:
+                declared = answer["id"]
+                state = {"state": "declared" if declared else "undeclared", "id": declared}
+        else:
+            state = {"state": "declared" if declared else "undeclared", "id": declared}
     if not handed and state["id"] and _identity_refusal(state) is None:
         os.environ["CAPABILITIES_PROJECT_ID"] = state["id"]
         os.environ["CAPABILITIES_PROJECT_ID_ROOT"] = str(root)

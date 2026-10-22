@@ -2659,6 +2659,36 @@ def _stamp(moment: Any) -> str | None:
     return moment.isoformat() if hasattr(moment, "isoformat") else moment
 
 
+def _bound_project_id(root: Path) -> str | None:
+    """The project's id where no caller resolved it: CAPABILITIES_PROJECT_ID
+    from the process environment for this root (one handed down for another
+    root, by CAPABILITIES_PROJECT_ID_ROOT, is passed over), else the one the
+    root's .env.local, else its .env, sets. project.json holds no id."""
+    handed = os.environ.get("CAPABILITIES_PROJECT_ID", "").strip()
+    scope = os.environ.get("CAPABILITIES_PROJECT_ID_ROOT", "").strip()
+    if handed:
+        try:
+            if not scope or Path(scope).expanduser().resolve() == Path(root).resolve():
+                return handed
+        except OSError:
+            pass
+    for name in (".env.local", ".env"):
+        try:
+            lines = (Path(root) / name).read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            key, eq, value = line.strip().partition("=")
+            key = key.strip()
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            if eq and key == "CAPABILITIES_PROJECT_ID":
+                ident = value.strip().strip('"').strip("'")
+                if ident:
+                    return ident
+    return None
+
+
 def _identity_record(envelope: Path) -> dict[str, Any]:
     try:
         identity = json.loads((Path(envelope) / "project.json").read_text())
@@ -2703,8 +2733,9 @@ def open_records(envelope: Path | str, global_dir: Path | str,
     the project's envelope, then `global_dir` unless `project_only`; in store
     mode a project's connections, grants, identifiers and policy come from its
     store instead (only its connections and grants where it moved only those),
-    for the project id given (else project.json's), its database resolved for
-    `project_root` (else the envelope's parent).
+    for the project id given (else CAPABILITIES_PROJECT_ID, as
+    `_bound_project_id` reads it), its database resolved for `project_root`
+    (else the envelope's parent).
 
     Where a database resolves, the agent's registry row decides first: an
     agent whose `migrated_at` is set reads and writes all its records and its
@@ -2731,7 +2762,7 @@ def open_records(envelope: Path | str, global_dir: Path | str,
                          'remove "store" from project.json, or set it to "files"')
     root = Path(project_root) if project_root else None
     in_store = connections_mode(envelope) == "store"
-    agent_id = project_id or identity.get("id")
+    agent_id = project_id or _bound_project_id(root or envelope.parent)
     if in_store:
         held = (RECORDS_MODE_KEY if records_mode(envelope) == "store"
                 else CONNECTIONS_MODE_KEY)
@@ -2740,7 +2771,7 @@ def open_records(envelope: Path | str, global_dir: Path | str,
             include_global=not project_only, project_root=root,
             application_name=application_name, held=held)
     else:
-        legacy = FileRecords(envelope, global_dir, identity.get("id"), identity.get("slug"),
+        legacy = FileRecords(envelope, global_dir, agent_id, identity.get("slug"),
                              include_global=not project_only)
     legacy._guard_agent = agent_id if isinstance(agent_id, str) and agent_id else None
     legacy._guard_root = root

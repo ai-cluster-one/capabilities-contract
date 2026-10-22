@@ -82,3 +82,68 @@ def test_an_unknown_tier_is_refused():
         tier_path("other")
     for tier in TIERS:
         assert tier_path(tier).is_file()
+
+
+def _project(tmp_path, monkeypatch, **files) -> tuple[dict, Path]:
+    """A project folder and a core-bound namespace standing in it, its
+    envelope handed down so no manager is asked for it."""
+    root = tmp_path / "project"
+    (root / "capabilities").mkdir(parents=True)
+    for name, text in files.items():
+        path = root / name.replace("__", "/")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    for key in ("CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(root))
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ENVELOPE", str(root / "capabilities"))
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ENVELOPE_ROOT", str(root))
+    namespace = _declarations()
+    bind(namespace, "core")
+    return namespace, root
+
+
+def test_the_project_id_is_read_from_env_local_before_env(tmp_path, monkeypatch, excepthook):
+    namespace, root = _project(
+        tmp_path, monkeypatch,
+        **{".env": "CAPABILITIES_PROJECT_ID=prj_00000000e0e0\n",
+           ".env.local": "OTHER=1\nCAPABILITIES_PROJECT_ID=\"prj_00000000a1a1\"\n"})
+    assert namespace["_project_id_state"]() == {"state": "declared", "id": "prj_00000000a1a1"}
+    (root / ".env.local").write_text("OTHER=1\n")
+    assert namespace["_project_id_state_at"](root)["id"] == "prj_00000000e0e0"
+
+
+def test_the_environment_wins_over_the_env_files(tmp_path, monkeypatch, excepthook):
+    namespace, root = _project(
+        tmp_path, monkeypatch, **{".env.local": "CAPABILITIES_PROJECT_ID=prj_00000000a1a1\n"})
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ID", "prj_00000000b2b2")
+    state = namespace["_project_id_state"]()
+    assert state == {"state": "handed", "id": "prj_00000000b2b2"}
+    assert namespace["_identity_refusal"](state) is None
+    assert namespace["_project_id"](write=True) == "prj_00000000b2b2"
+    # A value handed down for another root is passed over.
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ID_ROOT", str(tmp_path / "elsewhere"))
+    assert namespace["_project_id_state_at"](root)["id"] == "prj_00000000a1a1"
+
+
+def test_an_id_in_project_json_is_not_the_projects_id(tmp_path, monkeypatch, excepthook):
+    """project.json's id is read by the manager alone, which moves it into
+    .env.local; a capability asks the manager and takes its answer."""
+    manager = tmp_path / "manager"
+    manager.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s' '{{\"project_root\": \"{tmp_path / 'project'}\", "
+        "\"project_identity\": {\"state\": \"declared\", \"id\": \"prj_00000000c3c3\"}}'\n")
+    manager.chmod(0o755)
+    monkeypatch.setenv("CAPABILITIES_MANAGER_BIN", str(manager))
+    namespace, root = _project(
+        tmp_path, monkeypatch,
+        **{"capabilities__project.json": '{"id": "prj_00000000d4d4", "slug": "p"}'})
+    assert namespace["_project_id_state"]() == {"state": "declared", "id": "prj_00000000c3c3"}
+    # Without an id left anywhere, nobody is asked and there is no id.
+    (root / "capabilities" / "project.json").write_text('{"slug": "p"}')
+    manager.write_text("#!/bin/sh\nexit 9\n")
+    namespace["_PROJECT_ID_HANDED"].clear()
+    for key in ("CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT"):
+        monkeypatch.delenv(key, raising=False)
+    assert namespace["_project_id_state_at"](root) == {"state": "undeclared", "id": None}
