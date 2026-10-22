@@ -433,7 +433,8 @@ def _connection_grantees(adapter, cid: str, scope: str, root) -> list:
     taken from: every project the store holds an enabling grant for, for a
     connection kept in the store; the project the call runs in, for a
     connection of the machine it grants and does not declare itself. A
-    project's own connection in its files is granted to no other project."""
+    project's own connection in its files is granted to no other project, and
+    neither is an agent's own connection in the store."""
     if scope == "global":
         if root is None or adapter.mode_of("grant") != "files":
             return []
@@ -443,7 +444,10 @@ def _connection_grantees(adapter, cid: str, scope: str, root) -> list:
             return [str(root)]
         return []
     if adapter.mode_of("connection") == "store":
-        return adapter.grantees(NAME, cid)
+        grantees = adapter.grantees(NAME, cid)
+        if adapter.project_id and adapter.connection_owner(NAME, cid) == adapter.project_id:
+            return [agent for agent in grantees if agent != adapter.project_id]
+        return grantees
     return []
 
 
@@ -626,7 +630,12 @@ def _cmd_connection(argv: list[str]) -> None:
     if secrets:
         _env_file_write(credentials, secrets)
     try:
-        adapter.set(NAME, "connection", cid, entry, scope=scope)
+        if scope == "project" and adapter.mode_of("connection") == "store":
+            # A connection added in a project in store mode is the project's
+            # own, written with its grant.
+            adapter.set(NAME, "connection", cid, entry, scope=scope, own=True)
+        else:
+            adapter.set(NAME, "connection", cid, entry, scope=scope)
         if default:
             adapter.set(NAME, "setting", "connection.default", cid, scope=scope)
         source = adapter.scope_source(NAME, "connection", scope)

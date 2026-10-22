@@ -161,7 +161,7 @@ STORE_SETTINGS_CHANGES_TABLE = "capabilities_settings_changes"
 # Every capability's references for each project, versioned: one row per
 # version, the active one read before the project's files.
 STORE_REFERENCES_TABLE = "capabilities_references"
-STORE_TABLES_VERSION = (1, 4)
+STORE_TABLES_VERSION = (1, 5)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -561,6 +561,64 @@ def record_table_steps() -> list[tuple[str, str]]:
          " 'Who saved the version: user@node.';"
          " COMMENT ON COLUMN capabilities_references.note IS"
          " 'Why the version was saved.'"),
+        # A connection's owner: null for one shared by the capability and
+        # grantable to any agent, an agent's id for that agent's own account,
+        # which no other agent is granted. A store made before owners gives a
+        # row its owner once, by the rule the owner set: a connection whose
+        # grants name exactly one agent, and none is for every agent, is that
+        # agent's own where it is named for it - the first word of the
+        # agent's registered name (lowercase letters and digits) is a word of
+        # the connection's name or of its spec's display `name`. Every other
+        # row is shared.
+        ("0020-connection-owner",
+         "ALTER TABLE capabilities_connections ADD COLUMN owner text CHECK (owner <> '');"
+         " UPDATE capabilities_connections c SET owner = s.agent_id"
+         "  FROM (SELECT capability, connection, min(agent_id) AS agent_id"
+         "   FROM capabilities_connection_grants GROUP BY capability, connection"
+         "   HAVING count(*) FILTER (WHERE agent_id IS NULL) = 0"
+         "    AND count(DISTINCT agent_id) = 1) s,"
+         "   capabilities_agents a"
+         "  WHERE c.capability = s.capability AND c.name = s.connection AND a.id = s.agent_id"
+         "   AND substring(lower(a.name) FROM '[a-z0-9]+') = ANY (regexp_split_to_array("
+         "    lower(c.name || ' ' || coalesce(c.spec->>'name', '')), '[^a-z0-9]+'));"
+         " CREATE FUNCTION capabilities_connection_grants_owner() RETURNS trigger"
+         "  LANGUAGE plpgsql SET search_path FROM CURRENT AS $owner$"
+         " DECLARE held text;"
+         " BEGIN"
+         "  SELECT owner INTO held FROM capabilities_connections"
+         "   WHERE capability = NEW.capability AND name = NEW.connection;"
+         "  IF held IS NOT NULL AND NEW.agent_id IS DISTINCT FROM held THEN"
+         "   RAISE EXCEPTION '% connection % is agent %''s own and is granted to no other"
+         " agent', NEW.capability, NEW.connection, held USING ERRCODE = 'check_violation';"
+         "  END IF;"
+         "  RETURN NEW;"
+         " END $owner$;"
+         " CREATE TRIGGER capabilities_connection_grants_owner"
+         "  BEFORE INSERT OR UPDATE ON capabilities_connection_grants"
+         "  FOR EACH ROW EXECUTE FUNCTION capabilities_connection_grants_owner();"
+         " CREATE FUNCTION capabilities_connections_owner() RETURNS trigger"
+         "  LANGUAGE plpgsql SET search_path FROM CURRENT AS $owner$"
+         " BEGIN"
+         "  IF NEW.owner IS NOT NULL AND EXISTS (SELECT 1 FROM capabilities_connection_grants"
+         "   WHERE capability = OLD.capability AND connection = OLD.name"
+         "   AND agent_id IS DISTINCT FROM NEW.owner) THEN"
+         "   RAISE EXCEPTION '% connection % is granted to agents other than %, so it"
+         " cannot be that agent''s own', OLD.capability, OLD.name, NEW.owner"
+         "    USING ERRCODE = 'check_violation';"
+         "  END IF;"
+         "  RETURN NEW;"
+         " END $owner$;"
+         " CREATE TRIGGER capabilities_connections_owner"
+         "  BEFORE UPDATE OF owner ON capabilities_connections"
+         "  FOR EACH ROW EXECUTE FUNCTION capabilities_connections_owner();"
+         " COMMENT ON TABLE capabilities_connections IS"
+         " 'What a connection is: one row per (capability, name), its spec the entry"
+         " interior with secret references only. A row is shared by the capability"
+         " (owner null) or one agent''s own.';"
+         " COMMENT ON COLUMN capabilities_connections.owner IS"
+         " 'The agent whose own connection this is - its own account, granted to no"
+         " other agent; null for a connection shared by the capability, which any agent"
+         " may be granted.'"),
     ]
 
 
@@ -1727,6 +1785,14 @@ class StoreRecords(FileRecords):
             held = out
         return held
 
+    def connection_owner(self, capability: str, connection: str) -> str | None:
+        """The agent whose own connection this is; None for a shared one."""
+        _store_check("capability", capability, CAPABILITY_RE)
+        rows = self._read(
+            "SELECT owner FROM capabilities_connections WHERE capability = %s "
+            "AND name = %s", (capability, connection))
+        return rows[0][0] if rows else None
+
     def grantees(self, capability: str, connection: str) -> list[str]:
         _store_check("capability", capability, CAPABILITY_RE)
         if "grant" not in self.collections:
@@ -1929,6 +1995,55 @@ class StoreRecords(FileRecords):
                              f"grant {cid!r} node must name a node, or be null for every node")
         return {f: value[f] for f in (*GRANT_FIELDS, "is_default") if f in value}, node
 
+    def _put_connection(self, conn: Any, capability: str, cid: str, spec: dict,
+                        agent: str | None, own: bool, change: bool = True) -> bool:
+        """Write a connection's spec for the writer `agent` (None at the
+        machine's scope); whether the row is new. A new row is the writer's own
+        where `own` is asked and the writer is an agent, and shared otherwise; a
+        row that exists keeps its owner, and one another agent owns is refused.
+        With `change` false an existing row is left as it is."""
+        added = conn.execute(
+            "INSERT INTO capabilities_connections (capability, name, spec, owner) "
+            "VALUES (%s, %s, %s::jsonb, %s) ON CONFLICT (capability, name) DO NOTHING",
+            (capability, cid, json.dumps(spec, ensure_ascii=False),
+             agent if own else None)).rowcount
+        if added:
+            return True
+        if not change:
+            return False
+        (held,) = conn.execute(
+            "SELECT owner FROM capabilities_connections WHERE capability = %s "
+            "AND name = %s FOR UPDATE", (capability, cid)).fetchone()
+        if held is not None and held != agent:
+            raise StoreError("connection_owned",
+                             f"{capability} connection {cid!r} is agent {held}'s own, "
+                             "so only that agent changes it",
+                             "change it in that agent's project, or add a connection "
+                             "of this agent's own under another id")
+        conn.execute(
+            "UPDATE capabilities_connections SET spec = %s::jsonb "
+            "WHERE capability = %s AND name = %s",
+            (json.dumps(spec, ensure_ascii=False), capability, cid))
+        return False
+
+    def _drop_connection(self, conn: Any, capability: str, cid: str,
+                         agent: str | None) -> bool:
+        """Remove a connection with its grants; whether it was there. One
+        another agent owns is refused."""
+        row = conn.execute(
+            "SELECT owner FROM capabilities_connections WHERE capability = %s "
+            "AND name = %s FOR UPDATE", (capability, cid)).fetchone()
+        if row is None:
+            return False
+        if row[0] is not None and row[0] != agent:
+            raise StoreError("connection_owned",
+                             f"{capability} connection {cid!r} is agent {row[0]}'s own, "
+                             "so only that agent removes it",
+                             "remove it in that agent's project")
+        return conn.execute(
+            "DELETE FROM capabilities_connections WHERE capability = %s AND name = %s",
+            (capability, cid)).rowcount > 0
+
     def _put_grant(self, conn: Any, capability: str, cid: str,
                    fields: dict[str, Any], node: str | None) -> None:
         if not self.project_id:
@@ -2026,7 +2141,9 @@ class StoreRecords(FileRecords):
 
     def set(self, capability: str, collection: str, key: str, value: Any,
             actor: str | None = None, note: str | None = None,
-            scope: str | None = None, node: str | None = None) -> None:
+            scope: str | None = None, node: str | None = None, own: bool = False) -> None:
+        """`own` writes a new connection at project scope as this project's
+        own, with its grant enabling it, in one transaction."""
         if not self._scoped(collection, key, scope):
             return super().set(capability, collection, key, value,
                                actor=actor, note=note, scope=scope, node=node)
@@ -2050,13 +2167,12 @@ class StoreRecords(FileRecords):
             grant = {k: value[k] for k in GRANT_FIELDS if k in value}
 
             def work(conn: Any) -> None:
-                conn.execute(
-                    "INSERT INTO capabilities_connections (capability, name, spec) "
-                    "VALUES (%s, %s, %s::jsonb) ON CONFLICT (capability, name) "
-                    "DO UPDATE SET spec = EXCLUDED.spec",
-                    (capability, key, json.dumps(spec, ensure_ascii=False)))
-                if grant:
-                    fields, node = self._grant_value(key, grant)
+                added = self._put_connection(conn, capability, key, spec,
+                                             self.project_id, own)
+                wanted = ({"enabled": True, **grant} if added and own and self.project_id
+                          else grant)
+                if wanted:
+                    fields, node = self._grant_value(key, wanted)
                     self._put_grant(conn, capability, key, fields, node)
             self._write(work)
         elif collection == "grant":
@@ -2095,9 +2211,7 @@ class StoreRecords(FileRecords):
                     (agent, key, node)).rowcount > 0
         elif collection == "connection":
             def work(conn: Any) -> bool:
-                return conn.execute(
-                    "DELETE FROM capabilities_connections "
-                    "WHERE capability = %s AND name = %s", (capability, key)).rowcount > 0
+                return self._drop_connection(conn, capability, key, self.project_id)
         elif collection == "grant":
             def work(conn: Any) -> bool:
                 return conn.execute(
@@ -2793,7 +2907,7 @@ class AgentRecords(StoreRecords):
 
     def set(self, capability: str, collection: str, key: str, value: Any,
             actor: str | None = None, note: str | None = None,
-            scope: str | None = None, node: str | None = None) -> None:
+            scope: str | None = None, node: str | None = None, own: bool = False) -> None:
         if collection not in self.collections:
             return FileRecords.set(self, capability, collection, key, value,
                                    actor=actor, note=note, scope=scope, node=node)
@@ -2853,29 +2967,22 @@ class AgentRecords(StoreRecords):
 
             def work(conn: Any) -> None:
                 at = self._authority(conn, scope, None, actor)
-                if at is None:
-                    conn.execute(
-                        "INSERT INTO capabilities_connections (capability, name, spec) "
-                        "VALUES (%s, %s, %s::jsonb) ON CONFLICT (capability, name) "
-                        "DO UPDATE SET spec = EXCLUDED.spec",
-                        (capability, key, json.dumps(spec, ensure_ascii=False)))
-                else:
-                    # A connection is one row for every agent and node, so a
-                    # node that writes only its own rows may add one, never
-                    # change one another node may use.
-                    added = conn.execute(
-                        "INSERT INTO capabilities_connections (capability, name, spec) "
-                        "VALUES (%s, %s, %s::jsonb) ON CONFLICT (capability, name) "
-                        "DO NOTHING", (capability, key,
-                                       json.dumps(spec, ensure_ascii=False))).rowcount
-                    if not added:
-                        raise StoreError(
-                            "node_read_only",
-                            f"node {self.node} may add a connection but not change "
-                            f"{capability} connection {key!r}, which every node shares",
-                            f"change it on the master {self.agent.get('master')}")
-                if grant:
-                    fields, wanted = self._grant_value(key, grant)
+                # A connection is one row for every agent and node, so a node
+                # that writes only its own rows may add one, never change one
+                # another node may use. One added as the agent's own is
+                # granted to it in the same transaction.
+                added = self._put_connection(conn, capability, key, spec, agent, own,
+                                             change=at is None)
+                if not added and at is not None:
+                    raise StoreError(
+                        "node_read_only",
+                        f"node {self.node} may add a connection but not change "
+                        f"{capability} connection {key!r}, which every node shares",
+                        f"change it on the master {self.agent.get('master')}")
+                wanted_grant = ({"enabled": True, **grant}
+                                if added and own and agent is not None else grant)
+                if wanted_grant:
+                    fields, wanted = self._grant_value(key, wanted_grant)
                     self._put_grant_at(conn, capability, key, fields, agent,
                                        wanted if at is None else at)
             self._write(work)
@@ -2934,9 +3041,7 @@ class AgentRecords(StoreRecords):
                         f"node {self.node} may not remove {capability} connection "
                         f"{key!r}, which every node shares",
                         f"remove it on the master {self.agent.get('master')}")
-                return conn.execute(
-                    "DELETE FROM capabilities_connections WHERE capability = %s "
-                    "AND name = %s", (capability, key)).rowcount > 0
+                return self._drop_connection(conn, capability, key, agent)
             return bool(self._write(work))
         return bool(self._write(lambda conn: conn.execute(
             sql, (*target, self._authority(conn, scope, wanted, None))).rowcount > 0))
