@@ -128,6 +128,7 @@ def test_the_environment_wins_over_the_env_files(tmp_path, monkeypatch, exceptho
     namespace, root = _project(
         tmp_path, monkeypatch, **{".env.local": "CAPABILITIES_PROJECT_ID=prj_00000000a1a1\n"})
     monkeypatch.setenv("CAPABILITIES_PROJECT_ID", "prj_00000000b2b2")
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ID_ROOT", str(root))
     state = namespace["_project_id_state"]()
     assert state == {"state": "handed", "id": "prj_00000000b2b2"}
     assert namespace["_identity_refusal"](state) is None
@@ -135,6 +136,116 @@ def test_the_environment_wins_over_the_env_files(tmp_path, monkeypatch, exceptho
     # A value handed down for another root is passed over.
     monkeypatch.setenv("CAPABILITIES_PROJECT_ID_ROOT", str(tmp_path / "elsewhere"))
     assert namespace["_project_id_state_at"](root)["id"] == "prj_00000000a1a1"
+
+
+def test_an_id_in_the_environment_without_a_root_binds_nothing(tmp_path, monkeypatch,
+                                                                excepthook):
+    namespace, root = _project(tmp_path, monkeypatch)
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ID", "prj_00000000b2b2")
+    assert namespace["_project_id_state_at"](root) == {"state": "undeclared", "id": None}
+    from capabilities_contract.capability.tiers import store
+    assert store._bound_project_id(root) is None
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    assert namespace["_project_root"]() is None
+
+
+def _walker(tmp_path, monkeypatch) -> dict:
+    """A core-bound namespace whose walk starts where CLAUDE_PROJECT_DIR says."""
+    for key in ("CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT",
+                "CAPABILITIES_PROJECT_ENVELOPE", "CAPABILITIES_PROJECT_ENVELOPE_ROOT"):
+        monkeypatch.delenv(key, raising=False)
+    namespace = _declarations()
+    bind(namespace, "core")
+    return namespace
+
+
+def test_the_root_is_the_nearest_folder_whose_env_files_set_the_id(tmp_path, monkeypatch,
+                                                                   excepthook):
+    namespace = _walker(tmp_path, monkeypatch)
+    agent = tmp_path / "agent"
+    work = agent / "workspace" / "repo"
+    (work / ".git").mkdir(parents=True)
+    (agent / ".env.local").write_text("CAPABILITIES_PROJECT_ID=prj_00000000a1a1\n")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(work))
+    # A repository inside the agent's folder is not a project of its own.
+    assert namespace["_project_root"]() == agent.resolve()
+    # Without a bound folder above it, the repository names an unbound one.
+    (agent / ".env.local").write_text("OTHER=1\n")
+    assert namespace["_project_root"]() == work.resolve()
+    # A folder that still has its project.json is bound by it.
+    (agent / "capabilities").mkdir()
+    (agent / "capabilities" / "project.json").write_text('{"slug": "agent"}')
+    assert namespace["_project_root"]() == agent.resolve()
+
+
+def test_the_environment_binds_its_root_from_anywhere_outside_a_bound_folder(
+        tmp_path, monkeypatch, excepthook):
+    namespace = _walker(tmp_path, monkeypatch)
+    app = tmp_path / "app"
+    app.mkdir()
+    elsewhere = tmp_path / "elsewhere" / "repo"
+    (elsewhere / ".git").mkdir(parents=True)
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ID", "prj_00000000a1a1")
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ID_ROOT", str(app))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(elsewhere))
+    assert namespace["_project_root"]() == app.resolve()
+    assert namespace["_project_id_state_at"](app.resolve()) == {
+        "state": "handed", "id": "prj_00000000a1a1"}
+    # A folder bound to an id of its own is passed over by nobody's hand-down.
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / ".env.local").write_text("CAPABILITIES_PROJECT_ID=prj_00000000b2b2\n")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(other))
+    assert namespace["_project_root"]() == other.resolve()
+    assert namespace["_project_id_state_at"](other.resolve())["id"] == "prj_00000000b2b2"
+
+
+def _no_database(tmp_path, monkeypatch) -> None:
+    for key in list(os.environ):
+        if key.startswith("AGENTKIT_DB_"):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+
+
+def test_the_slug_is_an_older_project_json_s_else_the_id_without_a_store(
+        tmp_path, monkeypatch, excepthook):
+    _no_database(tmp_path, monkeypatch)
+    namespace, root = _project(
+        tmp_path, monkeypatch, **{".env.local": "CAPABILITIES_PROJECT_ID=prj_00000000a1a1\n"})
+    bind(namespace, "store")
+    assert namespace["_project_slug"](root) == "prj_00000000a1a1"
+    namespace["_PROJECT_SLUG"].clear()
+    (root / "capabilities" / "project.json").write_text('{"slug": "kept"}')
+    assert namespace["_project_slug"](root) == "kept"
+    assert namespace["_project_identity"]() == {"id": "prj_00000000a1a1", "slug": "kept"}
+
+
+def test_a_project_bound_by_its_id_alone_keeps_its_records_in_the_store(
+        tmp_path, monkeypatch, excepthook):
+    from capabilities_contract.capability.tiers import store
+    _no_database(tmp_path, monkeypatch)
+    root = tmp_path / "project"
+    envelope = root / "capabilities"
+    envelope.mkdir(parents=True)
+    (root / ".env.local").write_text("CAPABILITIES_PROJECT_ID=prj_00000000a1a1\n")
+    # No database resolves: nothing but the files can hold them.
+    assert store.records_mode(envelope) == "files"
+    monkeypatch.setenv("AGENTKIT_DB_URL", "postgresql://agent@127.0.0.1:1/app")
+    assert store.records_mode(envelope) == "store"
+    assert store.connections_mode(envelope, root) == "store"
+    # A settings.json gate is a project in files mode.
+    (envelope / "settings.json").write_text('{"capabilities": {}}')
+    assert store.records_mode(envelope) == "files"
+    # An older project.json still says it.
+    (envelope / "project.json").write_text('{"slug": "p", "records": "store"}')
+    assert store.records_mode(envelope) == "store"
+    (envelope / "settings.json").unlink()
+    (envelope / "project.json").write_text('{"slug": "p"}')
+    assert store.records_mode(envelope) == "files"
+    # Without an id nothing binds it to an agent.
+    (envelope / "project.json").unlink()
+    (root / ".env.local").write_text("OTHER=1\n")
+    assert store.records_mode(envelope) == "files"
 
 
 def test_an_id_in_project_json_is_not_the_projects_id(tmp_path, monkeypatch, excepthook):

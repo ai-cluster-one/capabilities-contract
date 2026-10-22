@@ -131,10 +131,47 @@ def _is_machine_registry(path: Path) -> bool:
     return (path / ".manager").is_dir()
 
 
+def _env_bound_root() -> Path | None:
+    """The folder the process environment binds: CAPABILITIES_PROJECT_ID_ROOT,
+    where CAPABILITIES_PROJECT_ID is set beside it and it names an existing
+    absolute folder. An id without a root binds no folder."""
+    ident = os.environ.get("CAPABILITIES_PROJECT_ID", "").strip()
+    scope = os.environ.get("CAPABILITIES_PROJECT_ID_ROOT", "").strip()
+    if not ident or not scope:
+        return None
+    path = Path(scope).expanduser()
+    if not path.is_absolute():
+        return None
+    try:
+        path = path.resolve()
+    except OSError:
+        return None
+    return path if path.is_dir() else None
+
+
+def _bound_folder(d: Path, bound: Path | None) -> bool:
+    """Whether `d` is a project bound to its id: the folder the environment
+    binds, one whose `.env.local` or `.env` sets CAPABILITIES_PROJECT_ID, or
+    one that still carries a binding of an older kind - an envelope's
+    `project.json` or `settings.json`, a legacy `.capabilities/` envelope, or
+    a ContextKit binding."""
+    if d == bound or _env_file_project_id(d):
+        return True
+    legacy = d / ".capabilities"
+    return ((d / "capabilities" / "settings.json").is_file()
+            or (d / "capabilities" / "project.json").is_file()
+            or (d / ".contextkit" / "config.toml").is_file()
+            or (legacy.is_dir() and not _is_machine_registry(legacy)))
+
+
 def _project_root() -> Path | None:
-    """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
-    the first directory holding capabilities/, legacy .capabilities/,
-    .contextkit/config.toml, .env(.local), or .git.
+    """The project root, walking up from $CLAUDE_PROJECT_DIR (else cwd).
+
+    The nearest bound folder (`_bound_folder`) is the root. Where no folder on
+    the walk is bound, the folder the environment binds is, so a deployed agent
+    whose environment sets CAPABILITIES_PROJECT_ID with
+    CAPABILITIES_PROJECT_ID_ROOT is found from anywhere; otherwise the nearest
+    folder holding .env(.local) or .git names an unbound project.
     Markers are read from the filesystem alone: the root is what the envelope
     location is resolved against, so resolving one cannot depend on the other.
     A home directory is never a project root (the machine registry lives in
@@ -143,20 +180,19 @@ def _project_root() -> Path | None:
     start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     here = Path(start).resolve()
     homes = _home_dirs()
+    bound = _env_bound_root()
+    unbound = None
     for d in (here, *here.parents):
         if d in homes:
-            return None
-        legacy = d / ".capabilities"
-        # Either marker names a project. `settings.json` is the gate and
-        # `project.json` the label; either one alone is enough.
-        if ((d / "capabilities" / "settings.json").is_file()
-                or (d / "capabilities" / "project.json").is_file()
-                or (d / ".contextkit" / "config.toml").is_file()
-                or (legacy.is_dir() and not _is_machine_registry(legacy))
-                or (d / ".env").exists()
-                or (d / ".env.local").exists() or (d / ".git").is_dir()):
+            break
+        if _bound_folder(d, bound):
             return d
-    return None
+        if unbound is None and ((d / ".env").exists() or (d / ".env.local").exists()
+                                or (d / ".git").is_dir()):
+            unbound = d
+    if bound is not None and bound not in homes:
+        return bound
+    return unbound
 
 
 _ENVELOPE_HOME: dict = {}
@@ -297,9 +333,11 @@ def _ask_manager(root: Path, *flags: str) -> tuple:
     env["CLAUDE_PROJECT_DIR"] = str(root)
     # Asked at all, the manager answers from the project itself: a live id
     # hand-down for this root is used before asking, so any in the environment
-    # is this process's own and must not come back as the answer.
-    env.pop("CAPABILITIES_PROJECT_ID", None)
-    env.pop("CAPABILITIES_PROJECT_ID_ROOT", None)
+    # is this process's own and must not come back as the answer. A root the
+    # environment binds is found by that binding, so it goes with the question.
+    if _env_bound_root() != root.resolve():
+        env.pop("CAPABILITIES_PROJECT_ID", None)
+        env.pop("CAPABILITIES_PROJECT_ID_ROOT", None)
     manager = os.environ.get("CAPABILITIES_MANAGER_BIN", "").strip()
     if not manager:
         source_manager = Path(__file__).resolve().parents[3] / "bin" / "capabilities"
@@ -441,16 +479,15 @@ def _handed_off_project_id(root: Path) -> str:
 
     `CAPABILITIES_PROJECT_ID` is the project's binding: set by a deployment for
     the agent it runs, or handed down by a process that resolved the id, scoped
-    by `CAPABILITIES_PROJECT_ID_ROOT` the way the envelope handoff is scoped. One
-    that crossed a project boundary is passed over, and one supplied without the
-    companion belongs to whoever launched the process and is honored as given.
+    by `CAPABILITIES_PROJECT_ID_ROOT`. One that crossed a project boundary is
+    passed over, and one supplied without the companion binds no folder.
     """
     handed = os.environ.get("CAPABILITIES_PROJECT_ID", "").strip()
     if not handed:
         return ""
     scope = os.environ.get("CAPABILITIES_PROJECT_ID_ROOT", "").strip()
     if not scope:
-        return handed
+        return ""
     try:
         if Path(scope).expanduser().resolve() != root.resolve():
             return ""
@@ -984,7 +1021,7 @@ def _records():
         try:
             project_only = os.environ.get("CAPABILITIES_RECORDS_PROJECT_ONLY", "") \
                 .strip().lower() in ("1", "true", "yes", "on")
-            in_store = root is not None and connections_mode(envelope) == "store"
+            in_store = root is not None and connections_mode(envelope, root) == "store"
             _RECORDS = open_records(
                 envelope, _CONFIG_HOME, project_only=project_only,
                 project_root=root, project_id=_project_id() if in_store else None,
@@ -994,19 +1031,77 @@ def _records():
     return _RECORDS
 
 
+_PROJECT_SLUG: dict = {}
+
+
+def _project_slug(root: Path | None = None) -> str | None:
+    """The project's slug, its short technical name: the one its agent's row in
+    the store holds (`capabilities_agents.slug`, which `capabilities relabel`
+    writes), else the one an older `project.json` still names, else the
+    project's id; None outside a project, or for one with none of them.
+
+    A project whose store is configured but does not answer, and which has no
+    older `project.json` slug, is refused (StoreError) rather than named by its
+    id, which would move everything its slug names. An answer is reused for
+    STORE_READ_SECONDS, so one command asks once and a long-running service
+    sees a new slug."""
+    import time
+
+    root = root or _project_root()
+    if root is None:
+        return None
+    kept = _PROJECT_SLUG.get(str(root))
+    if kept is not None and time.monotonic() - kept[0] < STORE_READ_SECONDS:
+        return kept[1]
+    try:
+        identity = json.loads((_project_capabilities_dir(root) / "project.json").read_text())
+    except (OSError, ValueError):
+        identity = {}
+    legacy = identity.get("slug") if isinstance(identity, dict) else None
+    legacy = legacy.strip() if isinstance(legacy, str) and legacy.strip() else None
+    ident = _project_id_state_at(root)["id"]
+    slug = None
+    if ident:
+        try:
+            conn, _schema = _store_connect(root, NAME, _PROBE_TIMEOUT)
+        except StoreError as exc:
+            if exc.slug != "store_not_configured" and legacy is None:
+                raise
+            conn = None
+        if conn is not None:
+            import psycopg
+            try:
+                slug = agent_slug(conn, ident)
+            except psycopg.Error as exc:
+                if legacy is None:
+                    raise StoreError("store_unreachable",
+                                     f"cannot read the agent registry: {exc}",
+                                     "check the database setting with "
+                                     "`capabilities store doctor`") from None
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    slug = slug or legacy or ident
+    _PROJECT_SLUG[str(root)] = (time.monotonic(), slug)
+    return slug
+
+
 def _project_identity() -> dict:
+    """This project's id and slug (`_project_slug`), refusing outside a project
+    or for a project with neither."""
     root = _project_root()
     if root is None:
         _die(6, "no_project", "no project here to resolve records for")
-    identity_file = _project_capabilities_dir(root) / "project.json"
     try:
-        identity = json.loads(identity_file.read_text())
-    except (OSError, ValueError) as e:
-        _die(6, "no_project_identity", f"cannot read {identity_file}: {e}",
+        slug = _project_slug(root)
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+    if not slug:
+        _die(6, "no_project_identity", f"{root} is bound to no project id",
              "run `capabilities init` in the project")
-    if not identity.get("slug"):
-        _die(6, "no_project_identity", f"{identity_file} declares no slug")
-    return identity
+    return {"id": _project_id_state_at(root)["id"], "slug": slug}
 
 
 def _state_dir() -> Path:
@@ -1017,7 +1112,9 @@ def _state_dir() -> Path:
         if root is not None:
             envelope = _project_capabilities_dir(root)
             if ((envelope / "project.json").is_file()
-                    or (envelope / "settings.json").is_file()):
+                    or (envelope / "settings.json").is_file()
+                    or (envelope.is_dir() and (_handed_off_project_id(root)
+                                               or _env_file_project_id(root)))):
                 return envelope / NAME / "state"
     return _STATE_HOME / NAME
 
@@ -1204,7 +1301,7 @@ def _connections_home_section() -> str:
     """Where the connections this help describes are kept, for the project it
     is run in - rendered from the project's connections mode, so help names
     the home the resolver reads rather than one it may not. Empty for a
-    capability without the connections tier. Reads `project.json` only and
+    capability without the connections tier. Reads the project's files and
     never reaches the store, so help stays local."""
     if "_resolve_env_key" not in globals():
         return ""
@@ -1219,7 +1316,7 @@ def _connections_home_section() -> str:
                 f"  {machine}\n" + reported)
     envelope = _project_capabilities_dir(root)
     try:
-        mode = connections_mode(envelope)
+        mode = connections_mode(envelope, root)
     except StoreError as e:
         _die(6, e.slug, e.message, e.hint)
     if mode == "store":

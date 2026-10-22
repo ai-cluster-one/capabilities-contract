@@ -161,7 +161,7 @@ STORE_SETTINGS_CHANGES_TABLE = "capabilities_settings_changes"
 # Every capability's references for each project, versioned: one row per
 # version, the active one read before the project's files.
 STORE_REFERENCES_TABLE = "capabilities_references"
-STORE_TABLES_VERSION = (1, 5)
+STORE_TABLES_VERSION = (1, 6)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -619,6 +619,24 @@ def record_table_steps() -> list[tuple[str, str]]:
          " 'The agent whose own connection this is - its own account, granted to no"
          " other agent; null for a connection shared by the capability, which any agent"
          " may be granted.'"),
+        # An agent's slug: its short technical name, which names its state
+        # directories, its service log lines and its `--project` shorthand.
+        # Unique within the store and path-safe; null while the agent has none,
+        # where its id stands in. The id is CAPABILITIES_PROJECT_ID, no longer
+        # a file's.
+        ("0021-agent-slug",
+         "ALTER TABLE capabilities_agents ADD COLUMN slug text"
+         " CHECK (slug ~ '^[a-z0-9-]+$');"
+         " CREATE UNIQUE INDEX capabilities_agents_slug ON capabilities_agents (slug);"
+         " COMMENT ON TABLE capabilities_agents IS"
+         " 'The agent registry: one row per agent, keyed by its project id"
+         " (CAPABILITIES_PROJECT_ID). Written by the capabilities manager alone.';"
+         " COMMENT ON COLUMN capabilities_agents.id IS"
+         " 'The project id, CAPABILITIES_PROJECT_ID (prj_<12 hex>, or an older UUID).';"
+         " COMMENT ON COLUMN capabilities_agents.slug IS"
+         " 'The agent''s short technical name: lowercase letters, digits and hyphens,"
+         " unique within the store. It names the agent''s state directories, service log"
+         " lines and --project shorthand; null while it has none, where the id stands in.'"),
     ]
 
 
@@ -3062,14 +3080,15 @@ def _stamp(moment: Any) -> str | None:
 
 def _bound_project_id(root: Path) -> str | None:
     """The project's id where no caller resolved it: CAPABILITIES_PROJECT_ID
-    from the process environment for this root (one handed down for another
-    root, by CAPABILITIES_PROJECT_ID_ROOT, is passed over), else the one the
-    root's .env.local, else its .env, sets. project.json holds no id."""
+    from the process environment where CAPABILITIES_PROJECT_ID_ROOT names this
+    root (one for another root, or one without a root, binds nothing here),
+    else the one the root's .env.local, else its .env, sets. project.json
+    holds no id."""
     handed = os.environ.get("CAPABILITIES_PROJECT_ID", "").strip()
     scope = os.environ.get("CAPABILITIES_PROJECT_ID_ROOT", "").strip()
-    if handed:
+    if handed and scope:
         try:
-            if not scope or Path(scope).expanduser().resolve() == Path(root).resolve():
+            if Path(scope).expanduser().resolve() == Path(root).resolve():
                 return handed
         except OSError:
             pass
@@ -3099,23 +3118,52 @@ def _identity_record(envelope: Path) -> dict[str, Any]:
     return identity if isinstance(identity, dict) else {}
 
 
-def records_mode(envelope: Path | str) -> str:
-    """Where this project keeps its records: `files`, unless its
-    `project.json` says `"records": "store"`. Only that record decides it."""
-    identity_file = Path(envelope) / "project.json"
-    declared = _identity_record(Path(envelope)).get(RECORDS_MODE_KEY, "files")
-    if declared not in RECORDS_MODES:
-        raise StoreError("bad_records_mode",
-                         f"{identity_file} declares records {declared!r}",
-                         f"one of: {', '.join(RECORDS_MODES)}; the manager writes it")
-    return declared
+def _database_resolves(root: Path) -> bool:
+    """Whether a database setting resolves for this project root - read from
+    its env files, the environment and the machine's store setting, without
+    reaching the database."""
+    try:
+        from capabilities_contract import db
+    except ImportError:
+        return False
+    try:
+        db.resolve_setting(root)
+    except db.DbError as exc:
+        return exc.slug != "store_not_configured"
+    return True
 
 
-def connections_mode(envelope: Path | str) -> str:
+def records_mode(envelope: Path | str, project_root: Path | str | None = None) -> str:
+    """Where this project keeps its records, read without reaching the store.
+
+    A `project.json`, while a project still has one, says it: `files` unless
+    `"records": "store"`. Without one, a project that keeps its gate in a
+    `settings.json` keeps its records in files, and a project bound to its id
+    (CAPABILITIES_PROJECT_ID) for which a database resolves keeps them in the
+    store; anything else keeps them in files. `project_root` is the folder
+    the id and the database resolve for, the envelope's parent unless named."""
+    envelope = Path(envelope)
+    identity_file = envelope / "project.json"
+    if identity_file.is_file():
+        declared = _identity_record(envelope).get(RECORDS_MODE_KEY, "files")
+        if declared not in RECORDS_MODES:
+            raise StoreError("bad_records_mode",
+                             f"{identity_file} declares records {declared!r}",
+                             f"one of: {', '.join(RECORDS_MODES)}; the manager writes it")
+        return declared
+    if (envelope / "settings.json").is_file():
+        return "files"
+    root = Path(project_root) if project_root else envelope.parent
+    if _bound_project_id(root) and _database_resolves(root):
+        return "store"
+    return "files"
+
+
+def connections_mode(envelope: Path | str, project_root: Path | str | None = None) -> str:
     """Where this project keeps its connections and grants: `store` when its
     records are in the store or its `project.json` says `"connections":
-    "store"`, `files` otherwise. Only that record decides it."""
-    if records_mode(envelope) == "store":
+    "store"`, `files` otherwise."""
+    if records_mode(envelope, project_root) == "store":
         return "store"
     identity_file = Path(envelope) / "project.json"
     declared = _identity_record(Path(envelope)).get(CONNECTIONS_MODE_KEY, "files")
@@ -3124,6 +3172,19 @@ def connections_mode(envelope: Path | str) -> str:
                          f"{identity_file} declares connections {declared!r}",
                          f"one of: {', '.join(CONNECTIONS_MODES)}; the manager writes it")
     return declared
+
+
+def agent_slug(conn: Any, agent_id: str) -> str | None:
+    """The agent's slug as its registry row holds it: None where the row has
+    none, the store holds no such row, or its registry predates slugs."""
+    import psycopg
+    try:
+        row = conn.execute(f"SELECT slug FROM {STORE_AGENTS_TABLE} WHERE id = %s",
+                           (agent_id,)).fetchone()
+    except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
+        conn.rollback()
+        return None
+    return row[0] if row and row[0] else None
 
 
 def open_records(envelope: Path | str, global_dir: Path | str,
@@ -3163,10 +3224,10 @@ def open_records(envelope: Path | str, global_dir: Path | str,
                          "kept only in files",
                          'remove "store" from project.json, or set it to "files"')
     root = Path(project_root) if project_root else None
-    in_store = connections_mode(envelope) == "store"
+    in_store = connections_mode(envelope, root) == "store"
     agent_id = project_id or _bound_project_id(root or envelope.parent)
     if in_store:
-        held = (RECORDS_MODE_KEY if records_mode(envelope) == "store"
+        held = (RECORDS_MODE_KEY if records_mode(envelope, root) == "store"
                 else CONNECTIONS_MODE_KEY)
         legacy: Records = StoreRecords(
             envelope, global_dir, agent_id, identity.get("slug"),
