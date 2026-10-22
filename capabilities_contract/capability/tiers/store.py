@@ -1342,10 +1342,6 @@ class FileRecords(Records):
             stored = self._stored_reference(capability, key)
             if stored is not None:
                 return self._put_stored_reference(capability, stored, body, base)
-            if self._references_failure is not None:
-                # Whether the store holds this reference is unknown, and a file
-                # written now would be shadowed by it the moment it answers.
-                raise self._references_failure
         path = self._documents(self.envelope, capability).get(key)
         if path is None:
             path = self._new_document_path(capability, key)
