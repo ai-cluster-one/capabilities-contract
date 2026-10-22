@@ -158,7 +158,10 @@ STORE_GLOBAL_TABLE = "capabilities_global"
 STORE_SETTINGS_TABLE = "capabilities_settings"
 STORE_SETTINGS_DOCUMENTS_TABLE = "capabilities_settings_documents"
 STORE_SETTINGS_CHANGES_TABLE = "capabilities_settings_changes"
-STORE_TABLES_VERSION = (1, 3)
+# Every capability's references for each project, versioned: one row per
+# version, the active one read before the project's files.
+STORE_REFERENCES_TABLE = "capabilities_references"
+STORE_TABLES_VERSION = (1, 4)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -187,6 +190,10 @@ STORE_READ_SECONDS = 2.0
 # plan sets it: the plan's one link holds a transaction open for the whole run,
 # and closing it after an operation would undo what the plan did so far.
 _HOLD_RECORDS_CONNECTION = False
+
+
+# A reference's name is its file's name without `.md`.
+_REFERENCE_NAME = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
 
 
 def record_table_steps() -> list[tuple[str, str]]:
@@ -497,6 +504,63 @@ def record_table_steps() -> list[tuple[str, str]]:
          " unset: the path was removed (new_value null).';"
          " COMMENT ON COLUMN capabilities_settings_changes.changed_by IS"
          " 'Who wrote it: user@node, migrate@node or <capability>-service@node.'"),
+        ("0019-references",
+         "CREATE TABLE capabilities_references ("
+         " id uuid PRIMARY KEY DEFAULT gen_random_uuid(),"
+         " project_id text NOT NULL CHECK (project_id <> ''),"
+         " capability text NOT NULL CHECK (capability ~ '^[a-z][a-z0-9-]*$'),"
+         f" name text NOT NULL CHECK (name ~ '{_REFERENCE_NAME}' AND name !~* '[.]md$'),"
+         " body text NOT NULL,"
+         " active boolean NOT NULL DEFAULT true,"
+         " created_at timestamptz NOT NULL DEFAULT now(),"
+         " created_by text NOT NULL CHECK (created_by <> ''),"
+         " note text);"
+         " CREATE UNIQUE INDEX capabilities_references_active ON capabilities_references"
+         "  (project_id, capability, (lower(replace(name, '_', '-')))) WHERE active;"
+         " CREATE INDEX capabilities_references_history ON capabilities_references"
+         "  (project_id, capability, (lower(replace(name, '_', '-'))), created_at DESC);"
+         " CREATE FUNCTION capabilities_references_guard() RETURNS trigger"
+         "  LANGUAGE plpgsql AS $guard$"
+         " BEGIN"
+         "  IF tg_op IN ('DELETE', 'TRUNCATE') THEN"
+         "   RAISE EXCEPTION 'reference versions are never deleted: retire the reference'"
+         "    USING ERRCODE = 'check_violation';"
+         "  END IF;"
+         "  IF (to_jsonb(NEW) - 'active') IS DISTINCT FROM (to_jsonb(OLD) - 'active') THEN"
+         "   RAISE EXCEPTION 'a reference version is immutable: save a new version'"
+         "    USING ERRCODE = 'check_violation';"
+         "  END IF;"
+         "  IF NEW.active AND NOT OLD.active THEN"
+         "   RAISE EXCEPTION 'a reference version is not made active again: save its"
+         " body as a new version' USING ERRCODE = 'check_violation';"
+         "  END IF;"
+         "  RETURN NEW;"
+         " END $guard$;"
+         " CREATE TRIGGER capabilities_references_guard"
+         "  BEFORE UPDATE OR DELETE ON capabilities_references"
+         "  FOR EACH ROW EXECUTE FUNCTION capabilities_references_guard();"
+         " CREATE TRIGGER capabilities_references_truncate"
+         "  BEFORE TRUNCATE ON capabilities_references"
+         "  FOR EACH STATEMENT EXECUTE FUNCTION capabilities_references_guard();"
+         " COMMENT ON TABLE capabilities_references IS"
+         " 'Every version of each capability''s references for a project: the file"
+         " capabilities/<capability>/reference/<name>.md as a row. A reference with an"
+         " active version is read from here before the project''s files; one with none"
+         " is retired. Immutable but for active, which a save clears as it adds the next.';"
+         " COMMENT ON COLUMN capabilities_references.project_id IS"
+         " 'The project''s declared id.';"
+         " COMMENT ON COLUMN capabilities_references.name IS"
+         " 'The file''s name without .md, as it was imported; the reference''s key is"
+         " reference.<name> with underscores as hyphens and in lower case, unique among"
+         " active versions.';"
+         " COMMENT ON COLUMN capabilities_references.body IS"
+         " 'Every byte of the file, front matter included, kept exactly.';"
+         " COMMENT ON COLUMN capabilities_references.active IS"
+         " 'The version in force; at most one per reference, none once it is retired.';"
+         " COMMENT ON COLUMN capabilities_references.created_by IS"
+         " 'Who saved the version: user@node.';"
+         " COMMENT ON COLUMN capabilities_references.note IS"
+         " 'Why the version was saved.'"),
     ]
 
 
@@ -579,6 +643,137 @@ def _document_key(prefix: str | None, stem: str) -> str:
     searches rather than computes."""
     slug = stem.replace("_", "-").lower()
     return f"{prefix}.{slug}" if prefix else slug
+
+
+# --- references in the store -----------------------------------------------------
+#
+# A project's references may be rows of `capabilities_references` rather than
+# files: one row per version, keyed by project, capability and name, the body
+# every byte of the file. A reference with an active version is read from
+# there before any file; where the store holds none, or no store answers, the
+# files are read as they always were. The manager imports and exports them.
+
+REFERENCE_DOCUMENT_PREFIX = "reference"
+_REFERENCE_NAME_RE = re.compile(_REFERENCE_NAME)
+_REFERENCE_COLUMNS = ("id, capability, name, body, active, created_at, created_by, note")
+
+
+def reference_name_ok(name: str) -> bool:
+    """Whether `name` (a file's name without `.md`) can be a stored reference."""
+    return bool(_REFERENCE_NAME_RE.match(name)) and not name.lower().endswith(".md")
+
+
+def reference_key(name: str) -> str:
+    """The document key a reference of this name answers to."""
+    return _document_key(REFERENCE_DOCUMENT_PREFIX, name)
+
+
+def _reference_row(row: Sequence[Any]) -> dict[str, Any]:
+    vid, capability, name, body, active, created_at, created_by, note = row
+    return {"version": str(vid), "capability": capability, "name": name,
+            "key": reference_key(name), "body": body, "active": bool(active),
+            "hash": hashlib.sha256(body.encode()).hexdigest()[:HASH_LENGTH],
+            "created_at": _stamp(created_at), "created_by": created_by, "note": note}
+
+
+def stored_references(conn: Any, project_id: str,
+                      capability: str | None = None) -> list[dict[str, Any]]:
+    """The active version of each reference the store holds for the project,
+    of one capability or of all, ordered by capability and name."""
+    query = (f"SELECT {_REFERENCE_COLUMNS} FROM {STORE_REFERENCES_TABLE} "
+             "WHERE project_id = %s AND active")
+    params: list[Any] = [project_id]
+    if capability is not None:
+        query += " AND capability = %s"
+        params.append(capability)
+    rows = conn.execute(query + " ORDER BY capability, name", params).fetchall()
+    return [_reference_row(row) for row in rows]
+
+
+def reference_history(conn: Any, project_id: str, capability: str,
+                      name: str) -> list[dict[str, Any]]:
+    """Every version of one reference, newest first."""
+    rows = conn.execute(
+        f"SELECT {_REFERENCE_COLUMNS} FROM {STORE_REFERENCES_TABLE} "
+        "WHERE project_id = %s AND capability = %s "
+        "AND lower(replace(name, '_', '-')) = %s ORDER BY created_at DESC, id",
+        (project_id, capability, reference_key(name)[len(REFERENCE_DOCUMENT_PREFIX) + 1:])
+    ).fetchall()
+    return [_reference_row(row) for row in rows]
+
+
+def _reference_lock(conn: Any, project_id: str, capability: str, name: str) -> None:
+    """One writer at a time per reference, so two saves from one base cannot
+    both find it active."""
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext(concat_ws(chr(31), %s::text, "
+                 "%s::text, %s::text, %s::text)))",
+                 (STORE_REFERENCES_TABLE, project_id, capability, reference_key(name)))
+
+
+def reference_save(conn: Any, project_id: str, capability: str, name: str, body: str,
+                   author: str, *, base_version: str | None = None,
+                   base_hash: str | None = None, note: str | None = None,
+                   check_base: bool = True) -> dict[str, Any]:
+    """Save `body` as the reference's new active version, inside the caller's
+    transaction, clearing `active` on the version it replaces. A body equal to
+    the active one adds nothing. `base_version` (a version id or a prefix of
+    six or more characters) or `base_hash` names the version the edit was made
+    from: the save is refused with `stale_base` when another is active now.
+    Answers {version, changed, previous}."""
+    if not reference_name_ok(name):
+        raise StoreError("bad_reference_name",
+                         f"{name!r} cannot name a reference",
+                         "a name is letters, digits, '.', '_' and '-', starting with a "
+                         "letter or digit, without .md")
+    _reference_lock(conn, project_id, capability, name)
+    history = reference_history(conn, project_id, capability, name)
+    active = next((row for row in history if row["active"]), None)
+    if check_base and (base_version is not None or base_hash is not None):
+        if base_version is not None:
+            wanted = base_version.strip().lower()
+            matches = [row for row in history if row["version"].startswith(wanted)] \
+                if len(wanted) >= 6 else []
+            if len(matches) != 1:
+                raise StoreError("unknown_base",
+                                 f"{base_version!r} names no single version of "
+                                 f"{capability}/{name}",
+                                 f"`capabilities references history {capability} {name}` "
+                                 "lists them")
+            current = active is not None and matches[0]["version"] == active["version"]
+        else:
+            current = active is not None and active["hash"] == base_hash
+        if not current:
+            now = active["version"] if active else "none"
+            raise StoreError("stale_base",
+                             f"{capability}/{name} is at version {now} now, not the "
+                             "base the edit was made from",
+                             "read it again and apply the change to what is active")
+    if active is not None and active["body"] == body and active["name"] == name:
+        return {"version": active["version"], "changed": False,
+                "previous": active["version"]}
+    if active is not None:
+        conn.execute(f"UPDATE {STORE_REFERENCES_TABLE} SET active = false WHERE id = %s",
+                     (active["version"],))
+    [(vid,)] = conn.execute(
+        f"INSERT INTO {STORE_REFERENCES_TABLE} (project_id, capability, name, body, "
+        "created_by, note) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+        (project_id, capability, name, body, author, note)).fetchall()
+    return {"version": str(vid), "changed": True,
+            "previous": active["version"] if active else None}
+
+
+def reference_retire(conn: Any, project_id: str, capability: str, name: str) -> str | None:
+    """Clear the reference's active version inside the caller's transaction,
+    keeping every version. Answers the version retired, None where none was
+    active."""
+    _reference_lock(conn, project_id, capability, name)
+    active = next((row for row in reference_history(conn, project_id, capability, name)
+                   if row["active"]), None)
+    if active is None:
+        return None
+    conn.execute(f"UPDATE {STORE_REFERENCES_TABLE} SET active = false WHERE id = %s",
+                 (active["version"],))
+    return active["version"]
 
 
 class Records:
@@ -1048,10 +1243,65 @@ class FileRecords(Records):
                     found.setdefault(_document_key(prefix, path.stem), path)
         return found
 
+    # -- references the store holds ------------------------------------------
+
+    # What the last read of the store's references answered, when, and why no
+    # store answered it: set by `open_records` where its own probe failed, so
+    # a store that is away costs one wait per process, not one per question.
+    _references: dict[tuple[str, str], dict[str, Any]] | None = None
+    _references_at = 0.0
+    _references_failure: StoreError | None = None
+
+    def _stored_references(self) -> dict[tuple[str, str], dict[str, Any]]:
+        """(capability, key) -> the active version of each reference the store
+        holds for this project. Empty where the project has no id, no store is
+        configured, the store does not answer, or it holds none: its files are
+        then read as they always were."""
+        if self._references is not None and (
+                self._references_failure is not None
+                or time.monotonic() - self._references_at < STORE_READ_SECONDS):
+            return self._references
+        found: dict[tuple[str, str], dict[str, Any]] = {}
+        failure: StoreError | None = None
+        if self._guard_agent:
+            try:
+                conn, _schema = _store_connect(self._guard_root or self.envelope.parent,
+                                               self._guard_application, _PROBE_TIMEOUT)
+            except StoreError as exc:
+                if exc.slug != "store_not_configured":
+                    failure = exc
+            else:
+                import psycopg
+                try:
+                    for row in stored_references(conn, self._guard_agent):
+                        found.setdefault((row["capability"], row["key"]), row)
+                except psycopg.errors.UndefinedTable:
+                    pass
+                except psycopg.Error as exc:
+                    failure = StoreError("store_unreachable",
+                                         f"cannot read the stored references: {exc}",
+                                         "check the database setting with "
+                                         "`capabilities store doctor`")
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        self._references, self._references_failure = found, failure
+        self._references_at = time.monotonic()
+        return found
+
+    def _stored_reference(self, capability: str, key: str) -> dict[str, Any] | None:
+        if not key.startswith(REFERENCE_DOCUMENT_PREFIX + "."):
+            return None
+        return self._stored_references().get((capability, key))
+
     def document_path(self, capability: str, key: str) -> Path | None:
         """The file this key names. It is the truth here, not a copy of it, so
         an edit to what this returns is the edit — which is why `put` validates
-        rather than transports."""
+        rather than transports. A reference the store holds has no file."""
+        if self._stored_reference(capability, key) is not None:
+            return None
         for _scope, _pid, root in self._chain():
             path = self._documents(root, capability).get(key)
             if path:
@@ -1059,6 +1309,13 @@ class FileRecords(Records):
         return None
 
     def document_read(self, capability: str, key: str) -> dict[str, Any] | None:
+        stored = self._stored_reference(capability, key)
+        if stored is not None:
+            return {"id": stored["version"], "key": key, "hash": stored["hash"],
+                    "body": stored["body"], "media_type": "text/markdown",
+                    "author": stored["created_by"], "created_at": stored["created_at"],
+                    "scope": ("project", self._guard_agent), "path": None,
+                    "version": stored["version"]}
         for scope, pid, root in self._chain():
             path = self._documents(root, capability).get(key)
             if not path:
@@ -1074,12 +1331,21 @@ class FileRecords(Records):
         keys: set[str] = set()
         for _scope, _pid, root in self._chain():
             keys.update(self._documents(root, capability))
+        keys.update(key for cap, key in self._stored_references() if cap == capability)
         return sorted(keys)
 
     def document_put(self, capability: str, key: str, body: str,
                      author: str | None = None, media_type: str | None = None,
                      base: str | None = None) -> str:
         self.guard_write(capability, "document")
+        if key.startswith(REFERENCE_DOCUMENT_PREFIX + "."):
+            stored = self._stored_reference(capability, key)
+            if stored is not None:
+                return self._put_stored_reference(capability, stored, body, base)
+            if self._references_failure is not None:
+                # Whether the store holds this reference is unknown, and a file
+                # written now would be shadowed by it the moment it answers.
+                raise self._references_failure
         path = self._documents(self.envelope, capability).get(key)
         if path is None:
             path = self._new_document_path(capability, key)
@@ -1097,6 +1363,29 @@ class FileRecords(Records):
                     "re-read it and apply the change again")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body)
+        return hashlib.sha256(body.encode()).hexdigest()[:HASH_LENGTH]
+
+    def _put_stored_reference(self, capability: str, stored: dict[str, Any],
+                              body: str, base: str | None) -> str:
+        """A new version of a reference the store holds, refused where another
+        became active after the edit began."""
+        conn, _schema = _store_connect(self._guard_root or self.envelope.parent,
+                                       self._guard_application)
+        import psycopg
+        try:
+            with conn.transaction():
+                reference_save(conn, self._guard_agent, capability, stored["name"], body,
+                               f"{_user_name()}@{node_name()}", base_hash=base)
+        except psycopg.Error as exc:
+            raise StoreError("store_unreachable", f"cannot save the reference: {exc}",
+                             "check the database setting with `capabilities store doctor`"
+                             ) from None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._references = None
         return hashlib.sha256(body.encode()).hexdigest()[:HASH_LENGTH]
 
     def _new_document_path(self, capability: str, key: str) -> Path:
@@ -1118,7 +1407,18 @@ class FileRecords(Records):
         self._refuse("a record's history")
         return []
 
-    def document_versions(self, *_a: Any, **_k: Any) -> list:
+    def document_versions(self, capability: str | None = None, key: str | None = None,
+                          *_a: Any, **_k: Any) -> list:
+        stored = (self._stored_reference(capability, key)
+                  if capability is not None and key is not None else None)
+        if stored is not None:
+            conn, _schema = _store_connect(self._guard_root or self.envelope.parent,
+                                           self._guard_application)
+            try:
+                return reference_history(conn, self._guard_agent, capability,
+                                         stored["name"])
+            finally:
+                conn.close()
         self._refuse("a document's earlier versions")
         return []
 
@@ -2786,6 +3086,10 @@ def open_records(envelope: Path | str, global_dir: Path | str,
     except StoreError as exc:
         if in_store and exc.slug != "store_not_configured":
             legacy._settings_blocked = exc
+        # No store answers: the references are the files, without asking again.
+        legacy._references = {}
+        legacy._references_failure = (None if exc.slug == "store_not_configured"
+                                      else exc)
         return legacy
     import psycopg
     try:
