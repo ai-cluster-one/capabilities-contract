@@ -702,17 +702,40 @@ def record_table_steps() -> list[tuple[str, str]]:
         # there (`enabled`). Only an agent's row naming a node places a service.
         # A row written before this column placed a service exactly where it
         # enabled the capability on a node of its own, so that is its value.
+        # A writer that predates the column still means that: a trigger gives
+        # `service` the value of `enabled` on an agent's row naming a node
+        # where an insert leaves it out, or an update changes `enabled` and
+        # leaves `service` as it was.
         ("0025-policy-service",
          "ALTER TABLE capabilities_policy"
          " ADD COLUMN service boolean NOT NULL DEFAULT false;"
          " UPDATE capabilities_policy SET service = enabled"
          "  WHERE agent_id IS NOT NULL AND node IS NOT NULL;"
+         " ALTER TABLE capabilities_policy ALTER COLUMN service DROP DEFAULT;"
          " ALTER TABLE capabilities_policy ADD CONSTRAINT capabilities_policy_service"
          "  CHECK (NOT service OR (agent_id IS NOT NULL AND node IS NOT NULL));"
+         " CREATE FUNCTION capabilities_policy_service_follows() RETURNS trigger"
+         "  LANGUAGE plpgsql AS $follows$"
+         " BEGIN"
+         "  IF NEW.agent_id IS NULL OR NEW.node IS NULL THEN"
+         "   NEW.service := coalesce(NEW.service, false);"
+         "  ELSIF tg_op = 'INSERT' THEN"
+         "   NEW.service := coalesce(NEW.service, NEW.enabled);"
+         "  ELSIF NEW.enabled IS DISTINCT FROM OLD.enabled"
+         "   AND NEW.service IS NOT DISTINCT FROM OLD.service THEN"
+         "   NEW.service := NEW.enabled;"
+         "  END IF;"
+         "  RETURN NEW;"
+         " END $follows$;"
+         " CREATE TRIGGER capabilities_policy_service_follows"
+         "  BEFORE INSERT OR UPDATE ON capabilities_policy"
+         "  FOR EACH ROW EXECUTE FUNCTION capabilities_policy_service_follows();"
          " COMMENT ON COLUMN capabilities_policy.service IS"
          " 'Whether the agent''s bundled service of this capability is placed on the node"
          " the row names: the service runs there. Apart from enabled, which says whether"
-         " the capability is usable there. Only an agent''s row naming a node places.'"),
+         " the capability is usable there. Only an agent''s row naming a node places."
+         " A trigger sets it to enabled on such a row where an insert leaves it out or"
+         " an update changes enabled alone, as a writer that predates the column means.'"),
     ]
 
 
