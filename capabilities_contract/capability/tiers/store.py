@@ -177,6 +177,11 @@ STORE_TABLES = {
     "setting": STORE_SETTINGS_TABLE,
 }
 
+# What the global layer takes from the store's rows for every agent once they
+# are in force: connections, their grants, the default pointer (a setting
+# kept on a grant) and policy. Identifiers and settings documents stay files.
+GLOBAL_STORE_COLLECTIONS = frozenset({"connection", "grant", "setting", "policy"})
+
 # A store that cannot be reached or is busy is the environment's fault, not
 # the configuration's: a capability maps these to its network exit code.
 STORE_ENVIRONMENT_SLUGS = frozenset({"store_unreachable", "store_busy"})
@@ -981,6 +986,55 @@ class FileRecords(Records):
         self._guard_application = STORE_OWNER
         self.actor: str | None = None
 
+    # Where the global layer's connections, grants, default pointer and policy
+    # may be the store's rows for every agent: `(project_root,)`, the folder
+    # its database resolves for (None outside any project), set by
+    # `open_records` and `global_records` alone. An adapter made directly
+    # reads the config home's files, as the manager's migration does.
+    _global_from: tuple | None = None
+    # What asking answered: None not yet, a GlobalRows where the store holds
+    # the global rows, False where it does not or no database is configured,
+    # or (when, StoreError) where a configured store did not answer.
+    _global_state: Any = None
+
+    def _global_rows(self, write: bool = False) -> "GlobalRows | None":
+        """The store's rows for every agent where they are in force - a
+        database resolves and `capabilities_global.global_migrated_at` is
+        set - else None, and the config home's files are the global layer as
+        before. A configured store that does not answer leaves a read on the
+        files and refuses a write (`write`), which would otherwise land in a
+        file the store's rows shadow once it answers again."""
+        if self._global_from is None or not self.include_global:
+            return None
+        state = self._global_state
+        if isinstance(state, tuple) and time.monotonic() - state[0] >= STORE_READ_SECONDS:
+            state = None
+        if state is None:
+            rows = GlobalRows(self.global_dir, self._global_from[0], self._guard_application)
+            try:
+                state = rows if rows.in_force() else False
+            except StoreError as exc:
+                state = (time.monotonic(), exc)
+            self._global_state = state
+        if isinstance(state, tuple):
+            if write:
+                raise state[1]
+            return None
+        return state or None
+
+    def global_kept(self) -> str:
+        """Where this adapter keeps the global layer's connections, grants,
+        default pointer and policy: `store` once the store's global rows are
+        in force, else `files`. A configured store that does not answer
+        raises StoreError, since a write could land in neither."""
+        return "store" if self._global_rows(write=True) is not None else "files"
+
+    def global_grantees(self, capability: str, connection: str) -> list[str]:
+        """Every agent a grant enables a connection of the global layer for,
+        where that layer is the store's rows; none where it is files."""
+        rows = self._global_rows()
+        return rows.grantees(capability, connection) if rows is not None else []
+
     def _agent_now(self) -> dict | None:
         """This project's registry row as the store holds it now, or None
         where no database answers or it holds none: a project whose records
@@ -1069,7 +1123,17 @@ class FileRecords(Records):
 
     def _entries(self, root: Path, capability: str, collection: str) -> dict[str, Any]:
         """Every entry of one collection held at one scope, keyed by the name a
-        record answers to."""
+        record answers to. Where the store's global rows are in force, the
+        global scope's connections, grants, default pointer and policy are
+        theirs, and its files answer only for what the store holds no row of."""
+        files = self._file_entries(root, capability, collection)
+        if root != self.global_dir or collection not in GLOBAL_STORE_COLLECTIONS:
+            return files
+        rows = self._global_rows()
+        return files if rows is None else rows.entries(capability, collection, files)
+
+    def _file_entries(self, root: Path, capability: str, collection: str) -> dict[str, Any]:
+        """Every entry of one collection one scope's files hold."""
         if collection == "policy":
             body = self._load(self._policy_file(root)) or {}
             return dict((body.get("capabilities") or {}))
@@ -1192,9 +1256,9 @@ class FileRecords(Records):
         """The file that answered, named exactly. A report that says only
         "files" makes the reader go and find out which one, and the scope a
         record resolved at is half of what they came to learn."""
-        for _scope, _pid, root in self._chain():
+        for scope, _pid, root in self._chain():
             if self._entries(root, capability, collection):
-                return str(self._file(root, capability, collection))
+                return self.scope_source(capability, collection, scope)
         return str(self._file(self.envelope, capability, collection))
 
     def scope_source(self, capability: str, collection: str, scope: str) -> str:
@@ -1204,7 +1268,24 @@ class FileRecords(Records):
         file: one file per scope, and the chain is not walked again."""
         _store_check("capability", capability, CAPABILITY_RE)
         root, _pid = self._scope_root(scope)
+        if scope == "global" and collection in GLOBAL_STORE_COLLECTIONS \
+                and collection != "setting":
+            rows = self._global_rows()
+            if rows is not None:
+                return rows.table_source(collection)
         return str(self._file(root, capability, collection))
+
+    def record_source(self, capability: str, collection: str, scope: str,
+                      key: str) -> str:
+        """Where one record of one scope was read: as `scope_source`, except
+        that a global connection a config-home file still answers for, the
+        store holding no row of it, names that file."""
+        source = self.scope_source(capability, collection, scope)
+        if scope == "global" and collection == "connection" and source.startswith("store:"):
+            rows = self._global_rows()
+            if rows is not None and key not in rows._layer(capability)["connections"]:
+                return str(self._file(self.global_dir, capability, collection))
+        return source
 
     def connections(self, capability: str, write_default: bool = False,
                     include_disabled: bool = False,
@@ -1276,6 +1357,9 @@ class FileRecords(Records):
             raise StoreError("bad_scope",
                              f"scope {target_scope!r} must be one of {', '.join(SCOPE_KINDS)}")
         self.guard_write(capability, collection, target_scope)
+        rows = self._store_kept(collection, key, target_scope)
+        if rows is not None:
+            return rows.set(capability, collection, key, value)
         root = self.envelope if target_scope == "project" else self.global_dir
         if target_scope == "project" and not self.envelope.is_dir():
             raise StoreError("no_envelope", "no capabilities/ envelope in this project",
@@ -1317,7 +1401,40 @@ class FileRecords(Records):
             raise StoreError("bad_scope",
                              f"scope {target_scope!r} must be one of {', '.join(SCOPE_KINDS)}")
         self.guard_write(capability, collection, target_scope)
+        rows = self._store_kept(collection, key, target_scope)
+        if rows is not None:
+            # The row goes, and so does a legacy file's entry of the same name,
+            # which would otherwise answer again where the store holds none.
+            gone = rows.delete(capability, collection, key)
+            return self._file_delete(self.global_dir, capability, collection, key) or gone
         root = self.envelope if target_scope == "project" else self.global_dir
+        return self._file_delete(root, capability, collection, key)
+
+    def _store_kept(self, collection: str, key: str | None,
+                    scope: str) -> "GlobalRows | None":
+        """Where a write lands once the store's global rows are in force: the
+        store's rows for a global connection, grant, default pointer or
+        policy; a refusal for a connection, grant or default pointer of a
+        project that keeps its records in files, since no connection is
+        written to a file any more; None where the files take it as before."""
+        if collection not in GLOBAL_STORE_COLLECTIONS or (
+                collection == "setting" and key != "connection.default"):
+            return None
+        if scope == "project" and collection == "policy":
+            return None
+        rows = self._global_rows(write=True)
+        if rows is None or scope == "global":
+            return rows
+        raise StoreError(
+            "connections_in_store",
+            "this project keeps its records in files, and the store this machine "
+            "reads holds the connections every agent uses: a connection, its grant "
+            "and the default pointer are no longer written to a file",
+            "move this project's records into the store with `capabilities migrate`, "
+            "then write it again")
+
+    def _file_delete(self, root: Path, capability: str, collection: str,
+                     key: str) -> bool:
         path = self._file(root, capability, collection, key)
         body = self._load(path)
         if not isinstance(body, dict):
@@ -1952,7 +2069,11 @@ class StoreRecords(FileRecords):
 
     def _entries(self, root: Path, capability: str, collection: str) -> dict[str, Any]:
         if collection in self.collections:
-            return {}
+            # What the global scope holds of a connection is a row of the
+            # store's once the global rows are in force, never a file.
+            rows = (self._global_rows() if root == self.global_dir
+                    and collection in ("connection", "grant") else None)
+            return {} if rows is None else rows.entries(capability, collection, {})
         if collection == "setting" and self._settings_blocked is not None:
             raise self._settings_blocked
         entries = super()._entries(root, capability, collection)
@@ -2444,6 +2565,235 @@ def settings_leaves(document: dict, prefix: tuple = ()) -> dict[tuple, Any]:
         else:
             out[path] = value
     return out
+
+
+class GlobalRows(StoreRecords):
+    """The store's rows for every agent, which are the global layer once the
+    store holds them (`capabilities_global.global_migrated_at` is set): every
+    connection row, the grant for every agent and every node with the default
+    pointer it carries, and the policy row for every agent and every node.
+    `project_root` is the folder the database resolves for; None outside any
+    project, where the machine's store setting answers.
+
+    A connection written here is shared (its owner null), and one an agent
+    owns is refused (`connection_owned`). Its grant names no agent and no
+    node, and the store refuses one for a connection an agent owns."""
+
+    def __init__(self, global_dir: Path | str, project_root: Path | str | None,
+                 application_name: str = STORE_OWNER):
+        super().__init__(Path(global_dir), Path(global_dir), None, None,
+                         application_name=application_name)
+        self.project_root = Path(project_root) if project_root is not None else None
+        self._in_force: bool | None = None
+
+    def in_force(self) -> bool:
+        """Whether the store holds the global rows; False where no database
+        is configured. A configured store that does not answer within
+        `_PROBE_TIMEOUT` raises StoreError."""
+        if self._in_force is not None:
+            return self._in_force
+        try:
+            conn, schema = _store_connect(self.project_root, self.application_name,
+                                          _PROBE_TIMEOUT)
+        except StoreError as exc:
+            if exc.slug in ("store_not_configured", "driver_missing"):
+                self._in_force = False
+                return False
+            raise
+        import psycopg
+        try:
+            try:
+                row = conn.execute("SELECT global_migrated_at FROM capabilities_global"
+                                   ).fetchone()
+            except psycopg.errors.UndefinedTable:
+                row = None
+            conn.rollback()
+        except psycopg.Error as exc:
+            raise StoreError("store_unreachable", f"cannot read the store's global rows: {exc}",
+                             "check the database setting with `capabilities store doctor`"
+                             ) from None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._schema = schema
+        self._in_force = bool(row and row[0])
+        return self._in_force
+
+    def table_source(self, collection: str) -> str:
+        return self._table_source(collection)
+
+    # -- reading ---------------------------------------------------------------
+
+    def _layer(self, capability: str) -> dict[str, Any]:
+        """One capability's global layer: its connection rows, the grant
+        fields every agent's grant decides, and the default pointer."""
+        key = ("global", capability)
+        held = self._fresh(key)
+        if held is None:
+            connections, grants = self._read_many([
+                ("SELECT name, spec FROM capabilities_connections "
+                 "WHERE capability = %s ORDER BY name", (capability,)),
+                ("SELECT connection, enabled, allow_write, is_default "
+                 "FROM capabilities_connection_grants WHERE agent_id IS NULL "
+                 "AND node IS NULL AND capability = %s ORDER BY connection",
+                 (capability,))])
+            held = {"connections": {name: dict(spec) if isinstance(spec, dict) else {}
+                                    for name, spec in connections},
+                    "grants": {}, "default": None}
+            for cid, enabled, allow_write, is_default in grants:
+                fields = {f: v for f, v in (("enabled", enabled),
+                                            ("allow_write", allow_write)) if v is not None}
+                if fields:
+                    held["grants"][cid] = fields
+                if is_default and held["default"] is None:
+                    held["default"] = cid
+            self._cache[key] = (time.monotonic(), held)
+        return held
+
+    def _policy(self) -> dict[str, dict[str, bool]]:
+        key = ("global", "")
+        held = self._fresh(key)
+        if held is None:
+            held = {name: {"enabled": bool(enabled)} for name, enabled in self._read(
+                "SELECT capability, enabled FROM capabilities_policy "
+                "WHERE agent_id IS NULL AND node IS NULL ORDER BY capability", ())}
+            self._cache[key] = (time.monotonic(), held)
+        return held
+
+    def entries(self, capability: str, collection: str,
+                files: dict[str, Any]) -> dict[str, Any]:
+        """The global scope's entries of one collection: the store's, with
+        `files` (the config home's) answering only for a name the store holds
+        no row of - a connection id, or a capability's policy. A file's
+        default pointer stands only for a capability the store holds no
+        connection of."""
+        if collection == "policy":
+            stored = self._policy()
+            return {**{k: v for k, v in files.items() if k not in stored}, **stored}
+        layer = self._layer(capability)
+        names = layer["connections"]
+        if collection == "connection":
+            out = {cid: v for cid, v in files.items() if cid not in names}
+            out.update(names)
+            return out
+        if collection == "grant":
+            out = {cid: v for cid, v in files.items() if cid not in names}
+            out.update(layer["grants"])
+            return out
+        out = dict(files)
+        if names:
+            out.pop("connection.default", None)
+        if layer["default"] is not None:
+            out["connection.default"] = layer["default"]
+        return out
+
+    # -- writing ---------------------------------------------------------------
+
+    def _put_global_grant(self, conn: Any, capability: str, cid: str,
+                          fields: dict[str, Any]) -> None:
+        known = conn.execute(
+            "SELECT 1 FROM capabilities_connections WHERE capability = %s AND name = %s",
+            (capability, cid)).fetchone()
+        if known is None:
+            raise StoreError("unknown_connection",
+                             f"the store holds no {capability} connection {cid!r}",
+                             f"add it first: `{capability} connection add {cid} --machine`")
+        if fields.get("is_default"):
+            conn.execute(
+                "UPDATE capabilities_connection_grants SET is_default = false "
+                "WHERE agent_id IS NULL AND node IS NULL AND capability = %s "
+                "AND connection <> %s AND is_default", (capability, cid))
+        columns = ["capability", "connection", *fields]
+        values = [capability, cid, *fields.values()]
+        updates = ", ".join(f"{field} = EXCLUDED.{field}" for field in fields)
+        conn.execute(
+            f"INSERT INTO capabilities_connection_grants (agent_id, node, {', '.join(columns)}) "
+            f"VALUES (NULL, NULL, {', '.join(['%s'] * len(values))}) "
+            "ON CONFLICT ((coalesce(agent_id, '')), capability, connection, "
+            "(coalesce(node, ''))) "
+            + (f"DO UPDATE SET {updates}" if updates else "DO NOTHING"),
+            values)
+
+    def _clear_default(self, conn: Any, capability: str) -> bool:
+        return conn.execute(
+            "UPDATE capabilities_connection_grants SET is_default = false "
+            "WHERE agent_id IS NULL AND node IS NULL AND capability = %s AND is_default",
+            (capability,)).rowcount > 0
+
+    def set(self, capability: str, collection: str, key: str, value: Any,
+            actor: str | None = None, note: str | None = None,
+            scope: str | None = None, node: str | None = None, own: bool = False) -> None:
+        if collection == "policy":
+            return self._put_policy(key, value, "global")
+        if collection == "connection":
+            if not isinstance(value, dict):
+                raise StoreError("bad_connection",
+                                 f"connection {key!r} must be a table, got "
+                                 f"{type(value).__name__}")
+            spec = {k: v for k, v in value.items() if k not in GRANT_FIELDS}
+            grant = {k: value[k] for k in GRANT_FIELDS if k in value}
+
+            def work(conn: Any) -> None:
+                self._put_connection(conn, capability, key, spec, None, False)
+                if grant:
+                    self._put_global_grant(conn, capability, key, grant)
+            return self._write(work)
+        if collection == "grant":
+            fields = {k: v for k, v in (value or {}).items() if k in GRANT_FIELDS}
+            return self._write(lambda conn: self._put_global_grant(conn, capability, key,
+                                                                   fields))
+        cid = value if isinstance(value, str) and value else None
+        if value not in (None, "") and cid is None:
+            raise StoreError("bad_default", "the default pointer names a connection id")
+
+        def put_default(conn: Any) -> None:
+            self._clear_default(conn, capability)
+            if cid is not None:
+                self._put_global_grant(conn, capability, cid, {"is_default": True})
+        return self._write(put_default)
+
+    def delete(self, capability: str, collection: str, key: str,
+               scope: str | None = None, node: str | None = None) -> bool:
+        if collection == "policy":
+            def work(conn: Any) -> bool:
+                return conn.execute(
+                    "DELETE FROM capabilities_policy WHERE agent_id IS NULL "
+                    "AND node IS NULL AND capability = %s", (key,)).rowcount > 0
+        elif collection == "connection":
+            def work(conn: Any) -> bool:
+                return self._drop_connection(conn, capability, key, None)
+        elif collection == "grant":
+            def work(conn: Any) -> bool:
+                cleared = conn.execute(
+                    "UPDATE capabilities_connection_grants SET enabled = NULL, "
+                    "allow_write = NULL WHERE agent_id IS NULL AND node IS NULL "
+                    "AND capability = %s AND connection = %s "
+                    "AND (enabled IS NOT NULL OR allow_write IS NOT NULL)",
+                    (capability, key)).rowcount > 0
+                conn.execute(
+                    "DELETE FROM capabilities_connection_grants WHERE agent_id IS NULL "
+                    "AND node IS NULL AND capability = %s AND connection = %s "
+                    "AND NOT is_default", (capability, key))
+                return cleared
+        else:
+            def work(conn: Any) -> bool:
+                return self._clear_default(conn, capability)
+        return bool(self._write(work))
+
+
+def global_records(global_dir: Path | str, project_root: Path | str | None = None,
+                   application_name: str = STORE_OWNER) -> "FileRecords":
+    """The machine's global layer alone, as a process outside any project
+    reads and writes it: the config home's files, or the store's rows for
+    every agent once they are in force there (see `GlobalRows`), the database
+    resolved for `project_root` (None: the machine's store setting)."""
+    global_dir = Path(global_dir)
+    adapter = FileRecords(global_dir / "no-project", global_dir)
+    adapter._global_from = (Path(project_root) if project_root is not None else None,)
+    adapter._guard_application = application_name
+    return adapter
 
 
 class _Unchanged(Exception):
@@ -3281,6 +3631,7 @@ def open_records(envelope: Path | str, global_dir: Path | str,
     legacy._guard_agent = agent_id if isinstance(agent_id, str) and agent_id else None
     legacy._guard_root = root
     legacy._guard_application = application_name
+    legacy._global_from = (root,)
     legacy.actor = actor
     if legacy._guard_agent is None:
         return legacy

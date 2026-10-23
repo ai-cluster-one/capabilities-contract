@@ -131,7 +131,7 @@ def _connections_composed() -> dict:
             refusal = (f"no {NAME} connection is usable in this project; every "
                        f"one it can see is withheld: {named}")
         _die(4, "connection_not_granted", refusal, _grant_hint("<id>"))
-    sources = {cid: adapter.scope_source(NAME, "connection", entry["scope"][0])
+    sources = {cid: adapter.record_source(NAME, "connection", entry["scope"][0], cid)
                for cid, entry in usable.items()}
     _MACHINE_LENT.update({cid: sources[cid] for cid, entry in usable.items()
                           if entry.get("machine_read")})
@@ -431,11 +431,18 @@ def _connection_scope(words: list[str], usage: str) -> tuple[str, list[str]]:
 def _connection_grantees(adapter, cid: str, scope: str, root) -> list:
     """The projects a connection removed at `scope` is granted to and would be
     taken from: every project the store holds an enabling grant for, for a
-    connection kept in the store; the project the call runs in, for a
+    connection kept in the store, the machine's included once the store holds
+    the global rows; the project the call runs in, for a
     connection of the machine it grants and does not declare itself. A
     project's own connection in its files is granted to no other project, and
     neither is an agent's own connection in the store."""
     if scope == "global":
+        # A machine connection that is a row of the store's is one row every
+        # agent may be granted, and removing it takes it from each of them.
+        held = getattr(adapter, "global_grantees", None)
+        stored = held(NAME, cid) if held is not None else []
+        if stored:
+            return stored
         if root is None or adapter.mode_of("grant") != "files":
             return []
         grant = (adapter.resolve_scope(NAME, "grant", "project").get(cid) or {}).get("value")
