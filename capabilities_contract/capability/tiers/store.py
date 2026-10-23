@@ -161,7 +161,7 @@ STORE_SETTINGS_CHANGES_TABLE = "capabilities_settings_changes"
 # Every capability's references for each project, versioned: one row per
 # version, the active one read before the project's files.
 STORE_REFERENCES_TABLE = "capabilities_references"
-STORE_TABLES_VERSION = (1, 7)
+STORE_TABLES_VERSION = (1, 8)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -660,6 +660,25 @@ def record_table_steps() -> list[tuple[str, str]]:
          " COMMENT ON COLUMN capabilities_agent_nodes.public_key IS"
          " 'The node''s X25519 public key, its 32 bytes in base64; the private key"
          " never leaves the node.'"),
+        # What binds an agent beyond its id, kept in its row rather than in a
+        # file of its folder: where its body sits inside the project and how
+        # it collaborates. A body root is a relative, visible folder, as the
+        # manager reads one: not empty, not absolute, no `..` part, and a
+        # first part that does not start with `.`; null is the project root.
+        ("0023-agent-binding",
+         "ALTER TABLE capabilities_agents"
+         " ADD COLUMN body_root text CHECK (body_root <> '' AND body_root = btrim(body_root)"
+         "  AND left(body_root, 1) NOT IN ('/', '.')"
+         "  AND body_root !~ '(^|/)[.][.](/|$)'),"
+         " ADD COLUMN collaboration_mode text"
+         "  CHECK (collaboration_mode IN ('ask', 'direct'));"
+         " COMMENT ON COLUMN capabilities_agents.body_root IS"
+         " 'The folder inside the project that holds the agent''s body - its context,"
+         " assets, routines and capabilities layers - as a relative path such as agent;"
+         " null where the body sits at the project root.';"
+         " COMMENT ON COLUMN capabilities_agents.collaboration_mode IS"
+         " 'ask: the agent offers Direct or Agent Team mode before non-trivial work;"
+         " direct: it does not offer. Null is ask.'"),
     ]
 
 
