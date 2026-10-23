@@ -2570,8 +2570,10 @@ def settings_leaves(document: dict, prefix: tuple = ()) -> dict[tuple, Any]:
 class GlobalRows(StoreRecords):
     """The store's rows for every agent, which are the global layer once the
     store holds them (`capabilities_global.global_migrated_at` is set): every
-    connection row, the grant for every agent and every node with the default
-    pointer it carries, and the policy row for every agent and every node.
+    shared connection row (its owner null; a row an agent owns is that agent's
+    own and never part of the global layer), the grant for every agent and
+    every node with the default pointer it carries, and the policy row for
+    every agent and every node.
     `project_root` is the folder the database resolves for; None outside any
     project, where the machine's store setting answers.
 
@@ -2627,14 +2629,14 @@ class GlobalRows(StoreRecords):
     # -- reading ---------------------------------------------------------------
 
     def _layer(self, capability: str) -> dict[str, Any]:
-        """One capability's global layer: its connection rows, the grant
+        """One capability's global layer: its shared connection rows, the grant
         fields every agent's grant decides, and the default pointer."""
         key = ("global", capability)
         held = self._fresh(key)
         if held is None:
             connections, grants = self._read_many([
                 ("SELECT name, spec FROM capabilities_connections "
-                 "WHERE capability = %s ORDER BY name", (capability,)),
+                 "WHERE capability = %s AND owner IS NULL ORDER BY name", (capability,)),
                 ("SELECT connection, enabled, allow_write, is_default "
                  "FROM capabilities_connection_grants WHERE agent_id IS NULL "
                  "AND node IS NULL AND capability = %s ORDER BY connection",
