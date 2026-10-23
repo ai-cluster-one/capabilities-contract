@@ -161,7 +161,7 @@ STORE_SETTINGS_CHANGES_TABLE = "capabilities_settings_changes"
 # Every capability's references for each project, versioned: one row per
 # version, the active one read before the project's files.
 STORE_REFERENCES_TABLE = "capabilities_references"
-STORE_TABLES_VERSION = (1, 6)
+STORE_TABLES_VERSION = (1, 7)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -637,6 +637,29 @@ def record_table_steps() -> list[tuple[str, str]]:
          " 'The agent''s short technical name: lowercase letters, digits and hyphens,"
          " unique within the store. It names the agent''s state directories, service log"
          " lines and --project shorthand; null while it has none, where the id stands in.'"),
+        # A node created as a Coolify resource names the coolify connection it
+        # was created through, the server and the resource, so it is reached
+        # and removed through that connection, whose token stays there. The
+        # three are set together or not at all. A node's public key is the
+        # X25519 key whose private half the node made and keeps.
+        ("0022-agent-node-coolify",
+         "ALTER TABLE capabilities_agent_nodes"
+         " ADD COLUMN coolify_connection text CHECK (coolify_connection <> ''),"
+         " ADD COLUMN coolify_server text CHECK (coolify_server <> ''),"
+         " ADD COLUMN coolify_resource text CHECK (coolify_resource <> ''),"
+         " ADD COLUMN public_key text CHECK (public_key ~ '^[A-Za-z0-9+/]{43}=$'),"
+         " ADD CONSTRAINT capabilities_agent_nodes_coolify CHECK"
+         "  (num_nonnulls(coolify_connection, coolify_server, coolify_resource) IN (0, 3));"
+         " COMMENT ON COLUMN capabilities_agent_nodes.coolify_connection IS"
+         " 'The coolify capability connection the node was created through; its token"
+         " stays in that connection. Null for a node that is not a Coolify resource.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.coolify_server IS"
+         " 'The uuid of the Coolify server the node''s resource runs on.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.coolify_resource IS"
+         " 'The uuid of the Coolify resource that is the node.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.public_key IS"
+         " 'The node''s X25519 public key, its 32 bytes in base64; the private key"
+         " never leaves the node.'"),
     ]
 
 
