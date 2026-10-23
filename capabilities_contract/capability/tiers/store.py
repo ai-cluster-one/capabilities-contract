@@ -161,7 +161,7 @@ STORE_SETTINGS_CHANGES_TABLE = "capabilities_settings_changes"
 # Every capability's references for each project, versioned: one row per
 # version, the active one read before the project's files.
 STORE_REFERENCES_TABLE = "capabilities_references"
-STORE_TABLES_VERSION = (1, 8)
+STORE_TABLES_VERSION = (1, 9)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -684,6 +684,19 @@ def record_table_steps() -> list[tuple[str, str]]:
          " COMMENT ON COLUMN capabilities_agents.collaboration_mode IS"
          " 'ask: the agent offers Direct or Agent Team mode before non-trivial work;"
          " direct: it does not offer. Null is ask.'"),
+        # The folder an agent lives in on a node: its project root on that
+        # machine, an absolute path. One folder on a node is one agent's, which
+        # the unique index enforces; null where the node's folder is not
+        # recorded, as for a node created elsewhere.
+        ("0024-agent-node-folder",
+         "ALTER TABLE capabilities_agent_nodes"
+         " ADD COLUMN folder text CHECK (folder <> '' AND left(folder, 1) = '/');"
+         " CREATE UNIQUE INDEX capabilities_agent_nodes_folder"
+         "  ON capabilities_agent_nodes (node, folder);"
+         " COMMENT ON COLUMN capabilities_agent_nodes.folder IS"
+         " 'The folder the agent lives in on this node, its project root there, as an"
+         " absolute path such as /app; null where it is not recorded. One folder on a"
+         " node is one agent''s.'"),
     ]
 
 
