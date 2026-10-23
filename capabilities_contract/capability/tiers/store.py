@@ -161,7 +161,7 @@ STORE_SETTINGS_CHANGES_TABLE = "capabilities_settings_changes"
 # Every capability's references for each project, versioned: one row per
 # version, the active one read before the project's files.
 STORE_REFERENCES_TABLE = "capabilities_references"
-STORE_TABLES_VERSION = (1, 9)
+STORE_TABLES_VERSION = (1, 10)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -697,6 +697,22 @@ def record_table_steps() -> list[tuple[str, str]]:
          " 'The folder the agent lives in on this node, its project root there, as an"
          " absolute path such as /app; null where it is not recorded. One folder on a"
          " node is one agent''s.'"),
+        # Whether the agent's bundled service of the capability is placed on
+        # the node its row names, apart from whether the capability is usable
+        # there (`enabled`). Only an agent's row naming a node places a service.
+        # A row written before this column placed a service exactly where it
+        # enabled the capability on a node of its own, so that is its value.
+        ("0025-policy-service",
+         "ALTER TABLE capabilities_policy"
+         " ADD COLUMN service boolean NOT NULL DEFAULT false;"
+         " UPDATE capabilities_policy SET service = enabled"
+         "  WHERE agent_id IS NOT NULL AND node IS NOT NULL;"
+         " ALTER TABLE capabilities_policy ADD CONSTRAINT capabilities_policy_service"
+         "  CHECK (NOT service OR (agent_id IS NOT NULL AND node IS NOT NULL));"
+         " COMMENT ON COLUMN capabilities_policy.service IS"
+         " 'Whether the agent''s bundled service of this capability is placed on the node"
+         " the row names: the service runs there. Apart from enabled, which says whether"
+         " the capability is usable there. Only an agent''s row naming a node places.'"),
     ]
 
 
@@ -2036,15 +2052,15 @@ class StoreRecords(FileRecords):
         if held is None:
             found: dict[tuple[str, str | None], dict[str, tuple]] = {}
             rows = self._read(
-                "SELECT agent_id, capability, node, enabled, updated_at "
+                "SELECT agent_id, capability, node, enabled, updated_at, service "
                 "FROM capabilities_policy "
                 "WHERE (agent_id IS NULL OR agent_id = %s) "
                 "AND (node IS NULL OR node = %s) ORDER BY capability",
                 (self.project_id, self.node))
-            for agent_id, name, node, enabled, updated_at in rows:
+            for agent_id, name, node, enabled, updated_at, service in rows:
                 scope = "global" if agent_id is None else "project"
                 found.setdefault((scope, node), {})[name] = (
-                    {"enabled": bool(enabled)}, _stamp(updated_at))
+                    {"enabled": bool(enabled)}, _stamp(updated_at), bool(service))
             held = [(scope, node, found.get((scope, node), {}))
                     for scope in ("project", "global") for node in (self.node, None)]
             self._cache[key] = (time.monotonic(), held)
@@ -2052,7 +2068,8 @@ class StoreRecords(FileRecords):
 
     def _record(self, scope: str, capability: str, collection: str, key: str,
                 value: Any, ref: str, note: str | None = None,
-                updated_at: str | None = None, node: str | None = None) -> dict[str, Any]:
+                updated_at: str | None = None, node: str | None = None,
+                service: bool | None = None) -> dict[str, Any]:
         record = {"id": f"store:{capability}/{collection}/{ref}", "scope": scope,
                   "project_id": self.project_id if scope == "project" else None,
                   "capability": capability, "collection": collection, "key": key,
@@ -2060,8 +2077,10 @@ class StoreRecords(FileRecords):
                   "updated_by": None}
         if collection == "policy":
             # Which node the row that answered names: this node's name, or None
-            # for the row for every node.
+            # for the row for every node; and whether it places the service.
             record["node"] = node
+            if service is not None:
+                record["service"] = service
         return record
 
     def _scope_layers(self, capability: str, collection: str,
@@ -2076,8 +2095,8 @@ class StoreRecords(FileRecords):
                      for label, (value, note, updated_at) in rows.items()}]
         return [{name: self._record(scope, capability, collection, name, value,
                                     f"{scope}/{name}@{node or '*'}",
-                                    updated_at=updated_at, node=node)
-                 for name, (value, updated_at) in rows.items()}
+                                    updated_at=updated_at, node=node, service=service)
+                 for name, (value, updated_at, service) in rows.items()}
                 for at, node, rows in self._policy_rows() if at == scope]
 
     def _entries(self, root: Path, capability: str, collection: str) -> dict[str, Any]:
@@ -2326,12 +2345,7 @@ class StoreRecords(FileRecords):
                              '{"enabled": true|false}')
         agent = self._agent(scope)
         node = _node_check(node)
-        self._write(lambda conn: conn.execute(
-            "INSERT INTO capabilities_policy (agent_id, capability, node, enabled) "
-            "VALUES (%s, %s, %s, %s) "
-            "ON CONFLICT ((coalesce(agent_id, '')), capability, (coalesce(node, ''))) "
-            "DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = now()",
-            (agent, name, node, value["enabled"])))
+        self._write(lambda conn: _upsert_policy(conn, agent, name, node, value["enabled"]))
 
     def set(self, capability: str, collection: str, key: str, value: Any,
             actor: str | None = None, note: str | None = None,
@@ -2377,6 +2391,86 @@ class StoreRecords(FileRecords):
             if value not in (None, "") and cid is None:
                 raise StoreError("bad_default", "the default pointer names a connection id")
             self._write(lambda conn: self._put_default(conn, capability, cid, None))
+
+    def place(self, capability: str, node: str, placed: bool, exclusive: bool = False,
+              actor: str | None = None) -> dict[str, Any]:
+        """Place this project's bundled service of `capability` on `node`, or take
+        it off, leaving whether the capability is usable on any node as it is:
+        only the `service` of the project's rows changes. Placing where the
+        project has no row naming the node writes one that enables the
+        capability there, since a service runs only where its project enables
+        it; placing where that row disables it is refused (`disabled_on_node`).
+        `exclusive` - a service that runs on one node at a time - takes the
+        service off every other node in the same transaction, which is how it
+        moves. Answers {node, changed, unplaced, enabled_on_node?}."""
+        _store_check("capability", capability, CAPABILITY_RE)
+        node = _node_check(node)
+        if node is None:
+            raise StoreError("bad_node", "a service is placed on one named node")
+        self.guard_write(capability, "policy", "project")
+        agent = self._agent("project")
+        where = "agent_id = %s AND capability = %s AND node = %s"
+
+        def work(conn: Any) -> dict[str, Any]:
+            target = self._place_node(conn, node, actor)
+            row = conn.execute(
+                f"SELECT enabled, service FROM capabilities_policy WHERE {where} "
+                "FOR UPDATE", (agent, capability, target)).fetchone()
+            out: dict[str, Any] = {"node": target, "changed": False, "unplaced": []}
+            if placed:
+                if row is not None and not row[0]:
+                    raise StoreError(
+                        "disabled_on_node",
+                        f"{capability} is disabled for this project on node {target}, "
+                        "so its service cannot run there",
+                        f"enable it there first: `capabilities enable {capability} "
+                        f"--project --node {target}`")
+                if row is None:
+                    conn.execute(
+                        "INSERT INTO capabilities_policy "
+                        "(agent_id, capability, node, enabled, service) "
+                        "VALUES (%s, %s, %s, true, true)", (agent, capability, target))
+                    out.update(changed=True, enabled_on_node=True)
+                elif not row[1]:
+                    conn.execute(
+                        "UPDATE capabilities_policy SET service = true, updated_at = now() "
+                        f"WHERE {where}", (agent, capability, target))
+                    out["changed"] = True
+                if exclusive:
+                    others = [n for (n,) in conn.execute(
+                        "SELECT node FROM capabilities_policy WHERE agent_id = %s "
+                        "AND capability = %s AND node <> %s AND service "
+                        "ORDER BY node FOR UPDATE", (agent, capability, target)).fetchall()]
+                    for other in others:
+                        self._place_node(conn, other, actor)
+                    if others:
+                        conn.execute(
+                            "UPDATE capabilities_policy SET service = false, "
+                            "updated_at = now() WHERE agent_id = %s AND capability = %s "
+                            "AND node = ANY(%s)", (agent, capability, others))
+                        out.update(changed=True, unplaced=others)
+            elif row is not None and row[1]:
+                conn.execute(
+                    "UPDATE capabilities_policy SET service = false, updated_at = now() "
+                    f"WHERE {where}", (agent, capability, target))
+                out["changed"] = True
+            return out
+        return self._write(work)
+
+    def placed_nodes(self, capability: str) -> list[str]:
+        """The nodes this project's bundled service of `capability` is placed
+        on, by name."""
+        _store_check("capability", capability, CAPABILITY_RE)
+        agent = self._agent("project")
+        return [node for (node,) in self._read(
+            "SELECT node FROM capabilities_policy WHERE agent_id = %s "
+            "AND capability = %s AND service ORDER BY node", (agent, capability))]
+
+    def _place_node(self, conn: Any, node: str, actor: str | None) -> str:
+        """The node a placement row is written for, refused where this process
+        may not write it."""
+        del conn, actor
+        return node
 
     def delete(self, capability: str, collection: str, key: str,
                scope: str | None = None, node: str | None = None) -> bool:
@@ -2932,6 +3026,11 @@ class AgentRecords(StoreRecords):
                 f"write it on the master {state.get('master') or '(none registered)'}")
         return self.node
 
+    def _place_node(self, conn: Any, node: str, actor: str | None) -> str:
+        """A placement row is written where the registry lets this node write
+        it: the master any node's, another node only its own where it may."""
+        return self._authority(conn, "project", node, actor)
+
     def _write(self, work: Any) -> Any:
         """One transaction, as the store tier's own, during which reads made
         on the same connection (a settings check reading the other scope)
@@ -2979,9 +3078,11 @@ class AgentRecords(StoreRecords):
 
     def _record(self, scope: str, capability: str, collection: str, key: str,
                 value: Any, ref: str, note: str | None = None,
-                updated_at: str | None = None, node: str | None = None) -> dict[str, Any]:
+                updated_at: str | None = None, node: str | None = None,
+                service: bool | None = None) -> dict[str, Any]:
         record = super()._record(scope, capability, collection, key, value, ref,
-                                 note=note, updated_at=updated_at, node=node)
+                                 note=note, updated_at=updated_at, node=node,
+                                 service=service)
         if collection in ("identifier", "grant"):
             record["node"] = node
         return record
@@ -3375,12 +3476,9 @@ class AgentRecords(StoreRecords):
                 raise StoreError("bad_policy", f"policy for {key!r} must be "
                                  '{"enabled": true|false}')
             wanted = _node_check(node)
-            self._write(lambda conn: conn.execute(
-                "INSERT INTO capabilities_policy (agent_id, capability, node, enabled) "
-                "VALUES (%s, %s, %s, %s) "
-                "ON CONFLICT ((coalesce(agent_id, '')), capability, (coalesce(node, ''))) "
-                "DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = now()",
-                (agent, key, self._authority(conn, scope, wanted, actor), value["enabled"])))
+            self._write(lambda conn: _upsert_policy(
+                conn, agent, key, self._authority(conn, scope, wanted, actor),
+                value["enabled"]))
             return None
         if collection == "connection":
             if not isinstance(value, dict):
@@ -3470,6 +3568,22 @@ class AgentRecords(StoreRecords):
             return bool(self._write(work))
         return bool(self._write(lambda conn: conn.execute(
             sql, (*target, self._authority(conn, scope, wanted, None))).rowcount > 0))
+
+
+def _upsert_policy(conn: Any, agent: str | None, capability: str, node: str | None,
+                   enabled: bool) -> None:
+    """Write one policy row. A row the agent writes for a node of its own places
+    the capability's service there exactly when it enables the capability
+    there, as `enable --node` and `disable --node` always have; `place` is what
+    changes the one without the other."""
+    conn.execute(
+        "INSERT INTO capabilities_policy (agent_id, capability, node, enabled, service) "
+        "VALUES (%s, %s, %s, %s, %s) "
+        "ON CONFLICT ((coalesce(agent_id, '')), capability, (coalesce(node, ''))) "
+        "DO UPDATE SET enabled = EXCLUDED.enabled, service = EXCLUDED.service, "
+        "updated_at = now()",
+        (agent, capability, node, enabled,
+         bool(enabled and agent is not None and node is not None)))
 
 
 def _only_policy_names_a_node(collection: str, node: Any) -> None:
