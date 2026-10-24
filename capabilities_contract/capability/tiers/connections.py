@@ -688,19 +688,95 @@ def _cmd_connection(argv: list[str]) -> None:
     _emit(out)
 
 
+def _reveal_args(argv: list[str], usage: str) -> tuple[str | None, list[str]]:
+    """The key `--reveal <KEY>` names, if any, and the words around it."""
+    reveal, rest = None, []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--reveal" or arg.startswith("--reveal="):
+            key = arg[len("--reveal="):] if arg.startswith("--reveal=") else (
+                argv[i + 1] if i + 1 < len(argv) else "")
+            if not key or key.startswith("--") or reveal is not None:
+                _die(6, "input", "--reveal names one key", usage)
+            reveal = key
+            i += 1 if arg.startswith("--reveal=") else 2
+        else:
+            rest.append(arg)
+            i += 1
+    return reveal, rest
+
+
+def _cmd_connections_show(argv: list[str]) -> None:
+    """`connections show <id> --reveal <KEY>` prints one value of one usable
+    connection in the clear: the value its declared field KEY resolves to,
+    which `connections` reports masked when the field is a secret. The
+    connection is selected as every verb selects one, so a connection this
+    project may not use is refused, never revealed."""
+    usage = f"{NAME} connections show <id> --reveal <KEY>"
+    reveal, words = _reveal_args(argv, usage)
+    flags = [w for w in words if w.startswith("--")]
+    if flags:
+        _die(6, "input", f"unknown connections show option {flags[0]!r}", usage)
+    if len(words) != 1:
+        _die(6, "input", "connections show names one connection id", usage)
+    if reveal is None:
+        _die(6, "input", "connections show reveals one field and takes --reveal <KEY>",
+             f"`{NAME} connections` reports every connection, secrets masked")
+    declared = globals().get("CONN_FIELDS")
+    if declared is None:
+        _die(6, "connection_fields_undeclared",
+             f"{NAME} does not declare its connection fields",
+             f"`{NAME} connections` reports its connections, secrets masked")
+    field = {f["key"]: f for f in declared}.get(reveal)
+    if field is None:
+        _die(6, "unknown_field", f"{NAME} declares no connection field {reveal!r}",
+             f"fields: {', '.join(f['key'] for f in declared) or 'none'}")
+    reg, _ = _connections_registry()
+    cid, entry = _select_connection(reg, words[0])
+    value = (entry or {}).get(reveal)
+    if field.get("secret"):
+        value = _resolve_env_key(value)[0] if isinstance(value, str) and value else None
+    elif isinstance(value, bool):
+        value = "true" if value else "false"
+    elif isinstance(value, (list, dict)):
+        value = json.dumps(value)
+    elif value is not None:
+        value = str(value)
+    if not value:
+        _die(3, "not_set", f"connection {cid!r} holds no value for {reveal}",
+             f"`{NAME} connections` says where each value resolves from")
+    _emit(value)
+
+
 def _cmd_setup(argv: list[str]) -> None:
     """`setup` reports the machine prerequisites the capability declares and
-    where each resolves from; `setup set` writes them to the capability's
-    credentials.env, secrets from stdin; `setup unset` takes them out.
+    where each resolves from; `setup show --reveal <KEY>` prints the one value
+    that report masks for KEY, in the clear; `setup set` writes them to the
+    capability's credentials.env, secrets from stdin; `setup unset` takes them out.
     `--machine` names a write as administration of the machine
     (`_machine_administration`)."""
-    usage = (f"{NAME} setup [show] | setup set [--machine] [--field KEY=VALUE ...] "
-             "[--stdin] | setup unset [--machine] <KEY> ...")
+    usage = (f"{NAME} setup [show] [--reveal <KEY>] | setup set [--machine] "
+             "[--field KEY=VALUE ...] [--stdin] | setup unset [--machine] <KEY> ...")
     declared = list(globals().get("SETUP_FIELDS") or [])
+    reveal, argv = _reveal_args(argv, usage)
     sub = argv[0] if argv and not argv[0].startswith("--") else "show"
     rest = argv[1:] if argv and argv[0] == sub else argv
     if sub not in ("show", "set", "unset"):
         _die(6, "input", f"unknown setup subcommand {sub!r}", usage)
+    if reveal is not None:
+        if sub != "show":
+            _die(6, "input", "--reveal is an option of setup show", usage)
+        field = {f["key"]: f for f in declared}.get(reveal)
+        if field is None:
+            _die(6, "unknown_field", f"{NAME} declares no setup field {reveal!r}",
+                 f"fields: {', '.join(f['key'] for f in declared) or 'none'}")
+        value = _resolve_env_key(reveal)[0]
+        if not value:
+            _die(3, "not_set", f"setup field {reveal} resolves nowhere",
+                 f"`{NAME} setup` says where each field resolves from")
+        _emit(value)
+        return
     if sub != "show":
         rest = [w for w in rest if w != "--machine"]
     changed: list = []

@@ -660,6 +660,13 @@ _AUTH_CONTRACT_VERBS = frozenset(
     {"help", "guide", "ids", "connections", "refs", "stub", "manifest"})
 
 
+def _reveals() -> bool:
+    """Whether this call prints a connection's value in the clear. It is the
+    `connections` verb, so it is told apart here: it reads a secret, and passes
+    no gate as a discovery verb."""
+    return sys.argv[1:3] == ["connections", "show"]
+
+
 def _auth_rule_verbs(rule) -> list | None:
     """The verbs a capability rule limits its grant to, or None when it grants
     the whole capability. A bare list is shorthand for {"verbs": [...]}."""
@@ -696,7 +703,8 @@ def _auth_gate() -> None:
         if _auth_capability_allowed(rule):
             verbs = _auth_rule_verbs(rule)
             verb = sys.argv[1] if len(sys.argv) > 1 else "help"
-            if verbs is None or verb in verbs or verb in _AUTH_CONTRACT_VERBS:
+            if verbs is None or verb in verbs or (
+                    verb in _AUTH_CONTRACT_VERBS and not _reveals()):
                 return
             _die(4, "verb_not_authorized",
                  f"verb refused: `{NAME} {verb}` is not among the verbs this "
@@ -848,7 +856,7 @@ def _gate() -> None:
     """
     _auth_gate()
     verb = sys.argv[1] if len(sys.argv) > 1 else "help"
-    safe = verb in {"help", "stub", "manifest", "connections"}
+    safe = verb in {"help", "stub", "manifest", "connections"} and not _reveals()
     if not safe:
         _machine_gate()
     service_action = sys.argv[2] if len(sys.argv) > 2 else None
@@ -1415,16 +1423,25 @@ def _declared_section() -> str:
                 f"  {NAME} connection remove <id> [--project|--global|--machine]\n"
                 "      Remove it, its default pointer, and the secret lines `connection add`\n"
                 "      wrote for it; a key another connection names is kept. Refused (exit 6\n"
-                "      connection_granted) while a project is granted it, naming each one.\n")
+                "      connection_granted) while a project is granted it, naming each one.\n"
+                f"  {NAME} connections show <id> --reveal <KEY>\n"
+                "      Print the value of one field below of one connection this project may\n"
+                "      use, raw and in the clear, and nothing else: the value `connections`\n"
+                "      reports masked for a secret. It passes the policy gate as an operational\n"
+                "      verb. An undeclared key exits 6 unknown_field and a key that holds no\n"
+                "      value exits 3 not_set, with nothing on stdout.\n")
         out += "  Fields:\n" + ("".join(_field_line(f) for f in conns["fields"])
                                 or "    none - an entry carries no fields of its own\n")
     if conns and conns.get("setup"):
         out += (f"\n## Machine setup, written through the contract\n\n"
-                f"  {NAME} setup [show] | setup set [--machine] [--field KEY=VALUE ...] "
-                "[--stdin] | setup unset [--machine] <KEY> ...\n"
+                f"  {NAME} setup [show] [--reveal <KEY>] | setup set [--machine] "
+                "[--field KEY=VALUE ...] [--stdin] | setup unset [--machine] <KEY> ...\n"
                 "      What this machine is given once, before any connection, kept in\n"
                 f"      {CREDENTIALS_ENV}; `show` says where each resolves\n"
-                "      from, secrets masked, and outside any project reads no policy. A secret\n"
+                "      from, secrets masked, and outside any project reads no policy.\n"
+                "      --reveal <KEY> prints that one value instead, raw and in the clear, and\n"
+                "      nothing else; an undeclared key exits 6 unknown_field and one that\n"
+                "      resolves nowhere exits 3 not_set, with nothing on stdout. A secret\n"
                 "      is taken only from the JSON object on stdin. --machine writes as\n"
                 "      administration of the machine: from anywhere, with no policy read.\n")
         out += "".join(_field_line(f) for f in conns["setup"])
@@ -2742,6 +2759,11 @@ def _contract(argv: list[str]) -> None:
         _cmd_refs(argv[1:])
     elif cmd == "context":
         _cmd_context(argv[1:])
+    elif cmd == "connections" and argv[1:2] == ["show"]:
+        if "_cmd_connections_show" not in globals():
+            _die(6, "unknown_connection", f"{NAME} has no connections",
+                 f"`{NAME} connections` reports an empty map")
+        _cmd_connections_show(argv[2:])
     elif cmd == "connections":
         _cmd_connections_reported()
     elif cmd == "inventory":
