@@ -663,8 +663,18 @@ _AUTH_CONTRACT_VERBS = frozenset(
 def _reveals() -> bool:
     """Whether this call prints a connection's value in the clear. It is the
     `connections` verb, so it is told apart here: it reads a secret, and passes
-    no gate as a discovery verb."""
-    return sys.argv[1:3] == ["connections", "show"]
+    no gate as a discovery verb. It is judged on the words a capability
+    dispatches, with `--connection <id>` lifted out wherever it stands."""
+    argv, words, i = sys.argv[1:], [], 0
+    while i < len(argv):
+        if argv[i] == "--connection" and i + 1 < len(argv):
+            i += 2
+        elif argv[i].startswith("--connection="):
+            i += 1
+        else:
+            words.append(argv[i])
+            i += 1
+    return words[:2] == ["connections", "show"]
 
 
 def _auth_rule_verbs(rule) -> list | None:
@@ -2760,6 +2770,10 @@ def _contract(argv: list[str]) -> None:
     elif cmd == "context":
         _cmd_context(argv[1:])
     elif cmd == "connections" and argv[1:2] == ["show"]:
+        if not _reveals():
+            _die(4, "reveal_not_gated",
+                 f"`{NAME} connections show` reached dispatch without the gate a reveal passes",
+                 f"run `{NAME} connections show <id> --reveal <KEY>` as written")
         if "_cmd_connections_show" not in globals():
             _die(6, "unknown_connection", f"{NAME} has no connections",
                  f"`{NAME} connections` reports an empty map")
