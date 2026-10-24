@@ -360,7 +360,7 @@ def _record_identity(cid: str, ident, display_name: str | None = None) -> bool:
             else:
                 adapter.set(NAME, "connection", cid, entry, scope=scope)
             return True
-    except StoreError:
+    except (StoreError, OSError):
         return False
     return False
 
