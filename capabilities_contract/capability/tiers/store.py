@@ -102,18 +102,143 @@ def read_only_switch() -> bool:
     return os.environ.get(READ_ONLY_ENV, "").strip().lower() in ("1", "true")
 
 
-# The name a machine declares for itself as a node. A container's host name is
-# its container id and changes on every redeploy, so a node that declares one
-# keeps the same name in the store across them.
+# A node is the machine a process runs on, keyed in the store by its id and
+# shown by its label. The id is twelve lowercase hex characters, as an agent's
+# is, and the machine resolves it itself with nothing configured: a Mac from its
+# hardware UUID through a hash, so the same Mac always answers the same id and
+# the UUID never leaves it; any other machine - a server, a container - from
+# the id kept in its config home, minted there once, where a container keeps it
+# on its persistent volume. AGENT_NODE_ID, where set, overrides both (a
+# container that is handed its id, a test). The label is the node's row's in
+# the store; AGENT_NODE_NAME, else the host name, is only the label a machine
+# gives itself when it is first registered.
+NODE_ID_ENV = "AGENT_NODE_ID"
 NODE_NAME_ENV = "AGENT_NODE_NAME"
+NODE_ID_RE = re.compile(r"[0-9a-f]{12}")
+NODE_ID_FILE = "node-id"
+_NODE_HASH_PREFIX = "capabilities-node:"
+# A Mac's id, derived once per process: asking the hardware is a subprocess.
+_mac_node_id: str | None = None
+
+
+def _node_id_path() -> Path:
+    """Where a machine that is not a Mac keeps its node id: beside the
+    manager's machine record in the config home."""
+    home = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(os.path.abspath(home)) / "capabilities" / NODE_ID_FILE
+
+
+def _mac_hardware_uuid() -> str | None:
+    import subprocess
+    try:
+        out = subprocess.run(["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = re.search(r'"IOPlatformUUID"\s*=\s*"([0-9A-Fa-f-]{36})"', out or "")
+    return found.group(1).upper() if found else None
+
+
+def _read_node_id_file(path: Path) -> str | None:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise StoreError("node_unidentified", f"cannot read this machine's node id at "
+                         f"{path}: {exc.__class__.__name__}") from None
+    if not NODE_ID_RE.fullmatch(value):
+        raise StoreError("node_unidentified", f"{path} holds no node id: it holds twelve "
+                         "lowercase hex characters",
+                         "set it with `capabilities node id --set <id>`")
+    return value
+
+
+def write_node_id(node_id: str, path: Path | None = None, replace: bool = True) -> str:
+    """Keep `node_id` as this machine's id in its config home, the file a
+    machine that is not a Mac resolves its id from. Without `replace` an id
+    already there wins, so two processes minting at once agree. Answers the id
+    the file holds."""
+    if not NODE_ID_RE.fullmatch(node_id or ""):
+        raise StoreError("bad_node_id", f"node id {node_id!r} is not twelve lowercase hex "
+                         "characters")
+    path = path or _node_id_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        import tempfile
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".node-id.")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(node_id + "\n")
+            os.chmod(tmp, 0o644)
+            if replace:
+                os.replace(tmp, path)
+            else:
+                try:
+                    os.link(tmp, path)
+                except FileExistsError:
+                    pass
+        finally:
+            if os.path.lexists(tmp):
+                os.unlink(tmp)
+    except OSError as exc:
+        raise StoreError("node_unidentified", f"cannot keep this machine's node id at "
+                         f"{path}: {exc.__class__.__name__}",
+                         f"make {path.parent} writable, or set {NODE_ID_ENV}") from None
+    return _read_node_id_file(path) or node_id
+
+
+def node_identity() -> dict[str, str]:
+    """This machine's node: {id, source}, source being `env`, `hardware`,
+    `file` or `minted`."""
+    global _mac_node_id
+    given = os.environ.get(NODE_ID_ENV, "").strip()
+    if given:
+        if not NODE_ID_RE.fullmatch(given):
+            raise StoreError("bad_node_id", f"{NODE_ID_ENV}={given!r} is not a node id: "
+                             "twelve lowercase hex characters")
+        return {"id": given, "source": "env"}
+    import sys
+    if sys.platform == "darwin":
+        if _mac_node_id is None:
+            uuid = _mac_hardware_uuid()
+            if not uuid:
+                raise StoreError("node_unidentified", "this Mac did not answer its hardware "
+                                 "UUID (ioreg IOPlatformUUID), which its node id is derived "
+                                 "from", f"set {NODE_ID_ENV} to run as a node anyway")
+            _mac_node_id = hashlib.sha256((_NODE_HASH_PREFIX + uuid).encode()).hexdigest()[:12]
+        return {"id": _mac_node_id, "source": "hardware"}
+    path = _node_id_path()
+    held = _read_node_id_file(path)
+    if held is not None:
+        return {"id": held, "source": "file"}
+    import secrets
+    return {"id": write_node_id(secrets.token_hex(6), path, replace=False), "source": "minted"}
+
+
+def node_id() -> str:
+    """The id of the node this process runs on: the key every store row that
+    names a node holds - a grant, a policy row or a setting for one node, a
+    service's lease, the node a run or a session belongs to."""
+    return node_identity()["id"]
 
 
 def node_name() -> str:
-    """The node this process runs on, by the one name the package gives it: a
-    store-mode grant naming a node is matched against it, and a service that
-    records which node holds its work records it. It is the name the machine
-    declares in AGENT_NODE_NAME, and the host name where it declares none."""
+    """The node this process runs on, as the store names it: its id
+    (`node_id`). Kept under this name, which every capability already calls."""
+    return node_id()
+
+
+def node_label() -> str:
+    """The label this machine gives itself when it is first registered as a
+    node: AGENT_NODE_NAME where set, else its host name. Once registered, the
+    node's row in the store holds its label, changed there at will."""
     return os.environ.get(NODE_NAME_ENV, "").strip() or socket.gethostname()
+
+
+def this_node() -> dict[str, str]:
+    """This machine as a node: {id, label, source}."""
+    return {**node_identity(), "label": node_label()}
 
 
 def _node_check(node: Any) -> str | None:
@@ -148,9 +273,10 @@ STORE_GRANTS_TABLE = "capabilities_connection_grants"
 STORE_IDENTIFIERS_TABLE = "capabilities_identifiers"
 STORE_POLICY_TABLE = "capabilities_policy"
 # The kernel's own tables, migrated in the same ledger: the agent registry, the
-# agent's nodes and the one row of facts about the store as a whole. The
-# manager alone writes them.
+# nodes, which agent lives on which node, and the one row of facts about the
+# store as a whole. The manager alone writes them.
 STORE_AGENTS_TABLE = "capabilities_agents"
+STORE_NODES_TABLE = "capabilities_nodes"
 STORE_AGENT_NODES_TABLE = "capabilities_agent_nodes"
 STORE_GLOBAL_TABLE = "capabilities_global"
 # Settings of an agent whose records moved into the store: one row per leaf,
@@ -161,7 +287,7 @@ STORE_SETTINGS_CHANGES_TABLE = "capabilities_settings_changes"
 # Every capability's references for each project, versioned: one row per
 # version, the active one read before the project's files.
 STORE_REFERENCES_TABLE = "capabilities_references"
-STORE_TABLES_VERSION = (1, 10)
+STORE_TABLES_VERSION = (1, 11)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -736,6 +862,81 @@ def record_table_steps() -> list[tuple[str, str]]:
          " the capability is usable there. Only an agent''s row naming a node places."
          " A trigger sets it to enabled on such a row where an insert leaves it out or"
          " an update changes enabled alone, as a writer that predates the column means.'"),
+        # The node registry: a node is a row of its own, keyed by its id and
+        # shown by its label, apart from which agent lives on it. A node's own
+        # fields - its kind, address, target, Coolify resource, public key and
+        # when it was last seen - move from each agent's link to it, and a link
+        # keeps what belongs to the pair: the folder, the master and the write
+        # flag. Every node a link named becomes a row whose id and label are
+        # that name, the id it was known by until it moves to a twelve-hex id
+        # of its own (`capabilities node rekey`); its fields are taken from the
+        # link that is a master first, then the one seen last.
+        ("0026-nodes",
+         "CREATE TABLE capabilities_nodes ("
+         " id text PRIMARY KEY CHECK (id <> ''),"
+         " label text NOT NULL CHECK (label <> '' AND label = btrim(label)),"
+         " kind text NOT NULL CHECK (kind IN ('mac', 'server')),"
+         " address text CHECK (address <> ''),"
+         " target text CHECK (target <> ''),"
+         " coolify_connection text CHECK (coolify_connection <> ''),"
+         " coolify_server text CHECK (coolify_server <> ''),"
+         " coolify_resource text CHECK (coolify_resource <> ''),"
+         " public_key text CHECK (public_key ~ '^[A-Za-z0-9+/]{43}=$'),"
+         " last_seen_at timestamptz,"
+         " created_at timestamptz NOT NULL DEFAULT now(),"
+         " updated_at timestamptz NOT NULL DEFAULT now(),"
+         " CONSTRAINT capabilities_nodes_coolify CHECK"
+         "  (num_nonnulls(coolify_connection, coolify_server, coolify_resource) IN (0, 3)));"
+         " INSERT INTO capabilities_nodes (id, label, kind, address, target,"
+         "  coolify_connection, coolify_server, coolify_resource, public_key, last_seen_at)"
+         " SELECT DISTINCT ON (n.node) n.node, n.node, n.kind, n.address, n.target,"
+         "  n.coolify_connection, n.coolify_server, n.coolify_resource, n.public_key,"
+         "  (SELECT max(m.last_seen_at) FROM capabilities_agent_nodes m WHERE m.node = n.node)"
+         " FROM capabilities_agent_nodes n"
+         " ORDER BY n.node, n.is_master DESC, n.last_seen_at DESC NULLS LAST, n.agent_id;"
+         " ALTER TABLE capabilities_agent_nodes"
+         "  DROP CONSTRAINT capabilities_agent_nodes_coolify,"
+         "  DROP COLUMN kind, DROP COLUMN address, DROP COLUMN target,"
+         "  DROP COLUMN last_seen_at, DROP COLUMN coolify_connection,"
+         "  DROP COLUMN coolify_server, DROP COLUMN coolify_resource, DROP COLUMN public_key,"
+         "  ADD CONSTRAINT capabilities_agent_nodes_node FOREIGN KEY (node)"
+         "   REFERENCES capabilities_nodes (id) ON DELETE CASCADE ON UPDATE CASCADE;"
+         " COMMENT ON TABLE capabilities_nodes IS"
+         " 'The node registry: one row per machine an agent runs on, keyed by its id and"
+         " shown by its label. Written by the capabilities manager alone.';"
+         " COMMENT ON COLUMN capabilities_nodes.id IS"
+         " 'The id the machine resolves for itself: twelve lowercase hex characters, from a"
+         " Mac''s hardware or a server''s config home, or AGENT_NODE_ID; a row registered"
+         " before ids holds the name it had until `capabilities node rekey` moves it. Every"
+         " store row that names a node holds this id.';"
+         " COMMENT ON COLUMN capabilities_nodes.label IS"
+         " 'The name shown for the node, free text set and changed at will; renaming a node"
+         " changes this column alone.';"
+         " COMMENT ON COLUMN capabilities_nodes.kind IS"
+         " 'mac: the node resolves its id from its hardware; server: from the id minted onto"
+         " its config volume.';"
+         " COMMENT ON COLUMN capabilities_nodes.address IS"
+         " 'Host name or IP address the node is reached at, where it is fixed.';"
+         " COMMENT ON COLUMN capabilities_nodes.target IS"
+         " 'The deployment target this node is deployed by; null for a node that is not"
+         " deployed, such as a Mac.';"
+         " COMMENT ON COLUMN capabilities_nodes.coolify_connection IS"
+         " 'The coolify capability connection the node was created through; its token"
+         " stays in that connection. Null for a node that is not a Coolify resource.';"
+         " COMMENT ON COLUMN capabilities_nodes.coolify_server IS"
+         " 'The uuid of the Coolify server the node''s resource runs on.';"
+         " COMMENT ON COLUMN capabilities_nodes.coolify_resource IS"
+         " 'The uuid of the Coolify resource that is the node.';"
+         " COMMENT ON COLUMN capabilities_nodes.public_key IS"
+         " 'The node''s X25519 public key, its 32 bytes in base64; the private key"
+         " never leaves the node.';"
+         " COMMENT ON COLUMN capabilities_nodes.last_seen_at IS"
+         " 'When the node last reported itself.';"
+         " COMMENT ON TABLE capabilities_agent_nodes IS"
+         " 'Which agent lives on which node, one row per (agent, node), with what belongs to"
+         " the pair. Written by the capabilities manager alone.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.node IS"
+         " 'The node''s id in capabilities_nodes.'"),
     ]
 
 
@@ -1753,7 +1954,10 @@ class StoreRecords(FileRecords):
         self.project_root = (Path(project_root) if project_root is not None
                              else self.envelope.parent)
         self.application_name = application_name
-        self.node = node_name()
+        # The node is resolved where a read or write first needs it, so an
+        # adapter that never names a node - the global rows a files-mode
+        # project reads - resolves, and mints, no node id.
+        self._node: str | None = None
         self._conn = connection
         self._owns_conn = connection is None
         # How many operations are running on the owned connection: it is closed
@@ -1767,6 +1971,17 @@ class StoreRecords(FileRecords):
         # moved into it. Its settings are then not read from files, which
         # would be stale for an agent that did.
         self._settings_blocked: StoreError | None = None
+
+    @property
+    def node(self) -> str:
+        """The node this adapter's rows are read and written for."""
+        if self._node is None:
+            self._node = node_name()
+        return self._node
+
+    @node.setter
+    def node(self, value: str) -> None:
+        self._node = value
 
     def settings_kept(self) -> str:
         if self._settings_blocked is not None:
@@ -2618,11 +2833,12 @@ def _master_hint(state: dict) -> str:
     master = state.get("master")
     if master:
         return (f"the agent's master node is {master}: register this node there with "
-                "`capabilities node add <node> --kind mac|server`, and run here with "
-                f"{NODE_NAME_ENV} set to that name")
+                "`capabilities node add <id> --label <label> --kind mac|server`, the id "
+                "being the one `capabilities node id` answers here")
     return ("the agent has no master node registered: register one with "
-            "`capabilities node add <node> --kind mac|server --master` on the machine "
-            f"that is its master, and run there with {NODE_NAME_ENV} set to that name")
+            "`capabilities node add <id> --label <label> --kind mac|server --master` on "
+            "the machine that is its master, the id being the one `capabilities node id` "
+            "answers there")
 
 
 def _refuse_frozen(state: dict | None, agent_id: str | None, role: str | None,
@@ -2641,7 +2857,7 @@ def _refuse_frozen(state: dict | None, agent_id: str | None, role: str | None,
     since = state.get("migrating_since")
     if not since:
         return
-    here = node if node is not None else os.environ.get(NODE_NAME_ENV, "").strip()
+    here = node if node is not None else node_id()
     if role == "migrate" and here and here == state.get("master"):
         return
     raise StoreError(
@@ -3817,14 +4033,8 @@ def open_records(envelope: Path | str, global_dir: Path | str,
         if in_store:
             legacy._schema = schema
         return legacy
-    node = os.environ.get(NODE_NAME_ENV, "").strip()
-    if not node or node not in state["nodes"]:
-        if not node:
-            raise StoreError(
-                "node_unnamed",
-                f"agent {agent_id} keeps its records in the store, read per node, and "
-                f"this process names no node: {NODE_NAME_ENV} is not set",
-                _master_hint(state))
+    node = node_id()
+    if node not in state["nodes"]:
         raise StoreError(
             "node_unregistered",
             f"agent {agent_id} keeps its records in the store, and node {node} is "
