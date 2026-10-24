@@ -293,7 +293,7 @@ STORE_SETTINGS_CHANGES_TABLE = "capabilities_settings_changes"
 # Every capability's references for each project, versioned: one row per
 # version, the active one read before the project's files.
 STORE_REFERENCES_TABLE = "capabilities_references"
-STORE_TABLES_VERSION = (1, 11)
+STORE_TABLES_VERSION = (1, 12)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -943,6 +943,67 @@ def record_table_steps() -> list[tuple[str, str]]:
          " the pair. Written by the capabilities manager alone.';"
          " COMMENT ON COLUMN capabilities_agent_nodes.node IS"
          " 'The node''s id in capabilities_nodes.'"),
+        # A reader from before the node registry - an older manager, AgentKit -
+        # still reads a node's fields off its links, so they stay there as a
+        # copy the store keeps of the node's row until those readers read the
+        # registry: nothing writes them, a trigger fills them on every link
+        # written, and a node's row copies them to its links where they
+        # differ. A label is not copied, so renaming a node is still its row
+        # alone. The triggers name the tables in the schema they fire in, so a
+        # writer's search_path does not matter. A step of its own after `0026-nodes`, which a store may hold
+        # already, so every store reaches the same tables.
+        ("0027-agent-node-fields-kept",
+         "ALTER TABLE capabilities_agent_nodes"
+         " ADD COLUMN kind text, ADD COLUMN address text, ADD COLUMN target text,"
+         " ADD COLUMN last_seen_at timestamptz, ADD COLUMN coolify_connection text,"
+         " ADD COLUMN coolify_server text, ADD COLUMN coolify_resource text,"
+         " ADD COLUMN public_key text;"
+         " CREATE FUNCTION capabilities_agent_nodes_node_fields() RETURNS trigger"
+         "  LANGUAGE plpgsql AS $fields$"
+         " BEGIN"
+         "  EXECUTE format('SELECT kind, address, target, last_seen_at, coolify_connection,"
+         "   coolify_server, coolify_resource, public_key FROM %I.capabilities_nodes"
+         "   WHERE id = $1', tg_table_schema)"
+         "  INTO NEW.kind, NEW.address, NEW.target, NEW.last_seen_at, NEW.coolify_connection,"
+         "   NEW.coolify_server, NEW.coolify_resource, NEW.public_key"
+         "  USING NEW.node;"
+         "  RETURN NEW;"
+         " END $fields$;"
+         " CREATE TRIGGER capabilities_agent_nodes_node_fields"
+         "  BEFORE INSERT OR UPDATE ON capabilities_agent_nodes"
+         "  FOR EACH ROW EXECUTE FUNCTION capabilities_agent_nodes_node_fields();"
+         " CREATE FUNCTION capabilities_nodes_to_links() RETURNS trigger"
+         "  LANGUAGE plpgsql AS $links$"
+         " BEGIN"
+         "  EXECUTE format('UPDATE %I.capabilities_agent_nodes SET node = node WHERE node = $1"
+         "   AND (kind, address, target, last_seen_at, coolify_connection, coolify_server,"
+         "    coolify_resource, public_key) IS DISTINCT FROM ($2, $3, $4, $5, $6, $7, $8, $9)',"
+         "   tg_table_schema)"
+         "  USING NEW.id, NEW.kind, NEW.address, NEW.target, NEW.last_seen_at,"
+         "   NEW.coolify_connection, NEW.coolify_server, NEW.coolify_resource, NEW.public_key;"
+         "  RETURN NULL;"
+         " END $links$;"
+         " CREATE TRIGGER capabilities_nodes_to_links"
+         "  AFTER INSERT OR UPDATE ON capabilities_nodes"
+         "  FOR EACH ROW EXECUTE FUNCTION capabilities_nodes_to_links();"
+         " UPDATE capabilities_agent_nodes SET node = node;"
+         " COMMENT ON COLUMN capabilities_agent_nodes.kind IS"
+         " 'A copy of capabilities_nodes.kind kept by the store for readers from before the"
+         " node registry; nothing writes it, and it goes once they read the registry.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.address IS"
+         " 'A copy of capabilities_nodes.address kept by the store, as kind.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.target IS"
+         " 'A copy of capabilities_nodes.target kept by the store, as kind.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.last_seen_at IS"
+         " 'A copy of capabilities_nodes.last_seen_at kept by the store, as kind.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.coolify_connection IS"
+         " 'A copy of capabilities_nodes.coolify_connection kept by the store, as kind.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.coolify_server IS"
+         " 'A copy of capabilities_nodes.coolify_server kept by the store, as kind.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.coolify_resource IS"
+         " 'A copy of capabilities_nodes.coolify_resource kept by the store, as kind.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.public_key IS"
+         " 'A copy of capabilities_nodes.public_key kept by the store, as kind.'"),
     ]
 
 
