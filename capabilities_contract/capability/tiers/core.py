@@ -1387,6 +1387,8 @@ def _field_line(field: dict, scoped: bool = False) -> str:
         traits.append("secret, stdin only" + (f", kept as {field['env']}" if field.get("env") else ""))
     if field.get("default") is not None:
         traits.append(f"default {json.dumps(field['default'])}")
+    if field.get("identity") is True:
+        traits.append("main identifier")
     if scoped:
         traits = [kind]
         if field.get("default") is not None:
@@ -1410,6 +1412,7 @@ def _declared_section() -> str:
         out += (f"\n## Connections, written through the contract\n\n"
                 f"  {NAME} connection add <id> [--project|--global|--machine] [--default] "
                 "[--replace] [--field KEY=VALUE ...] [--env KEY=ENV_KEY ...] [--stdin]\n"
+                "      [--identity ID [--display-name TEXT]]\n"
                 "      Write one connection from the fields below. --project (the default)\n"
                 "      writes this project's record, --global the machine's, and --machine\n"
                 "      the machine's as administration of the machine: from anywhere, with\n"
@@ -1428,8 +1431,13 @@ def _declared_section() -> str:
                 "      is refused (exit 6 connection_exists) unless --replace is given; it\n"
                 "      then keeps every field not given, and null in the JSON object clears\n"
                 "      one. --default\n"
-                "      points the scope's default at it. Answers the fields as they now\n"
-                "      resolve, secrets masked.\n"
+                "      points the scope's default at it. --identity ID records who the\n"
+                "      connection is, as login and doctor record it on success, with\n"
+                "      --display-name TEXT beside it; --display-name alone renames the one\n"
+                "      recorded, and --identity '' clears it. `connections` lists each\n"
+                "      connection's identity from its record, with no round-trip: the one\n"
+                "      recorded, else the value of the field marked main identifier below.\n"
+                "      Answers the fields as they now resolve, secrets masked.\n"
                 f"  {NAME} connection remove <id> [--project|--global|--machine]\n"
                 "      Remove it, its default pointer, and the secret lines `connection add`\n"
                 "      wrote for it; a key another connection names is kept. Refused (exit 6\n"
@@ -2011,7 +2019,9 @@ def _cmd_connections_reported() -> None:
     capability's effective policy state is added to it. Under the read-only
     switch every connection in it is marked read-only and the switch is named
     beside it, so a reader sees why no connection may write; in a machine read
-    each connection the machine lent is named as the machine's, read-only."""
+    each connection the machine lent is named as the machine's, read-only.
+    Each connection carries `identity`, who it is as its record says, read
+    without a round-trip."""
     import contextlib
     import io
     captured = io.StringIO()
@@ -2030,6 +2040,12 @@ def _cmd_connections_reported() -> None:
         return
     conns = report.get("connections")
     conns = conns if isinstance(conns, dict) else {}
+    if "_connection_identity" in globals() and conns:
+        # Who each connection is, from its record alone: no round-trip.
+        held = _inventory_connections().get("connections") or {}
+        for cid, entry in conns.items():
+            if isinstance(entry, dict):
+                entry["identity"] = _connection_identity(held.get(cid))
     if read_only_switch():
         for entry in conns.values():
             if isinstance(entry, dict):

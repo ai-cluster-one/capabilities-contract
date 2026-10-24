@@ -277,6 +277,94 @@ def _doctor_gate(report: dict, wanted: str | None) -> None:
              f"or process env; `{NAME} connections` shows where every value resolves")
 
 
+# --- Who a connection is ------------------------------------------------------
+#
+# A connection's spec may carry `identity`, {"id": text, "display_name": text or
+# null}: the account it is signed in as, kept in the connection's own record so
+# `connections` names it without a round-trip. A capability declares which of
+# its CONN_FIELDS is its main identifier with `"identity": true` on that field;
+# where nothing is recorded yet, that field's value is the identity's id.
+# login and doctor record it on success (`_record_identity`), and a person sets
+# it with `connection add <id> --identity ID [--display-name TEXT]`.
+
+IDENTITY_KEY = "identity"
+
+
+def _identity_value(ident, display_name=None) -> dict:
+    """The stored shape of one identity. Raises ValueError naming what is
+    wrong."""
+    if isinstance(ident, bool) or not isinstance(ident, (str, int)):
+        raise ValueError("an identity's id is text")
+    ident = str(ident).strip()
+    if not ident or len(ident) > 256:
+        raise ValueError("an identity's id is text of 1 to 256 characters")
+    if display_name is not None:
+        if not isinstance(display_name, str):
+            raise ValueError("an identity's display name is text")
+        display_name = display_name.strip() or None
+    return {"id": ident, "display_name": display_name}
+
+
+def _identity_field() -> str | None:
+    """The key of the connection field the capability declares as its main
+    identifier, if it declares one."""
+    for field in globals().get("CONN_FIELDS") or []:
+        if field.get("identity") is True:
+            return field.get("key")
+    return None
+
+
+def _connection_identity(entry: dict | None) -> dict | None:
+    """Who one connection is, from its record alone: the identity recorded on
+    it, else the declared identifier field's value as the id, else None."""
+    entry = entry if isinstance(entry, dict) else {}
+    held = entry.get(IDENTITY_KEY)
+    if isinstance(held, dict):
+        try:
+            return _identity_value(held.get("id"), held.get("display_name"))
+        except ValueError:
+            pass
+    key = _identity_field()
+    value = entry.get(key) if key else None
+    if value not in (None, "") and not isinstance(value, (bool, list, dict)):
+        return {"id": str(value), "display_name": None}
+    return None
+
+
+def _record_identity(cid: str, ident, display_name: str | None = None) -> bool:
+    """Record who connection `cid` is, as login or doctor just proved it.
+
+    Written to the connection's own record, at the scope that holds it, and
+    only where it changes. Never fails the verb that proved it: under the
+    read-only switch, for a connection no record here holds, or where the
+    records refuse the write, nothing is written and False is answered."""
+    try:
+        value = _identity_value(ident, display_name)
+    except ValueError:
+        return False
+    if read_only_switch() or not cid:
+        return False
+    try:
+        adapter = _records()
+        scopes = ["project", "global"] if _project_root() is not None else ["global"]
+        for scope in scopes:
+            held = adapter.resolve_scope(NAME, "connection", scope).get(cid)
+            if held is None:
+                continue
+            entry = dict(held.get("value") or {})
+            if entry.get(IDENTITY_KEY) == value:
+                return True
+            entry[IDENTITY_KEY] = value
+            if scope == "project" and adapter.mode_of("connection") == "store":
+                adapter.set(NAME, "connection", cid, entry, scope=scope, own=True)
+            else:
+                adapter.set(NAME, "connection", cid, entry, scope=scope)
+            return True
+    except StoreError:
+        return False
+    return False
+
+
 # --- Writing connections and the machine's setup -----------------------------
 #
 # `connection add|remove` and `setup` are the one way every capability takes a
@@ -469,7 +557,8 @@ def _cmd_connection(argv: list[str]) -> None:
     its secrets into the scope's credentials file; `connection remove <id>`
     takes it out again with the secrets it wrote."""
     usage = (f"{NAME} connection add <id> [--project|--global|--machine] [--default] "
-             "[--replace] [--field KEY=VALUE ...] [--env KEY=ENV_KEY ...] [--stdin] | "
+             "[--replace] [--field KEY=VALUE ...] [--env KEY=ENV_KEY ...] [--stdin] "
+             "[--identity ID [--display-name TEXT]] | "
              f"{NAME} connection remove <id> [--project|--global|--machine]")
     import re as _re
     sub = argv[0] if argv else ""
@@ -495,6 +584,29 @@ def _cmd_connection(argv: list[str]) -> None:
             i += 1
     if named and sub != "add":
         _die(6, "input", "--env is an option of connection add", usage)
+    identity_given: dict = {}
+    words_left: list = []
+    i = 0
+    while i < len(rest_argv):
+        arg = rest_argv[i]
+        option = next((o for o in ("--identity", "--display-name")
+                       if arg == o or arg.startswith(o + "=")), None)
+        if option is None:
+            words_left.append(arg)
+            i += 1
+            continue
+        if arg.startswith(option + "="):
+            identity_given[option] = arg[len(option) + 1:]
+            i += 1
+        elif i + 1 < len(rest_argv):
+            identity_given[option] = rest_argv[i + 1]
+            i += 2
+        else:
+            _die(6, "input", f"{option} takes a value", usage)
+    rest_argv = words_left
+    if identity_given and sub != "add":
+        _die(6, "input", "--identity and --display-name are options of connection add",
+             usage)
     argv_values, words, stdin = _field_args(rest_argv, usage)
     default = "--default" in words
     replace = "--replace" in words
@@ -630,6 +742,27 @@ def _cmd_connection(argv: list[str]) -> None:
                 entry[key] = env_key
         elif key not in entry and field.get("default") is not None and field.get("required"):
             entry[key] = field["default"]
+    if identity_given:
+        ident = identity_given.get("--identity")
+        held_identity = entry.get(IDENTITY_KEY)
+        if ident == "":
+            if "--display-name" in identity_given:
+                _die(6, "input", "--identity '' clears the identity, and takes no "
+                     "--display-name", usage)
+            entry.pop(IDENTITY_KEY, None)
+        else:
+            if ident is None:
+                if not isinstance(held_identity, dict) or not held_identity.get("id"):
+                    _die(6, "input", f"connection {cid!r} records no identity to name",
+                         "give --identity ID with --display-name")
+                ident = held_identity["id"]
+            name = identity_given.get("--display-name",
+                                      (held_identity or {}).get("display_name")
+                                      if "--identity" not in identity_given else None)
+            try:
+                entry[IDENTITY_KEY] = _identity_value(ident, name)
+            except ValueError as e:
+                _die(6, "bad_field", str(e))
     missing = [f["key"] for f in declared if f.get("required") and entry.get(f["key"]) in (None, "")]
     if missing:
         _die(6, "fields_required", f"connection {cid!r} needs: {', '.join(missing)}",
@@ -665,6 +798,7 @@ def _cmd_connection(argv: list[str]) -> None:
            "connection": cid, "scope": scope, "registry": source,
            "credentials": str(credentials) if secrets else None,
            "default": default, "fields": report,
+           "identity": _connection_identity(entry),
            "next": f"`{NAME} doctor --connection {cid}` proves it"}
     methods = globals().get("LINK_METHODS") or []
     if methods:
