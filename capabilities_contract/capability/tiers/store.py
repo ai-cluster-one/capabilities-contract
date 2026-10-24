@@ -109,12 +109,17 @@ def read_only_switch() -> bool:
 # the UUID never leaves it; any other machine - a server, a container - from
 # the id kept in its config home, minted there once, where a container keeps it
 # on its persistent volume. AGENT_NODE_ID, where set, overrides both (a
-# container that is handed its id, a test). The label is the node's row's in
+# container that is handed its id, a test); it also takes the name a node
+# registered before ids is still keyed by, which a box compiled for such a node
+# is handed. The label is the node's row's in
 # the store; AGENT_NODE_NAME, else the host name, is only the label a machine
 # gives itself when it is first registered.
 NODE_ID_ENV = "AGENT_NODE_ID"
 NODE_NAME_ENV = "AGENT_NODE_NAME"
 NODE_ID_RE = re.compile(r"[0-9a-f]{12}")
+# The id a node registered before ids keeps until it is moved to its own: the
+# name it was registered by, as a deployment target declared it.
+NODE_LEGACY_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
 NODE_ID_FILE = "node-id"
 _NODE_HASH_PREFIX = "capabilities-node:"
 # A Mac's id, derived once per process: asking the hardware is a subprocess.
@@ -194,9 +199,10 @@ def node_identity() -> dict[str, str]:
     global _mac_node_id
     given = os.environ.get(NODE_ID_ENV, "").strip()
     if given:
-        if not NODE_ID_RE.fullmatch(given):
+        if not (NODE_ID_RE.fullmatch(given) or NODE_LEGACY_ID_RE.fullmatch(given)):
             raise StoreError("bad_node_id", f"{NODE_ID_ENV}={given!r} is not a node id: "
-                             "twelve lowercase hex characters")
+                             "twelve lowercase hex characters, or the name a node "
+                             "registered before ids is keyed by")
         return {"id": given, "source": "env"}
     import sys
     if sys.platform == "darwin":
