@@ -883,6 +883,15 @@ def _cmd_connections_show(argv: list[str]) -> None:
     _emit(value)
 
 
+def _setup_presentation() -> dict:
+    """What `SETUP` declares about the machine's setup as a whole - its
+    `title`, the `guide` {url, steps} a person follows to obtain the fields,
+    and the `verify` verb that asks the remote system whether it accepts them -
+    each key only where it is declared."""
+    declared = globals().get("SETUP") or {}
+    return {key: declared[key] for key in ("title", "guide", "verify") if key in declared}
+
+
 def _cmd_setup(argv: list[str]) -> None:
     """`setup` reports the machine prerequisites the capability declares and
     where each resolves from; `setup show --reveal <KEY>` prints the one value
@@ -948,7 +957,7 @@ def _cmd_setup(argv: list[str]) -> None:
                        "value": (_mask(value) if secret else value) if value else None})
     out = {"capability": NAME, "credentials": str(CREDENTIALS_ENV),
            "ready": all(f["set"] for f in fields if f.get("required")),
-           "fields": fields}
+           "fields": fields, **_setup_presentation()}
     if sub != "show":
         out.update({"ok": True, "action": sub, "changed": changed})
     _emit(out)

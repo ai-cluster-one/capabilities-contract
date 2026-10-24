@@ -2075,6 +2075,7 @@ def _cmd_connections_reported() -> None:
 # so a script that declares none still runs:
 #   CONN_FIELDS   a connection entry's own fields, one dict per field
 #   SETUP_FIELDS  what the machine is given once, before any connection
+#   SETUP         that setup's title, the guide to obtaining it, its verify verb
 #   LINK_METHODS  the interactive ceremonies that link a connection
 #   SETTINGS      where the capability's settings live, and the keys it declares
 
@@ -2119,7 +2120,9 @@ def _manifest_core() -> dict:
             "post_install": POST_INSTALL, "tables": _tables_declared(),
             "connections": _connections_declaration(),
             "settings": _settings_declaration(),
-            "migrate_files": callable(globals().get("_migrate_files_mover"))}
+            "migrate_files": callable(globals().get("_migrate_files_mover")),
+            **({"setup": _setup_presentation()}
+               if "_setup_presentation" in globals() and globals().get("SETUP") else {})}
 
 
 def _field_value(field: dict, raw, from_argv: bool = False):
