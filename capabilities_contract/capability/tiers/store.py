@@ -3691,8 +3691,22 @@ class AgentRecords(StoreRecords):
                         out.setdefault(key, row)
             return out
         if collection == "connection" and scope == "global":
-            return {}
+            # The machine's connections are the shared rows, which no agent
+            # owns; a row an agent owns is that agent's own and never one.
+            _store_check("capability", capability, CAPABILITY_RE)
+            rows = self._read(
+                "SELECT name, spec FROM capabilities_connections "
+                "WHERE capability = %s AND owner IS NULL ORDER BY name", (capability,))
+            return {name: self._record("global", capability, collection, name,
+                                       spec if isinstance(spec, dict) else {},
+                                       f"global/{name}")
+                    for name, spec in rows}
         return super().resolve_scope(capability, collection, scope)
+
+    def global_grantees(self, capability: str, connection: str) -> list[str]:
+        """Every agent a grant enables a shared connection for, which removing
+        it would take it from: the shared rows are this agent's global layer."""
+        return self.grantees(capability, connection)
 
     def get(self, capability: str, collection: str, key: str) -> Any:
         if collection == "grant":
