@@ -293,7 +293,13 @@ STORE_SETTINGS_CHANGES_TABLE = "capabilities_settings_changes"
 # Every capability's references for each project, versioned: one row per
 # version, the active one read before the project's files.
 STORE_REFERENCES_TABLE = "capabilities_references"
-STORE_TABLES_VERSION = (1, 12)
+# What each node actually runs: a row per service it supervises, keyed by
+# project, capability and node, in one of a closed set of states.
+STORE_SERVICE_INSTANCES_TABLE = "capabilities_service_instances"
+SERVICE_INSTANCE_STATES = ("starting", "ready", "unusable", "degraded", "failing",
+                           "held", "waiting", "stopping")
+SERVICE_INSTANCE_TEXT_CHARS = 2000
+STORE_TABLES_VERSION = (1, 13)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -1004,7 +1010,129 @@ def record_table_steps() -> list[tuple[str, str]]:
          " 'A copy of capabilities_nodes.coolify_resource kept by the store, as kind.';"
          " COMMENT ON COLUMN capabilities_agent_nodes.public_key IS"
          " 'A copy of capabilities_nodes.public_key kept by the store, as kind.'"),
+        # What runs where: one row per service a node supervises, written by
+        # whatever supervises it there - today deployment's runner - and
+        # deleted when it stops supervising it, so the nodes that run a
+        # service are a plain read. `node` carries no foreign key, as the
+        # lease's does not: a service running on a node nobody registered is
+        # still shown, and `capabilities node rekey` moves the column with
+        # every other that names a node. `ready` is computed from `state`,
+        # which alone says whether the service can do its work.
+        ("0028-service-instances",
+         "CREATE TABLE capabilities_service_instances ("
+         " project_id text NOT NULL CHECK (project_id <> ''),"
+         " capability text NOT NULL CHECK (capability ~ '^[a-z][a-z0-9_-]*$'),"
+         " node text NOT NULL CHECK (node <> ''),"
+         " state text NOT NULL CHECK (state IN ('starting', 'ready', 'unusable', 'degraded', 'failing', 'held', 'waiting', 'stopping')),"
+         " ready boolean GENERATED ALWAYS AS (state IN ('ready', 'degraded')) STORED,"
+         " problem text CHECK (problem <> ''),"
+         " problem_code text CHECK (problem_code <> ''),"
+         " payload_sha256 text CHECK (payload_sha256 ~ '^[0-9a-f]{64}$'),"
+         " pid integer CHECK (pid > 0),"
+         " host text CHECK (host <> ''),"
+         " started_at timestamptz,"
+         " checked_at timestamptz NOT NULL DEFAULT now(),"
+         " last_exit_code integer,"
+         " last_error text CHECK (last_error <> ''),"
+         " last_error_at timestamptz,"
+         " skipped_settings jsonb NOT NULL DEFAULT '[]'"
+         "  CHECK (jsonb_typeof(skipped_settings) = 'array'),"
+         " PRIMARY KEY (project_id, capability, node),"
+         " CONSTRAINT capabilities_service_instances_unusable_says_why"
+         "  CHECK (state <> 'unusable' OR problem IS NOT NULL),"
+         " CONSTRAINT capabilities_service_instances_failing_says_why"
+         "  CHECK (state <> 'failing' OR last_error IS NOT NULL));"
+         " COMMENT ON TABLE capabilities_service_instances IS"
+         " 'What each node actually runs: one row per (project, capability, node) while"
+         " something on that node supervises the service, deleted when it stops"
+         " supervising it. Placement says where a service should run and the lease which"
+         " node may run an exclusive one; this row says what runs and whether it works.';"
+         " COMMENT ON COLUMN capabilities_service_instances.project_id IS"
+         " 'The project''s declared id.';"
+         " COMMENT ON COLUMN capabilities_service_instances.node IS"
+         " 'The id of the node the service runs on, as capabilities_nodes keys it.';"
+         " COMMENT ON COLUMN capabilities_service_instances.state IS"
+         " 'starting: running, not yet passed its probe; ready: running and its probe"
+         " passes; unusable: running, and its probe says it cannot do its work (problem says"
+         " why); degraded: ready, with settings skipped on this node; failing: exits and is"
+         " restarted, or cannot be started (last_error says why); held: stopped and not"
+         " restarted until the gate answer changes; waiting: placed here, while another"
+         " node holds the lease; stopping: no longer placed here, being stopped.';"
+         " COMMENT ON COLUMN capabilities_service_instances.ready IS"
+         " 'Whether the service can do its work here: state ready or degraded.';"
+         " COMMENT ON COLUMN capabilities_service_instances.problem IS"
+         " 'Why the service is not ready, in its declared doctor''s words.';"
+         " COMMENT ON COLUMN capabilities_service_instances.problem_code IS"
+         " 'The error code the doctor named, else the category its exit code stands for.';"
+         " COMMENT ON COLUMN capabilities_service_instances.payload_sha256 IS"
+         " 'The installed payload of the capability the service was started from.';"
+         " COMMENT ON COLUMN capabilities_service_instances.pid IS"
+         " 'The service''s process on host; null while it does not run.';"
+         " COMMENT ON COLUMN capabilities_service_instances.host IS"
+         " 'The host name of the machine the pid is on.';"
+         " COMMENT ON COLUMN capabilities_service_instances.started_at IS"
+         " 'When the running process started; null while it does not run.';"
+         " COMMENT ON COLUMN capabilities_service_instances.checked_at IS"
+         " 'When the supervisor last wrote the row; a node that stops writing it is gone"
+         " or cut off, and its rows say nothing after that.';"
+         " COMMENT ON COLUMN capabilities_service_instances.last_exit_code IS"
+         " 'The exit code the service last failed with on this node; null when it could not"
+         " be started at all.';"
+         " COMMENT ON COLUMN capabilities_service_instances.last_error IS"
+         " 'The last lines the service printed to stderr when it last failed, or why it"
+         " could not be started.';"
+         " COMMENT ON COLUMN capabilities_service_instances.last_error_at IS"
+         " 'When the service last failed on this node.';"
+         " COMMENT ON COLUMN capabilities_service_instances.skipped_settings IS"
+         " 'The settings the service reported it cannot honour on this node and skipped,"
+         " as its doctor named them.'"),
     ]
+
+
+def service_instance_put(conn: Any, project_id: str, capability: str, node: str, *,
+                         state: str, problem: str | None = None,
+                         problem_code: str | None = None,
+                         payload_sha256: str | None = None, pid: int | None = None,
+                         host: str | None = None, started_at: Any = None,
+                         last_exit_code: int | None = None, last_error: str | None = None,
+                         last_error_at: Any = None,
+                         skipped_settings: Sequence[Any] = ()) -> None:
+    """Write the whole row of what `node` runs of `capability` for the project,
+    as its supervisor sees it now; `checked_at` is the store's now. Text is
+    kept to its last SERVICE_INSTANCE_TEXT_CHARS characters, and an empty
+    string is written as nothing."""
+    if state not in SERVICE_INSTANCE_STATES:
+        raise StoreError("bad_state", f"service state {state!r} is not one of "
+                         f"{', '.join(SERVICE_INSTANCE_STATES)}")
+
+    def text(value: str | None) -> str | None:
+        value = (value or "").strip()
+        return value[-SERVICE_INSTANCE_TEXT_CHARS:] or None
+
+    conn.execute(
+        "INSERT INTO capabilities_service_instances AS i (project_id, capability, node,"
+        " state, problem, problem_code, payload_sha256, pid, host, started_at,"
+        " last_exit_code, last_error, last_error_at, skipped_settings)"
+        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)"
+        " ON CONFLICT (project_id, capability, node) DO UPDATE SET"
+        " state = EXCLUDED.state, problem = EXCLUDED.problem,"
+        " problem_code = EXCLUDED.problem_code, payload_sha256 = EXCLUDED.payload_sha256,"
+        " pid = EXCLUDED.pid, host = EXCLUDED.host, started_at = EXCLUDED.started_at,"
+        " checked_at = now(), last_exit_code = EXCLUDED.last_exit_code,"
+        " last_error = EXCLUDED.last_error, last_error_at = EXCLUDED.last_error_at,"
+        " skipped_settings = EXCLUDED.skipped_settings",
+        (project_id, capability, node, state, text(problem), text(problem_code),
+         payload_sha256 or None, pid, text(host), started_at, last_exit_code,
+         text(last_error), last_error_at, json.dumps(list(skipped_settings))))
+
+
+def service_instance_drop(conn: Any, project_id: str, capability: str, node: str) -> bool:
+    """Delete the row once `node` no longer supervises `capability` for the
+    project; whether there was one."""
+    return bool(conn.execute(
+        "DELETE FROM capabilities_service_instances"
+        " WHERE project_id = %s AND capability = %s AND node = %s",
+        (project_id, capability, node)).rowcount)
 
 
 def _refuse_record_write(capability: str, collection: str) -> None:
