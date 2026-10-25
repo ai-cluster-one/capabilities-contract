@@ -7,15 +7,43 @@
 # docstring of `capabilities_contract.capability`.
 #
 
+def _shared_credentials_env() -> Path:
+    """The machine's one home for the values several capabilities share:
+    `$XDG_CONFIG_HOME/capabilities/shared.env`, keyed by each value's shared
+    name."""
+    return _CONFIG_HOME / "capabilities" / "shared.env"
+
+
+def _shared_name(key: str) -> str | None:
+    """The shared name a declared setup field gives its env key, or None when
+    the key is the capability's own."""
+    import re as _re
+    for field in globals().get("SETUP_FIELDS") or []:
+        if not isinstance(field, dict):
+            continue
+        name = field.get("shared")
+        if (field.get("key") == key and isinstance(name, str)
+                and _re.fullmatch(r"[A-Z][A-Z0-9_]*", name)):
+            return name
+    return None
+
+
 def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
     """Resolve one env key through cascade tiers 2-4: project .env(.local) →
-    user credentials.env → process env. Returns (value, tier, source)."""
+    user config → process env. Returns (value, tier, source). User config is
+    the capability's credentials.env, after the machine's shared.env for a key
+    a setup field declares shared."""
     root = _project_root()
     if root is not None:
         for fname in (".env.local", ".env"):
             val = _parse_env_file(root / fname).get(key)
             if val:
                 return val, "project", root / fname
+    shared = _shared_name(key)
+    if shared is not None:
+        val = _parse_env_file(_shared_credentials_env()).get(shared)
+        if val:
+            return val, "user", _shared_credentials_env()
     val = _parse_env_file(CREDENTIALS_ENV).get(key)
     if val:
         return val, "user", CREDENTIALS_ENV
@@ -897,6 +925,10 @@ def _cmd_setup(argv: list[str]) -> None:
     where each resolves from; `setup show --reveal <KEY>` prints the one value
     that report masks for KEY, in the clear; `setup set` writes them to the
     capability's credentials.env, secrets from stdin; `setup unset` takes them out.
+    A field that declares `shared` is listed under `shared`, apart from
+    `fields`, and is written to and removed from the machine's shared.env
+    under its shared name, so one value serves every capability that declares
+    it; unset also takes the key out of the capability's own credentials.env.
     `--machine` names a write as administration of the machine
     (`_machine_administration`)."""
     usage = (f"{NAME} setup [show] [--reveal <KEY>] | setup set [--machine] "
@@ -931,11 +963,18 @@ def _cmd_setup(argv: list[str]) -> None:
         given = _declared_values(declared, argv_values, stdin, "setup")
         if not given:
             _die(6, "input", "setup set was given nothing to set", usage)
-        _env_file_write(CREDENTIALS_ENV, {
+        written = {
             key: (None if value is None else
                   ("true" if value is True else "false" if value is False else
                    json.dumps(value) if isinstance(value, (list, dict)) else str(value)))
-            for key, value in given.items()})
+            for key, value in given.items()}
+        own = {key: value for key, value in written.items() if _shared_name(key) is None}
+        shared = {_shared_name(key): value for key, value in written.items()
+                  if _shared_name(key) is not None}
+        if own:
+            _env_file_write(CREDENTIALS_ENV, own)
+        if shared:
+            _env_file_write(_shared_credentials_env(), shared)
         changed = sorted(given)
     elif sub == "unset":
         keys = [w for w in rest if not w.startswith("--")]
@@ -947,17 +986,24 @@ def _cmd_setup(argv: list[str]) -> None:
                  else "setup unset names the keys to remove", usage)
         _read_only_gate(f"`{NAME} setup unset`")
         _env_file_write(CREDENTIALS_ENV, {key: None for key in keys})
+        shared = {_shared_name(key): None for key in keys if _shared_name(key) is not None}
+        if shared:
+            _env_file_write(_shared_credentials_env(), shared)
         changed = sorted(keys)
-    fields = []
+    fields, shared_fields = [], []
     for field in declared:
         value, tier, source = _resolve_env_key(field["key"])
         secret = bool(field.get("secret"))
-        fields.append({**field, "set": bool(value), "tier": tier if value else None,
-                       "source": str(source) if (value and source) else None,
-                       "value": (_mask(value) if secret else value) if value else None})
+        (shared_fields if _shared_name(field["key"]) else fields).append(
+            {**field, "set": bool(value), "tier": tier if value else None,
+             "source": str(source) if (value and source) else None,
+             "value": (_mask(value) if secret else value) if value else None})
     out = {"capability": NAME, "credentials": str(CREDENTIALS_ENV),
-           "ready": all(f["set"] for f in fields if f.get("required")),
+           "ready": all(f["set"] for f in fields + shared_fields if f.get("required")),
            "fields": fields, **_setup_presentation()}
+    if shared_fields:
+        out.update({"shared": shared_fields,
+                    "shared_credentials": str(_shared_credentials_env())})
     if sub != "show":
         out.update({"ok": True, "action": sub, "changed": changed})
     _emit(out)
