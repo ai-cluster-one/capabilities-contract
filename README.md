@@ -133,6 +133,17 @@ print(report.state, report.pending)
 
 `status(conn, owner, steps, *, major, minor)` reports what `migrate` would do with the same arguments, changing nothing and taking no lock, so it answers while another session holds one. It returns a `MigrateStatus` with `state`, `major` and `minor` (the caller's), `stored_major` and `stored_minor` (the store's, or `None`), and the step ids under `applied`, `pending` and `changed`, plus `warnings`. `state` is `current` when every step is applied and the store records the caller's version or a newer minor (which adds a warning), `pending` when `migrate` has something to apply or record, and `checksum_mismatch` or `schema_too_new` when `migrate` would refuse.
 
+## Bodies
+
+```python
+from capabilities_contract.bodies import body_digest, check_body, materialise
+
+path = materialise(script_body, state_dir / "bodies")
+subprocess.run([str(path)], check=True)
+```
+
+`capabilities_contract.bodies` is the one way a stored executable script body - an automation's `script_body`, a stored tasks hook - is run. It imports nothing outside the standard library. `body_digest(body)` is the sha256 hex digest of the body's UTF-8 bytes. `check_body(body)` raises `ValueError` unless the body is a `str` starting with `#!`. `materialise(body, directory)` checks the body, makes the directory with mode 0700 (and its parents) when it is missing, and returns `<directory>/<body_digest(body)>`, an executable file holding the body: a regular file already there with the same content and mode 0700 is reused, and anything else at that path is replaced atomically by a file written beside it, chmodded 0700 and moved into place with `os.replace`. A process running the file never sees it partial, and processes materialising the same body at once each return the whole file.
+
 ## Errors
 
 Every failure is a `DbError` with `slug` (stable, for the caller to map to an exit code), `message` and `hint` (possibly `None`). Slugs: `store_not_configured`, `store_not_postgres`, `store_setting_unreadable`, `store_setting_too_new`, `bad_store_setting`, `sslmode_too_weak`, `bad_schema_name`, `store_unreachable`, `transaction_pooler`, `session_state`, `driver_missing`, `bad_application_name`, `bad_owner`, `bad_version`, `bad_step`, `connection_busy`, `checksum_mismatch`, `naming_law`, `step_failed`, `schema_too_new`, `store_busy`, `bad_channel`, `bad_scope`, `bad_follow`, `bad_interval`, `not_migrated`.
