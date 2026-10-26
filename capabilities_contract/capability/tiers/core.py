@@ -2414,17 +2414,20 @@ def _settings_write(home: dict, path: Path, document: dict) -> None:
             spare.unlink()
 
 
-def _settings_rows_write(home: dict, scope: str, change) -> dict:
+def _settings_rows_write(home: dict, scope: str, change, base=None) -> dict:
     """Change one home's document where it is rows, in the store's one
     transaction: `change` takes the document and returns the new one, and the
-    capability's check reads the whole result before anything is written."""
+    capability's check reads the whole result before anything is written.
+    `base`, where given, is `{"generation": ...}` as the document was read,
+    and the write is refused where another write moved it since."""
     check = globals().get("_settings_check")
 
     def checked(document: dict) -> list:
         return [str(p) for p in (check(scope, document) or [])] if check else []
     try:
         return _records().settings_write(NAME, scope, change, check=checked,
-                                         seed=home.get("seed"))
+                                         seed=home.get("seed"),
+                                         **({"base": base["generation"]} if base else {}))
     except StoreError as e:
         if e.slug == "not_found":
             _die(3, e.slug, e.message, e.hint)
@@ -2689,6 +2692,19 @@ def _cmd_settings(argv: list[str]) -> None:
     _read_only_gate(f"`{NAME} settings {sub}`")
     document = dict(document or {})
     previous = None
+    base = None
+    if sub == "edit" and rows:
+        # The generation first, then the document: an edit is refused where
+        # another write lands between this read and its own.
+        try:
+            base = {"generation": _records().setting_generations(NAME).get(scope)}
+        except StoreError as e:
+            _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+        path, document, error = _settings_read(home)
+        if error:
+            _die(6, "settings_unreadable", error)
+        document = dict(document if document is not None
+                        else json.loads(json.dumps(home.get("seed") or {})))
     if sub == "edit":
         edited = _settings_edit(home, scope, document, yes)
         if edited is None:
@@ -2725,7 +2741,7 @@ def _cmd_settings(argv: list[str]) -> None:
                 raise StoreError("not_found", f"{key} is not set at scope {scope}")
             _settings_drop(target, key)
             return target
-        written = _settings_rows_write(home, scope, change)
+        written = _settings_rows_write(home, scope, change, base)
         out["path"] = written["source"]
         if key:
             out.update({"key": key, "previous": _settings_dig(written["before"], key)[0]})

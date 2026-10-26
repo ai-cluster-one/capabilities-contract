@@ -3424,6 +3424,10 @@ class _Unchanged(Exception):
     it runs in leaves the document as it was."""
 
 
+# A settings write that names no generation it was read at.
+_UNREAD = object()
+
+
 def _user_name() -> str:
     name = os.environ.get("USER") or os.environ.get("LOGNAME")
     if not name:
@@ -3446,14 +3450,15 @@ class AgentRecords(StoreRecords):
     the row for every node. This node is AGENT_NODE_NAME, registered among the
     agent's nodes; `open_records` refuses an agent that has moved without it.
 
-    Who writes what: the agent's master writes the rows every node shares
-    (node null); another node writes only where the master let it
-    (`may_write`), and what it writes carries its own node. While the agent's
-    `migrating_since` is set, only the migration on its master writes. A
-    settings document is written in one transaction under its advisory lock:
+    Who writes what: the agent's master, and every node its link lets write
+    (`may_write`), writes the rows every node shares (node null) and the rows
+    for its own node; a row for another node is the master's alone. While the
+    agent's `migrating_since` is set, only the migration on its master writes.
+    A settings document is written in one transaction under its advisory lock:
     assembled, changed, checked whole, then stored as the paths that changed,
     removals first, each with a trail row, and its generation moved to the
-    last of them."""
+    last of them. A write made from a document read earlier names the
+    generation it read, and is refused while another write has moved it."""
 
     settings_in_rows = True
 
@@ -3512,8 +3517,8 @@ class AgentRecords(StoreRecords):
                    actor: str | None) -> str | None:
         """The node a write lands on, decided from the registry as it stands
         in this transaction: the master writes the shared rows (or a row for
-        the node it names); another node writes its own rows where it may, and
-        nothing else."""
+        the node it names); another node its link lets write writes the shared
+        rows and its own, and a node it does not let write writes nothing."""
         state = _agent_state(conn, self.project_id) or {}
         if scope != "global":
             _refuse_frozen(state, self.project_id, self._role(actor), node=self.node)
@@ -3528,17 +3533,17 @@ class AgentRecords(StoreRecords):
             raise StoreError(
                 "node_read_only",
                 f"node {self.node} is not the master of agent {self.project_id} and "
-                "writes nothing: the rows every node shares are written on the master "
-                f"{state.get('master') or '(none registered)'}",
-                "write it on the master, or let the master allow this node its own "
-                f"rows with `capabilities node set {self.node} --may-write`")
+                "may not write: the rows every node shares are written on the master "
+                f"{state.get('master') or '(none registered)'} or on a node it lets write",
+                "write it on the master, or let this node write with "
+                f"`capabilities node set {self.node} --may-write`")
         if wanted not in (None, self.node):
             raise StoreError(
                 "node_read_only",
                 f"node {self.node} is not the master of agent {self.project_id} and "
-                f"writes only rows of its own, not rows for node {wanted}",
+                f"writes the shared rows and its own, not rows for node {wanted}",
                 f"write it on the master {state.get('master') or '(none registered)'}")
-        return self.node
+        return wanted
 
     def _place_node(self, conn: Any, node: str, actor: str | None) -> str:
         """A placement row is written where the registry lets this node write
@@ -3824,13 +3829,16 @@ class AgentRecords(StoreRecords):
 
     def settings_write(self, capability: str, scope: str, change: Any,
                        check: Any = None, seed: dict | None = None,
-                       actor: str | None = None) -> dict[str, Any]:
+                       actor: str | None = None, base: Any = _UNREAD) -> dict[str, Any]:
         """Change one scope's settings document in one transaction: lock it,
         assemble it (the seed where no document exists yet), apply `change`
         (a function from the document to the new one), check the result as
         this node will read it with `check` (a function returning problems),
         then write the paths that differ, removals first, one trail row each,
-        and move the document's generation to the last of them. A refused
+        and move the document's generation to the last of them. `base` is the
+        generation the change was made from, as `setting_generations` gave it
+        (None where no document existed); given, the write is refused
+        (`stale_edit`) where the scope's generation is another now. A refused
         write changes nothing."""
         _store_check("capability", capability, CAPABILITY_RE)
         _refuse_record_write(capability, "setting")
@@ -3840,6 +3848,18 @@ class AgentRecords(StoreRecords):
         def work(conn: Any) -> dict[str, Any]:
             node = self._authority(conn, scope, None, actor)
             self._lock_document(conn, agent, capability, node)
+            if base is not _UNREAD:
+                [(now,)] = conn.execute(
+                    "SELECT max(generation) FROM capabilities_settings_documents "
+                    "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') "
+                    "AND capability = %s AND (node IS NULL OR node = %s)",
+                    (agent, capability, self.node)).fetchall()
+                if (None if now is None else int(now)) != base:
+                    raise StoreError(
+                        "stale_edit",
+                        f"the {scope} settings of {capability} are at generation "
+                        f"{now} now, not {base} as they were when the edit began",
+                        "read them again and apply the change again")
             old, generation = self._document_rows(conn, agent, capability, node)
             exists = generation is not None or bool(old)
             current = (settings_tree(list(old.items())) if exists
