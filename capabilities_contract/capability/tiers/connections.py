@@ -28,11 +28,46 @@ def _shared_name(key: str) -> str | None:
     return None
 
 
+# Why the vault could not answer a key this process asked it for, by key: the
+# store could not be read, or the agent's key is not one. Reported beside the
+# key, never in place of a value another tier gives.
+_VAULT_UNREAD: dict = {}
+
+
+def _vault_value(key: str) -> tuple[str | None, str | None]:
+    """The cascade's last tier: (the value the agent's vault holds for `key`,
+    where), or (None, None). The vault is the store's, sealed with the agent's
+    own key; only the names asked for are opened, and kept in memory only."""
+    import re as _re
+    if not _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,254}", key):
+        return None, None
+    root = _project_root()
+    agent = _project_id() if root is not None else None
+    if not agent:
+        return None, None
+    try:
+        from capabilities_contract import vault as _vault
+    except ImportError:
+        return None, None
+    try:
+        reader = _vault.reader(root, agent, application_name=NAME)
+        if reader is None:
+            return None, None
+        value = reader.get(key)
+    except _vault.VaultError as e:
+        _VAULT_UNREAD[key] = e.message
+        return None, None
+    _VAULT_UNREAD.pop(key, None)
+    if value is None:
+        return None, None
+    return value, f"vault:{agent}"
+
+
 def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
-    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
-    user config → process env. Returns (value, tier, source). User config is
-    the capability's credentials.env, after the machine's shared.env for a key
-    a setup field declares shared."""
+    """Resolve one env key through cascade tiers 2-5: project .env(.local) →
+    user config → process env → the agent's vault. Returns (value, tier,
+    source). User config is the capability's credentials.env, after the
+    machine's shared.env for a key a setup field declares shared."""
     root = _project_root()
     if root is not None:
         for fname in (".env.local", ".env"):
@@ -50,6 +85,9 @@ def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
     val = os.environ.get(key)
     if val:
         return val, "env", None
+    val, where = _vault_value(key)
+    if val:
+        return val, "vault", where
     return None, None, None
 
 
@@ -270,10 +308,13 @@ def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
 
 def _key_report(key: str, secret: bool, required: bool,
                 value: str | None, tier: str | None, source) -> dict:
-    return {"key": key, "secret": secret, "required": required,
-            "set": bool(value), "tier": tier if value else None,
-            "source": str(source) if (value and source) else None,
-            "value": (_mask(value) if secret else value) if value else None}
+    report = {"key": key, "secret": secret, "required": required,
+              "set": bool(value), "tier": tier if value else None,
+              "source": str(source) if (value and source) else None,
+              "value": (_mask(value) if secret else value) if value else None}
+    if not value and key in _VAULT_UNREAD:
+        report["vault"] = _VAULT_UNREAD[key]
+    return report
 
 
 def _missing_required(keys: list) -> list:
@@ -299,10 +340,15 @@ def _doctor_gate(report: dict, wanted: str | None) -> None:
             problems[cid] = miss
     if problems:
         detail = "; ".join(f"{c}: {', '.join(ks)}" for c, ks in sorted(problems.items()))
+        unread = sorted({_VAULT_UNREAD[k] for ks in problems.values() for k in ks
+                         if k in _VAULT_UNREAD})
+        if unread:
+            detail += " (" + "; ".join(unread) + ")"
         _die(2, "credentials_missing",
              f"unresolved required config — {detail}",
              f"set each in the project .env/.env.local, the user credentials.env, "
-             f"or process env; `{NAME} connections` shows where every value resolves")
+             f"process env, or the agent's vault (`capabilities secrets set <KEY>`); "
+             f"`{NAME} connections` shows where every value resolves")
 
 
 # --- Who a connection is ------------------------------------------------------

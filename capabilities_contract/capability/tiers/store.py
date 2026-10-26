@@ -296,10 +296,12 @@ STORE_REFERENCES_TABLE = "capabilities_references"
 # What each node actually runs: a row per service it supervises, keyed by
 # project, capability and node, in one of a closed set of states.
 STORE_SERVICE_INSTANCES_TABLE = "capabilities_service_instances"
+# Each agent's secrets, sealed with the agent's own key (capabilities_contract.vault).
+STORE_VAULT_TABLE = "capabilities_vault"
 SERVICE_INSTANCE_STATES = ("starting", "ready", "unusable", "degraded", "failing",
                            "held", "waiting", "stopping")
 SERVICE_INSTANCE_TEXT_CHARS = 2000
-STORE_TABLES_VERSION = (1, 13)
+STORE_TABLES_VERSION = (1, 14)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -1086,6 +1088,61 @@ def record_table_steps() -> list[tuple[str, str]]:
          " COMMENT ON COLUMN capabilities_service_instances.skipped_settings IS"
          " 'The settings the service reported it cannot honour on this node and skipped,"
          " as its doctor named them.'"),
+        # Each agent's vault: its secrets, sealed with the agent's own key,
+        # which the store never holds; the agent's row keeps only the key's
+        # fingerprint. A row sealed under another key than the agent's present
+        # one is unreadable, kept until it is set again or removed. Every
+        # change raises the vault's channel version for the agent, so a
+        # process that resolved a secret rereads it.
+        ("0029-vault",
+         "CREATE TABLE capabilities_vault ("
+         " agent_id text NOT NULL CHECK (agent_id <> ''),"
+         " name text NOT NULL CHECK (name ~ '^[A-Za-z_][A-Za-z0-9_]{0,254}$'),"
+         " ciphertext bytea NOT NULL,"
+         " key_fingerprint text NOT NULL CHECK (key_fingerprint ~ '^[0-9a-f]{64}$'),"
+         " updated_at timestamptz NOT NULL DEFAULT now(),"
+         " updated_by text CHECK (updated_by <> ''),"
+         " PRIMARY KEY (agent_id, name));"
+         " ALTER TABLE capabilities_agents ADD COLUMN vault_key text"
+         "  CHECK (vault_key ~ '^[0-9a-f]{64}$');"
+         " CREATE FUNCTION capabilities_vault_announce() RETURNS trigger AS $$"
+         " DECLARE agent text;"
+         " BEGIN"
+         "  IF tg_table_name = 'capabilities_agents' THEN agent := new.id;"
+         "  ELSIF tg_op = 'DELETE' THEN agent := old.agent_id;"
+         "  ELSE agent := new.agent_id; END IF;"
+         "  IF to_regclass(format('%I.schema_channel', tg_table_schema)) IS NOT NULL THEN"
+         "   EXECUTE format('INSERT INTO %I.schema_channel AS c (channel, scope, version)"
+         " VALUES (%L, $1, 1) ON CONFLICT (channel, scope)"
+         " DO UPDATE SET version = c.version + 1',"
+         "                  tg_table_schema, 'capabilities_vault') USING agent;"
+         "  END IF;"
+         "  RETURN NULL;"
+         " END $$ LANGUAGE plpgsql;"
+         " CREATE TRIGGER capabilities_vault_changed"
+         "  AFTER INSERT OR UPDATE OR DELETE ON capabilities_vault"
+         "  FOR EACH ROW EXECUTE FUNCTION capabilities_vault_announce();"
+         " CREATE TRIGGER capabilities_vault_key_changed"
+         "  AFTER UPDATE OF vault_key ON capabilities_agents"
+         "  FOR EACH ROW WHEN (old.vault_key IS DISTINCT FROM new.vault_key)"
+         "  EXECUTE FUNCTION capabilities_vault_announce();"
+         " COMMENT ON TABLE capabilities_vault IS"
+         " 'Each agent''s vault: one row per named secret, sealed with XChaCha20-Poly1305"
+         " under the agent''s own key (AGENT_ENCRYPTION_KEY, kept in the agent''s"
+         " environment and never here), the agent id and the name bound as associated"
+         " data. Written by the capabilities manager''s secrets verbs.';"
+         " COMMENT ON COLUMN capabilities_vault.agent_id IS"
+         " 'The agent the secret is sealed for, as capabilities_agents keys it.';"
+         " COMMENT ON COLUMN capabilities_vault.name IS"
+         " 'The environment variable name the secret answers in the credential cascade.';"
+         " COMMENT ON COLUMN capabilities_vault.ciphertext IS"
+         " 'A format byte, the 24-byte nonce, then the ciphertext with its tag.';"
+         " COMMENT ON COLUMN capabilities_vault.key_fingerprint IS"
+         " 'The fingerprint of the key that sealed the value; a row whose fingerprint is"
+         " not the agent''s vault_key is unreadable.';"
+         " COMMENT ON COLUMN capabilities_agents.vault_key IS"
+         " 'The fingerprint of the agent''s encryption key, never the key; null while"
+         " the agent has none.'"),
     ]
 
 
@@ -2390,13 +2447,36 @@ class StoreRecords(FileRecords):
 
     # -- reading ---------------------------------------------------------------
 
+    def vault_reader(self) -> Any:
+        """This agent's vault as this process reads it, or None where the
+        agent has no key here. A key that is not one is left to the cascade,
+        which names it where a value is resolved."""
+        if not self.project_id:
+            return None
+        try:
+            from capabilities_contract import vault
+            return vault.reader(self.project_root, self.project_id,
+                                application_name=self.application_name)
+        except Exception:
+            return None
+
     def _connection_rows(self, capability: str) -> dict[str, dict[str, Any]]:
         key = ("connection", capability)
         held = self._fresh(key)
         if held is None:
-            rows = self._read(
+            statements: list[tuple[str, Sequence[Any]]] = [(
                 "SELECT name, spec FROM capabilities_connections "
-                "WHERE capability = %s ORDER BY name", (capability,))
+                "WHERE capability = %s ORDER BY name", (capability,))]
+            # The agent's sealed secrets ride in the same round trip, so the
+            # cascade's last tier asks the store nothing more.
+            reader = self.vault_reader()
+            if reader is not None and not reader.loaded:
+                from capabilities_contract import vault
+                statements += vault.round_trip(self.project_id)
+            found = self._read_many(statements)
+            rows = found[0]
+            if len(found) == 3:
+                reader.seed(found[1], found[2])
             held = {name: spec if isinstance(spec, dict) else {} for name, spec in rows}
             self._cache[key] = (time.monotonic(), held)
         return held

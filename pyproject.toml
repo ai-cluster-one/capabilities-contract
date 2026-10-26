@@ -20,7 +20,7 @@ classifiers = [
     "Topic :: Database",
     "Topic :: Software Development :: Libraries",
 ]
-dependencies = ["psycopg[binary]>=3.2,<4"]
+dependencies = ["psycopg[binary]>=3.2,<4", "pynacl>=1.5,<2"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
