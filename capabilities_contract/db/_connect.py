@@ -875,7 +875,10 @@ def connect(*, application_name: str, project_root: Path | str | None = None,
     at once as `store_unreachable` for a pause of between half and all of
     RECONNECT_FIRST_SECONDS, doubling with each failure in a row up to
     RECONNECT_LONGEST_SECONDS, and the first after the pause dials again; the
-    first connect of a process always dials. Both ends send TCP keepalives on a
+    first connect of a process always dials. Each such refusal, and the one of
+    the connect that began the pause, carries the `time.monotonic()` moment the
+    pause ends as `DbError.dials_again_at`, so a caller that asks again waits
+    for that one schedule rather than keeping its own. Both ends send TCP keepalives on a
     session connection; a transaction connection sends them from the client only.
     The client gives either kind up once data it sent has gone unacknowledged for
     TCP_USER_TIMEOUT_MILLISECONDS, which keepalives, never sent meanwhile, cannot
@@ -1001,21 +1004,25 @@ def _paused(key: str) -> None:
                   f"cannot reach the store: {why}".rstrip() +
                   f" (no answer to {failures} connect(s) in a row; not dialled again "
                   f"for {left:.1f}s)",
-                  "check the database setting with `capabilities store doctor`") from why
+                  "check the database setting with `capabilities store doctor`",
+                  dials_again_at=until) from why
 
 
-def _note_connect(key: str, failure: BaseException | None) -> None:
+def _note_connect(key: str, failure: BaseException | None) -> float | None:
     """Record how a connect to `key` ended: a store that did not answer pauses
     the next connects for a doubling, jittered while, at most
-    RECONNECT_LONGEST_SECONDS; one that answered ends the pause."""
+    RECONNECT_LONGEST_SECONDS, and the moment the pause ends is returned; one
+    that answered ends the pause."""
     with _LOCK:
         if failure is None:
             _PAUSED.pop(key, None)
-            return
+            return None
         failures = (_PAUSED.get(key) or (0, 0.0, failure))[0] + 1
         pause = min(RECONNECT_LONGEST_SECONDS,
                     RECONNECT_FIRST_SECONDS * (2 ** min(failures - 1, 16)))
-        _PAUSED[key] = (failures, time.monotonic() + _jittered(pause), failure)
+        until = time.monotonic() + _jittered(pause)
+        _PAUSED[key] = (failures, until, failure)
+        return until
 
 
 def _open_transaction(kwargs: dict, own_address: bool, budget: float) -> Any:
@@ -1043,11 +1050,13 @@ def _open_transaction(kwargs: dict, own_address: bool, budget: float) -> Any:
         conn = _attempts(open_one, budget)
     except psycopg.OperationalError as exc:
         unanswered = isinstance(exc, _unanswered())
+        until = None
         if unanswered or _transient(exc):
-            _note_connect(key, exc)
+            until = _note_connect(key, exc)
         why = str(exc) if unanswered else f"cannot reach the store: {exc}"
         raise DbError("store_unreachable", why,
-                      "check the database setting with `capabilities store doctor`") from exc
+                      "check the database setting with `capabilities store doctor`",
+                      dials_again_at=until) from exc
     _note_connect(key, None)
     conn._opened_with = (kwargs, own_address, budget)
     conn._blocks = []

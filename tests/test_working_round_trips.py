@@ -302,16 +302,20 @@ def test_a_store_that_did_not_answer_is_not_dialled_again_within_the_pause(
     store.write(port=proxy.port)
     monkeypatch.setattr(connect_module, "RECONNECT_FIRST_SECONDS", 1.0)
     proxy.refuse = connect_module.CONNECT_ATTEMPTS
-    # The first connect of the process dials.
-    with pytest.raises(DbError):
+    # The first connect of the process dials, and says when the next one will.
+    with pytest.raises(DbError) as first:
         connect(application_name="down", transaction=True)
     dialled = proxy.accepted
     assert dialled == connect_module.CONNECT_ATTEMPTS
+    (_n, until, _why), = connect_module._PAUSED.values()
+    assert first.value.dials_again_at == until
+    assert 0.5 - 0.05 <= until - time.monotonic() <= 1.0
     began = time.monotonic()
     with pytest.raises(DbError) as caught:
         connect(application_name="down", transaction=True)
     assert caught.value.slug == "store_unreachable"
     assert "not dialled again" in caught.value.message
+    assert caught.value.dials_again_at == until
     assert isinstance(caught.value.__cause__, psycopg.OperationalError)
     assert time.monotonic() - began < 0.2
     assert proxy.accepted == dialled
