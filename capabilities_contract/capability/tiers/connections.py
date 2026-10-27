@@ -63,25 +63,56 @@ def _vault_value(key: str) -> tuple[str | None, str | None]:
     return value, f"vault:{agent}"
 
 
-def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
-    """Resolve one env key through cascade tiers 2-5: project .env(.local) →
-    user config → process env → the agent's vault. Returns (value, tier,
-    source). User config is the capability's credentials.env, after the
-    machine's shared.env for a key a setup field declares shared."""
+# The keys this process resolved from a file, in the order it asked: the ones a
+# file and the agent's vault could both hold (`_vault_conflicts`).
+_FILE_KEYS: dict = {}
+
+
+def _file_values(key: str) -> list:
+    """[(file, value, tier)] for every file of the cascade that holds `key`, in the
+    cascade's order: the project's .env.local and .env, the machine's
+    shared.env under the key's shared name, the capability's credentials.env."""
+    found = []
     root = _project_root()
     if root is not None:
         for fname in (".env.local", ".env"):
             val = _parse_env_file(root / fname).get(key)
             if val:
-                return val, "project", root / fname
+                found.append((root / fname, val, "project"))
     shared = _shared_name(key)
     if shared is not None:
         val = _parse_env_file(_shared_credentials_env()).get(shared)
         if val:
-            return val, "user", _shared_credentials_env()
+            found.append((_shared_credentials_env(), val, "user"))
     val = _parse_env_file(CREDENTIALS_ENV).get(key)
     if val:
-        return val, "user", CREDENTIALS_ENV
+        found.append((CREDENTIALS_ENV, val, "user"))
+    return found
+
+
+def _vault_conflicts() -> list:
+    """[{key, files}] for each key this process resolved from a file where the
+    agent's vault holds another value: the files whose value is not the
+    vault's. A key the vault does not hold, or cannot open, is no conflict."""
+    out = []
+    for key in _FILE_KEYS:
+        held, _where = _vault_value(key)
+        if held is None:
+            continue
+        files = [str(path) for path, val, _tier in _file_values(key) if val != held]
+        if files:
+            out.append({"key": key, "files": files})
+    return out
+
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-5: project .env(.local) →
+    user config → process env → the agent's vault. Returns (value, tier,
+    source). User config is the capability's credentials.env, after the
+    machine's shared.env for a key a setup field declares shared."""
+    for path, val, tier in _file_values(key):
+        _FILE_KEYS.setdefault(key, None)
+        return val, tier, path
     val = os.environ.get(key)
     if val:
         return val, "env", None

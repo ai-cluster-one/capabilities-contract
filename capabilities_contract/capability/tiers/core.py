@@ -2780,14 +2780,75 @@ def _cmd_settings(argv: list[str]) -> None:
     _emit(out)
 
 
+# --- The one question doctor raises -------------------------------------------
+#
+# `doctor` asks the supervisor only where the system cannot know the right
+# answer: a key a file and the agent's vault both hold, with different values,
+# or an update of this capability that failed. It asks in one line on stderr,
+# `{"supervisor": {...}}`, written as the process exits so it follows whatever
+# the capability's own doctor answered, and only when there is something to
+# ask; it changes neither that answer nor the exit code.
+
+UPDATE_FAILED_DIR = ".update-failed"
+
+
+def _update_failed() -> dict | None:
+    """What the manager recorded when its update of this capability failed, or
+    None: `<registry>/.update-failed/<NAME>.json`, which the manager writes when
+    an update of the capability stops and removes when one lands."""
+    registry = Path(os.environ.get("CAPABILITIES_HOME") or (Path.home() / ".capabilities"))
+    try:
+        record = json.loads((registry / UPDATE_FAILED_DIR / f"{NAME}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _supervisor_question() -> dict | None:
+    """The one question doctor raises, or None where there is none."""
+    conflicts = _vault_conflicts() if "_vault_conflicts" in globals() else []
+    failed = _update_failed()
+    if not conflicts and failed is None:
+        return None
+    asks = []
+    for c in conflicts:
+        asks.append(f"{c['key']} holds one value in {', '.join(c['files'])} and another "
+                    f"in the agent's vault; which is right?")
+    if failed is not None:
+        error = failed.get("error") if isinstance(failed.get("error"), dict) else {}
+        why = error.get("message") or error.get("code") or "no reason was recorded"
+        asks.append(f"the last update of {NAME} failed ({why}) and it runs the payload "
+                    f"it had; retry it with `capabilities update {NAME}`?")
+    return {"question": " ".join(asks), "conflicts": conflicts, "update_failed": failed}
+
+
+def _supervisor_line() -> None:
+    try:
+        question = _supervisor_question()
+    except Exception:
+        return
+    if question is not None:
+        sys.stdout.flush()
+        sys.stderr.write(json.dumps({"supervisor": question}, ensure_ascii=False,
+                                    default=str) + "\n")
+        sys.stderr.flush()
+
+
 def _contract(argv: list[str]) -> None:
     """Dispatch the contract verbs; domain verbs fall through to the CLI's own
     parser. Runs after _gate(), before any credential is resolved.
 
     `help` is a contract verb only when bare (no extra args) — the top-level
     dump plus the Identifiers section. `<NAME> help <subcommand>` falls
-    through to the CLI so per-verb help stays clean."""
+    through to the CLI so per-verb help stays clean.
+
+    `doctor` falls through too, with the one question it may raise armed for
+    the process's exit."""
     cmd = argv[0] if argv else ""
+    if cmd == "doctor":
+        import atexit
+        atexit.register(_supervisor_line)
+        return
     if cmd == "stub":
         _emit(f"{SUMMARY} Run `{NAME} help`.")
     elif cmd == "manifest":
