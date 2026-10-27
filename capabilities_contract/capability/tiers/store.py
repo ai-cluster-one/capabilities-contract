@@ -311,6 +311,12 @@ STORE_NODE_SESSIONS_TABLE = "capabilities_node_sessions"
 # session is expected there, over what the node's placed services need.
 STORE_NODE_LOGIN_EXPECTATIONS_TABLE = "capabilities_node_login_expectations"
 STORE_NODE_SESSION_EXPECTATIONS_TABLE = "capabilities_node_session_expectations"
+# Each update run of a node, and the closed set of the states it goes through;
+# a change raises NODE_UPDATE_CHANNEL for the node, so its manager wakes.
+STORE_NODE_UPDATES_TABLE = "capabilities_node_updates"
+NODE_UPDATE_STATES = ("requested", "running", "updated", "current", "rolled_back", "failed")
+NODE_UPDATE_OPEN_STATES = ("requested", "running")
+NODE_UPDATE_CHANNEL = "capabilities_node_update"
 # The tools whose sign-in a node reports for each agent, each a pair of
 # columns, and the closed set of what a tool's own answer can say of it.
 NODE_STATE_TOOLS = ("claude", "codex", "gh")
@@ -319,7 +325,7 @@ NODE_LOGIN_STATES = ("signed_in", "signed_out", "absent", "unknown")
 # again within this many seconds reads as unreachable.
 NODE_STATE_FRESH_SECONDS = 90
 NODE_STATE_TEXT_CHARS = 500
-STORE_TABLES_VERSION = (1, 16)
+STORE_TABLES_VERSION = (1, 17)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -1391,6 +1397,103 @@ def record_table_steps() -> list[tuple[str, str]]:
          " 'When the owner last set it.';"
          " COMMENT ON COLUMN capabilities_node_session_expectations.updated_by IS"
          " 'Who set it, where the writer names itself.'"),
+        # Updates of a node. Its state row says whether a newer manager release,
+        # capability payload or contract library is available and what each
+        # brings, as the node's own manager last checked; the node's regular
+        # state write leaves those columns alone. Beside it, one row per update
+        # run of the node: asked for (requested), taken up (running) and its
+        # outcome. A run is the machine's, as its state row is, so it carries
+        # no project; the store holds at most one requested or running run per
+        # node, and each change raises the node's channel version so the node's
+        # manager takes a request up at once.
+        ("0032-node-updates",
+         "ALTER TABLE capabilities_node_states"
+         " ADD COLUMN update_available boolean,"
+         " ADD COLUMN update_offer jsonb,"
+         " ADD COLUMN update_checked_at timestamptz;"
+         " CREATE TABLE capabilities_node_updates ("
+         " id uuid PRIMARY KEY DEFAULT gen_random_uuid(),"
+         " node text NOT NULL"
+         "  REFERENCES capabilities_nodes (id) ON DELETE CASCADE ON UPDATE CASCADE,"
+         " state text NOT NULL DEFAULT 'requested' CHECK (state IN ('requested', 'running',"
+         "  'updated', 'current', 'rolled_back', 'failed')),"
+         " requested_at timestamptz NOT NULL DEFAULT now(),"
+         " requested_by text CHECK (requested_by <> ''),"
+         " started_at timestamptz,"
+         " finished_at timestamptz,"
+         " reason text CHECK (reason <> ''),"
+         " versions_before jsonb,"
+         " versions_after jsonb,"
+         " doctors jsonb,"
+         " CONSTRAINT capabilities_node_updates_started"
+         "  CHECK ((state = 'requested') = (started_at IS NULL)),"
+         " CONSTRAINT capabilities_node_updates_finished"
+         "  CHECK ((state IN ('requested', 'running')) = (finished_at IS NULL)),"
+         " CONSTRAINT capabilities_node_updates_why"
+         "  CHECK (state NOT IN ('rolled_back', 'failed') OR reason IS NOT NULL));"
+         " CREATE UNIQUE INDEX capabilities_node_updates_one_open"
+         "  ON capabilities_node_updates (node) WHERE state IN ('requested', 'running');"
+         " CREATE INDEX capabilities_node_updates_node"
+         "  ON capabilities_node_updates (node, requested_at DESC);"
+         " CREATE FUNCTION capabilities_node_updates_announce() RETURNS trigger AS $$"
+         " BEGIN"
+         "  IF to_regclass(format('%I.schema_channel', tg_table_schema)) IS NOT NULL THEN"
+         "   EXECUTE format('INSERT INTO %I.schema_channel AS c (channel, scope, version)"
+         " VALUES (%L, $1, 1) ON CONFLICT (channel, scope)"
+         " DO UPDATE SET version = c.version + 1',"
+         "                  tg_table_schema, 'capabilities_node_update') USING new.node;"
+         "  END IF;"
+         "  RETURN NULL;"
+         " END $$ LANGUAGE plpgsql;"
+         " CREATE TRIGGER capabilities_node_updates_changed"
+         "  AFTER INSERT OR UPDATE ON capabilities_node_updates"
+         "  FOR EACH ROW EXECUTE FUNCTION capabilities_node_updates_announce();"
+         " COMMENT ON COLUMN capabilities_node_states.update_available IS"
+         " 'Whether a newer manager release, capability payload or contract library is"
+         " available to the node, as its manager last checked; null until it has.';"
+         " COMMENT ON COLUMN capabilities_node_states.update_offer IS"
+         " 'What the node''s manager found newer at that check, as it reports it: per"
+         " component behind, the installed and available versions and the change-log"
+         " entries newer than installed.';"
+         " COMMENT ON COLUMN capabilities_node_states.update_checked_at IS"
+         " 'The store''s time of the check update_available and update_offer answer.';"
+         " COMMENT ON TABLE capabilities_node_updates IS"
+         " 'One row per update run of a node: asked for by anyone (requested), taken up"
+         " by the node''s own capabilities manager (running), and its outcome. The row"
+         " is the machine''s, as its row in capabilities_nodes is, so it carries no"
+         " project. At most one row per node is requested or running; each change"
+         " raises the version of channel capabilities_node_update for the node in"
+         " schema_channel.';"
+         " COMMENT ON COLUMN capabilities_node_updates.id IS"
+         " 'The run''s id, which the request answers.';"
+         " COMMENT ON COLUMN capabilities_node_updates.node IS"
+         " 'The node''s id in capabilities_nodes.';"
+         " COMMENT ON COLUMN capabilities_node_updates.state IS"
+         " 'requested (asked, not taken up), running, updated (something changed and"
+         " every placed service''s doctor answered), current (nothing to change),"
+         " rolled_back (a step or a doctor failed and the node runs what it ran before)"
+         " or failed (the run stopped, or could not return the node to what it ran"
+         " before).';"
+         " COMMENT ON COLUMN capabilities_node_updates.requested_at IS"
+         " 'When the run was asked for.';"
+         " COMMENT ON COLUMN capabilities_node_updates.requested_by IS"
+         " 'Who asked, where the writer names itself.';"
+         " COMMENT ON COLUMN capabilities_node_updates.started_at IS"
+         " 'When the node''s manager took the run up; null while requested.';"
+         " COMMENT ON COLUMN capabilities_node_updates.finished_at IS"
+         " 'When the run ended; null while requested or running.';"
+         " COMMENT ON COLUMN capabilities_node_updates.reason IS"
+         " 'Why it ended as it did, in words: the step or the doctor that failed, with"
+         " its message; required for rolled_back and failed.';"
+         " COMMENT ON COLUMN capabilities_node_updates.versions_before IS"
+         " 'What the node ran when the run started, as its manager reports it: the"
+         " manager release, each capability payload and each environment''s contract"
+         " library.';"
+         " COMMENT ON COLUMN capabilities_node_updates.versions_after IS"
+         " 'What the node runs when the run ended, in versions_before''s terms.';"
+         " COMMENT ON COLUMN capabilities_node_updates.doctors IS"
+         " 'The answers of the doctors of the services placed on the node, as its"
+         " manager reports them: after the update, and after a rollback.'"),
     ]
 
 
@@ -1448,6 +1551,11 @@ NODE_LOGIN_COLUMNS = tuple(f"{tool}_{part}" for tool in NODE_STATE_TOOLS
 NODE_LOGIN_NEED_COLUMNS = tuple(f"{tool}_needed" for tool in NODE_STATE_TOOLS)
 NODE_SESSION_COLUMNS = ("node", "capability", "connection", "live", "account", "checked_at")
 NODE_EXPECTATION_COLUMNS = ("expected", "updated_at", "updated_by")
+# The node's update availability on its state row, which its regular state
+# write leaves alone, and an update run's row.
+NODE_UPDATE_OFFER_COLUMNS = ("update_available", "update_offer", "update_checked_at")
+NODE_UPDATE_COLUMNS = ("id", "node", "state", "requested_at", "requested_by", "started_at",
+                       "finished_at", "reason", "versions_before", "versions_after", "doctors")
 
 
 def _node_text(value: Any) -> str | None:
@@ -1561,14 +1669,16 @@ def node_agents_prune(conn: Any, node: str, asked: Sequence[str],
 def node_states(conn: Any, nodes: Sequence[str]) -> list[dict[str, Any]]:
     """The state rows of `nodes`, by node, each with `reachable` - whether its
     fresh_until is still ahead of the store's now - and `uptime_seconds`, the
-    store's now less booted_at. A node with no row is not answered."""
+    store's now less booted_at, and the update availability the node last
+    checked (NODE_UPDATE_OFFER_COLUMNS). A node with no row is not answered."""
+    columns = (*NODE_STATE_COLUMNS, *NODE_UPDATE_OFFER_COLUMNS)
     found = conn.execute(
-        f"SELECT node, {', '.join(NODE_STATE_COLUMNS)}, fresh_until > now(),"
+        f"SELECT node, {', '.join(columns)}, fresh_until > now(),"
         " extract(epoch FROM now() - booted_at) FROM capabilities_node_states"
         " WHERE node = ANY (%s) ORDER BY node", (list(nodes),)).fetchall()
     out = []
     for row in found:
-        entry = dict(zip(("node", *NODE_STATE_COLUMNS), row[:-2], strict=True))
+        entry = dict(zip(("node", *columns), row[:-2], strict=True))
         uptime = row[-1]
         entry.update({"reachable": bool(row[-2]),
                       "uptime_seconds": int(uptime) if uptime is not None else None})
@@ -1654,6 +1764,114 @@ def node_expectations(conn: Any, project_id: str,
             f" ORDER BY node, {', '.join(keys)}", (project_id, list(nodes))).fetchall()
         out[kind] = [dict(zip(columns, row, strict=True)) for row in found]
     return out
+
+
+def node_update_offer_put(conn: Any, node: str, *, available: bool,
+                          offer: Any = None) -> dict[str, Any] | None:
+    """Write on `node`'s state row whether an update is available to it and
+    `offer`, what is newer and what it brings, as the producer reports it;
+    `update_checked_at` is the store's now. Nothing else on the row changes.
+    Answers {update_available, update_checked_at}, or None where the node has
+    no state row yet, which writes nothing."""
+    if not isinstance(available, bool):
+        raise StoreError("bad_state", "an update is available or it is not: true or false")
+    row = conn.execute(
+        "UPDATE capabilities_node_states SET update_available = %s,"
+        " update_offer = %s::jsonb, update_checked_at = now() WHERE node = %s"
+        " RETURNING update_available, update_checked_at",
+        (available, None if offer is None else json.dumps(offer, ensure_ascii=False,
+                                                          default=str), node)).fetchone()
+    return {"update_available": row[0], "update_checked_at": row[1]} if row else None
+
+
+def _node_update_row(row: Sequence[Any] | None) -> dict[str, Any] | None:
+    return dict(zip(NODE_UPDATE_COLUMNS, row, strict=True)) if row else None
+
+
+def _node_update_open(conn: Any, node: str) -> dict[str, Any] | None:
+    return _node_update_row(conn.execute(
+        f"SELECT {', '.join(NODE_UPDATE_COLUMNS)} FROM capabilities_node_updates"
+        " WHERE node = %s AND state IN ('requested', 'running')", (node,)).fetchone())
+
+
+def node_update_request(conn: Any, node: str, *, by: str | None = None) -> dict[str, Any]:
+    """Ask `node` to update: a requested row, which the node's manager takes
+    up. Refused with update_pending, naming the open run, where one is
+    already requested or running for the node. Answers the row."""
+    row = conn.execute(
+        "INSERT INTO capabilities_node_updates (node, requested_by) VALUES (%s, %s)"
+        " ON CONFLICT (node) WHERE state IN ('requested', 'running') DO NOTHING"
+        f" RETURNING {', '.join(NODE_UPDATE_COLUMNS)}", (node, _node_text(by))).fetchone()
+    if row is None:
+        open_run = _node_update_open(conn, node) or {}
+        raise StoreError("update_pending",
+                         f"node {node} has an update {open_run.get('state', 'open')} already"
+                         f" ({open_run.get('id')})",
+                         "wait for it to end; `capabilities node state` shows its outcome")
+    return _node_update_row(row)
+
+
+def node_update_claim(conn: Any, node: str, *, by: str | None = None,
+                      interrupted: str = "interrupted: the run that took it up stopped"
+                                         " before it ended") -> dict[str, Any]:
+    """Take up an update run of `node` now, as its own manager: a run left
+    running - by a run that stopped, since the caller holds the node's one run
+    - is closed failed with `interrupted` as its reason first; then the
+    requested run is marked running, or, with none requested, a running row
+    of its own is made. Answers {run, interrupted [ids]}."""
+    closed = [found[0] for found in conn.execute(
+        "UPDATE capabilities_node_updates SET state = 'failed', finished_at = now(),"
+        " reason = %s WHERE node = %s AND state = 'running' RETURNING id",
+        (_node_text(interrupted), node)).fetchall()]
+    row = conn.execute(
+        "UPDATE capabilities_node_updates SET state = 'running', started_at = now()"
+        " WHERE id = (SELECT id FROM capabilities_node_updates WHERE node = %s"
+        "  AND state = 'requested' FOR UPDATE)"
+        f" RETURNING {', '.join(NODE_UPDATE_COLUMNS)}", (node,)).fetchone()
+    if row is None:
+        row = conn.execute(
+            "INSERT INTO capabilities_node_updates (node, state, requested_by, started_at)"
+            " VALUES (%s, 'running', %s, now())"
+            f" RETURNING {', '.join(NODE_UPDATE_COLUMNS)}", (node, _node_text(by))).fetchone()
+    return {"run": _node_update_row(row), "interrupted": closed}
+
+
+def node_update_finish(conn: Any, run_id: Any, *, state: str, reason: str | None = None,
+                       versions_before: Any = None, versions_after: Any = None,
+                       doctors: Any = None) -> dict[str, Any] | None:
+    """End the running update run `run_id` in `state` - updated, current,
+    rolled_back or failed - with its reason in words (required for rolled_back
+    and failed; one line of at most NODE_STATE_TEXT_CHARS characters) and
+    what the producer reports of the versions and the doctors. Answers the
+    row, or None where no such run is running."""
+    if state not in NODE_UPDATE_STATES or state in NODE_UPDATE_OPEN_STATES:
+        raise StoreError("bad_state", f"an update run ends as one of "
+                         f"{', '.join(s for s in NODE_UPDATE_STATES if s not in NODE_UPDATE_OPEN_STATES)}"
+                         f", not {state!r}")
+    reason = _node_text(reason)
+    if state in ("rolled_back", "failed") and not reason:
+        raise StoreError("bad_state", f"a run that ends {state} says why")
+
+    def jsonb(value: Any) -> str | None:
+        return None if value is None else json.dumps(value, ensure_ascii=False, default=str)
+    return _node_update_row(conn.execute(
+        "UPDATE capabilities_node_updates SET state = %s, finished_at = now(), reason = %s,"
+        " versions_before = %s::jsonb, versions_after = %s::jsonb, doctors = %s::jsonb"
+        " WHERE id = %s AND state = 'running'"
+        f" RETURNING {', '.join(NODE_UPDATE_COLUMNS)}",
+        (state, reason, jsonb(versions_before), jsonb(versions_after), jsonb(doctors),
+         str(run_id))).fetchone())
+
+
+def node_updates(conn: Any, nodes: Sequence[str]) -> list[dict[str, Any]]:
+    """The latest update run of each of `nodes`, by node: the open one where
+    there is one, which is always the latest asked. A node with no run is not
+    answered."""
+    found = conn.execute(
+        f"SELECT DISTINCT ON (node) {', '.join(NODE_UPDATE_COLUMNS)}"
+        " FROM capabilities_node_updates WHERE node = ANY (%s)"
+        " ORDER BY node, requested_at DESC, id", (list(nodes),)).fetchall()
+    return [_node_update_row(row) for row in found]
 
 
 def _refuse_record_write(capability: str, collection: str) -> None:

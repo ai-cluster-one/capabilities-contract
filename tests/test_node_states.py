@@ -208,10 +208,9 @@ def test_both_tables_follow_the_registry_id_and_go_with_the_node(nodes):
 
 def test_a_store_at_the_node_states_step_takes_only_the_expectations_step(store):
     steps = store_tier.record_table_steps()
-    assert steps[-1][0] == "0031-node-expectations"
-    assert store_tier.STORE_TABLES_VERSION == (1, 16)
-    _migrate(steps[:-1], 1, 15)
-    result = _migrate(steps, *store_tier.STORE_TABLES_VERSION)
+    at = [step[0] for step in steps].index("0031-node-expectations")
+    _migrate(steps[:at], 1, 15)
+    result = _migrate(steps[:at + 1], 1, 16)
     assert result.applied == ["0031-node-expectations"]
     with _conn() as conn:
         uncommented = conn.execute(
@@ -290,3 +289,113 @@ def test_the_owners_words_follow_the_registry_id_and_go_with_the_node(nodes):
             "SELECT (SELECT count(*) FROM capabilities_node_login_expectations)"
             " + (SELECT count(*) FROM capabilities_node_session_expectations)"
             ).fetchone()[0] == 0
+
+
+def test_a_store_at_the_expectations_step_takes_only_the_updates_step(store):
+    steps = store_tier.record_table_steps()
+    assert steps[-1][0] == "0032-node-updates"
+    assert store_tier.STORE_TABLES_VERSION == (1, 17)
+    _migrate(steps[:-1], 1, 16)
+    result = _migrate(steps, *store_tier.STORE_TABLES_VERSION)
+    assert result.applied == ["0032-node-updates"]
+    with _conn() as conn:
+        [(comment,)] = conn.execute("SELECT obj_description("
+                                    "to_regclass('capabilities_node_updates'))").fetchall()
+        assert comment
+        uncommented = conn.execute(
+            "SELECT a.attrelid::regclass::text, a.attname FROM pg_attribute a"
+            " WHERE a.attrelid = ANY (ARRAY[to_regclass('capabilities_node_updates'),"
+            " to_regclass('capabilities_node_states')])"
+            " AND a.attnum > 0 AND NOT a.attisdropped"
+            " AND col_description(a.attrelid, a.attnum) IS NULL").fetchall()
+        assert uncommented == []
+
+
+def _channel(conn, node: str) -> int:
+    found = conn.execute("SELECT version FROM schema_channel WHERE channel = %s"
+                         " AND scope = %s", (store_tier.NODE_UPDATE_CHANNEL, node)).fetchone()
+    return found[0] if found else 0
+
+
+def test_a_nodes_update_availability_stays_through_its_state_writes(nodes):
+    offer = {"components": [{"kind": "manager", "installed": "a", "available": "b"}]}
+    with _conn() as conn:
+        with conn.transaction():
+            assert store_tier.node_update_offer_put(conn, NODE, available=True,
+                                                    offer=offer) is None
+            store_tier.node_state_put(conn, NODE, cpu_count=2)
+        [row] = store_tier.node_states(conn, [NODE])
+        assert (row["update_available"], row["update_offer"], row["update_checked_at"]) == (
+            None, None, None)
+        with conn.transaction():
+            said = store_tier.node_update_offer_put(conn, NODE, available=True, offer=offer)
+            store_tier.node_state_put(conn, NODE, cpu_count=4)
+        [row] = store_tier.node_states(conn, [NODE])
+        assert (row["cpu_count"], row["update_available"], row["update_offer"]) == (
+            4, True, offer)
+        assert row["update_checked_at"] == said["update_checked_at"]
+        with pytest.raises(store_tier.StoreError):
+            store_tier.node_update_offer_put(conn, NODE, available="yes")
+
+
+def test_an_update_run_is_asked_taken_up_and_ended_one_at_a_time_per_node(nodes):
+    import psycopg
+    with _conn() as conn:
+        start = _channel(conn, NODE)
+        with conn.transaction():
+            asked = store_tier.node_update_request(conn, NODE, by="owner@desk")
+        assert (asked["state"], asked["requested_by"], asked["started_at"]) == (
+            "requested", "owner@desk", None)
+        assert _channel(conn, NODE) == start + 1
+        with pytest.raises(store_tier.StoreError) as refused, conn.transaction():
+            store_tier.node_update_request(conn, NODE)
+        assert refused.value.slug == "update_pending"
+        with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
+            conn.execute("INSERT INTO capabilities_node_updates (node) VALUES (%s)", (NODE,))
+        with conn.transaction():
+            store_tier.node_update_request(conn, OTHER)
+        with conn.transaction():
+            taken = store_tier.node_update_claim(conn, NODE, by="node")
+        assert taken["interrupted"] == [] and taken["run"]["id"] == asked["id"]
+        assert taken["run"]["state"] == "running" and taken["run"]["started_at"]
+        assert _channel(conn, NODE) == start + 2
+        with pytest.raises(store_tier.StoreError), conn.transaction():
+            store_tier.node_update_finish(conn, asked["id"], state="rolled_back")
+        with pytest.raises(store_tier.StoreError), conn.transaction():
+            store_tier.node_update_finish(conn, asked["id"], state="running")
+        with conn.transaction():
+            done = store_tier.node_update_finish(
+                conn, asked["id"], state="rolled_back", reason="doctor of x: red\n",
+                versions_before={"manager": "a"}, versions_after={"manager": "a"},
+                doctors={"after_update": [{"capability": "x", "state": "unusable"}]})
+        assert (done["state"], done["reason"], done["versions_before"]) == (
+            "rolled_back", "doctor of x: red", {"manager": "a"})
+        assert done["finished_at"] is not None
+        with conn.transaction():
+            assert store_tier.node_update_finish(conn, asked["id"], state="updated") is None
+        # With none requested, the node's own run makes its row; a run left
+        # running is closed as interrupted by the next.
+        with conn.transaction():
+            mine = store_tier.node_update_claim(conn, NODE)["run"]
+        assert mine["id"] != asked["id"] and mine["state"] == "running"
+        with conn.transaction():
+            later = store_tier.node_update_claim(conn, NODE)
+        assert later["interrupted"] == [mine["id"]]
+        [last] = store_tier.node_updates(conn, [NODE])
+        assert last["id"] == later["run"]["id"] and last["state"] == "running"
+        [(state, reason)] = conn.execute(
+            "SELECT state, reason FROM capabilities_node_updates WHERE id = %s",
+            (mine["id"],)).fetchall()
+        assert state == "failed" and reason.startswith("interrupted")
+        assert {r["node"] for r in store_tier.node_updates(conn, [NODE, OTHER])} == {
+            NODE, OTHER}
+        # The runs follow the registry's id and go with the node.
+        with conn.transaction():
+            conn.execute("UPDATE capabilities_nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
+                         (NODE,))
+        assert [r["state"] for r in store_tier.node_updates(conn, ["aaaaaaaaaaaa"])] == [
+            "running"]
+        with conn.transaction():
+            conn.execute("DELETE FROM capabilities_nodes WHERE id = 'aaaaaaaaaaaa'")
+        assert conn.execute("SELECT count(*) FROM capabilities_node_updates"
+                            " WHERE node <> %s", (OTHER,)).fetchone()[0] == 0
