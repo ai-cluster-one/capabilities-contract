@@ -2843,9 +2843,13 @@ def _contract(argv: list[str]) -> None:
     through to the CLI so per-verb help stays clean.
 
     `doctor` falls through too, with the one question it may raise armed for
-    the process's exit."""
+    the process's exit, wherever a `--connection <id>` selection stands."""
     cmd = argv[0] if argv else ""
-    if cmd == "doctor":
+    verb, i = cmd, 0
+    while i < len(argv) and (argv[i] == "--connection" or argv[i].startswith("--connection=")):
+        i += 2 if argv[i] == "--connection" else 1
+        verb = argv[i] if i < len(argv) else ""
+    if verb == "doctor":
         import atexit
         atexit.register(_supervisor_line)
         return

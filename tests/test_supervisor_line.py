@@ -96,3 +96,23 @@ def test_doctor_arms_one_line_on_stderr_and_answers_nothing_else(probe, capsys,
     probe["vault"]["PROBE_TOKEN"] = "a"
     probe["_supervisor_line"]()
     assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("argv", [["--connection", "main", "doctor"],
+                                  ["--connection=main", "doctor"],
+                                  ["doctor", "--connection", "main"]])
+def test_doctor_arms_the_line_wherever_the_connection_is_named(probe, monkeypatch, argv):
+    armed = []
+    monkeypatch.setattr("atexit.register", armed.append)
+    probe["_contract"](argv)
+    assert armed == [probe["_supervisor_line"]]
+
+
+@pytest.mark.parametrize("argv", [["service", "doctor"],
+                                  ["--connection", "main", "service", "doctor"],
+                                  ["--connection", "doctor"]])
+def test_only_the_doctor_verb_arms_the_line(probe, monkeypatch, argv):
+    armed = []
+    monkeypatch.setattr("atexit.register", armed.append)
+    probe["_contract"](argv)
+    assert armed == []
