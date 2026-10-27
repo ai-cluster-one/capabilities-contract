@@ -47,12 +47,11 @@ def _conn():
     return connect(application_name="test", transaction=True)
 
 
-def test_a_store_at_the_last_step_takes_only_the_node_states_step(store):
+def test_a_store_at_the_step_before_takes_the_node_states_step(store):
     steps = store_tier.record_table_steps()
-    assert steps[-1][0] == "0030-node-states"
-    assert store_tier.STORE_TABLES_VERSION == (1, 15)
-    _migrate(steps[:-1], 1, 14)
-    result = _migrate(steps, *store_tier.STORE_TABLES_VERSION)
+    at = [step[0] for step in steps].index("0030-node-states")
+    _migrate(steps[:at], 1, 14)
+    result = _migrate(steps[:at + 1], 1, 15)
     assert result.applied == ["0030-node-states"]
     with _conn() as conn:
         for table in ("capabilities_node_states", "capabilities_node_logins",
@@ -205,3 +204,89 @@ def test_both_tables_follow_the_registry_id_and_go_with_the_node(nodes):
                             " + (SELECT count(*) FROM capabilities_node_logins)"
                             " + (SELECT count(*) FROM capabilities_node_sessions)"
                             ).fetchone()[0] == 0
+
+
+def test_a_store_at_the_node_states_step_takes_only_the_expectations_step(store):
+    steps = store_tier.record_table_steps()
+    assert steps[-1][0] == "0031-node-expectations"
+    assert store_tier.STORE_TABLES_VERSION == (1, 16)
+    _migrate(steps[:-1], 1, 15)
+    result = _migrate(steps, *store_tier.STORE_TABLES_VERSION)
+    assert result.applied == ["0031-node-expectations"]
+    with _conn() as conn:
+        uncommented = conn.execute(
+            "SELECT a.attrelid::regclass::text, a.attname FROM pg_attribute a"
+            " WHERE a.attrelid = ANY (ARRAY["
+            " to_regclass('capabilities_node_login_expectations'),"
+            " to_regclass('capabilities_node_session_expectations'),"
+            " to_regclass('capabilities_node_logins')])"
+            " AND a.attnum > 0 AND NOT a.attisdropped"
+            " AND col_description(a.attrelid, a.attnum) IS NULL").fetchall()
+        assert uncommented == []
+
+
+def test_a_sign_in_row_says_what_the_placed_services_need(nodes):
+    with _conn() as conn:
+        with conn.transaction():
+            store_tier.node_logins_put(conn, AGENT, NODE, {}, needed=["claude", "gh"])
+        [row] = store_tier.node_logins(conn, AGENT, [NODE])
+        assert (row["claude_needed"], row["codex_needed"], row["gh_needed"]) == (
+            True, False, True)
+        with conn.transaction():
+            store_tier.node_logins_put(conn, AGENT, NODE, {"gh": ("signed_out", None)})
+        [row] = store_tier.node_logins(conn, AGENT, [NODE])
+        assert (row["gh_login"], row["claude_needed"], row["gh_needed"]) == (
+            "signed_out", True, True)
+        with conn.transaction():
+            store_tier.node_logins_put(conn, AGENT, NODE, {}, needed=[])
+        [row] = store_tier.node_logins(conn, AGENT, [NODE])
+        assert not (row["claude_needed"] or row["codex_needed"] or row["gh_needed"])
+        with pytest.raises(store_tier.StoreError):
+            store_tier.node_logins_put(conn, AGENT, NODE, {}, needed=["stub"])
+
+
+def test_the_owners_word_is_set_changed_and_taken_back_per_agent_and_node(nodes):
+    with _conn() as conn:
+        with conn.transaction():
+            on = store_tier.node_expectation_set(conn, AGENT, NODE, tool="gh",
+                                                 expected=True, by="owner")
+            again = store_tier.node_expectation_set(conn, AGENT, NODE, tool="gh",
+                                                    expected=True)
+            off = store_tier.node_expectation_set(conn, AGENT, NODE, capability="whatsapp",
+                                                  connection="main", expected=False)
+            store_tier.node_expectation_set(conn, PEER, NODE, tool="claude", expected=False)
+        assert (on, again["changed"], off["before"]) == (
+            {"before": None, "after": True, "changed": True}, False, None)
+        mine = store_tier.node_expectations(conn, AGENT, [NODE, OTHER])
+        assert [(r["node"], r["tool"], r["expected"], r["updated_by"])
+                for r in mine["sign_ins"]] == [(NODE, "gh", True, "owner")]
+        assert [(r["capability"], r["connection"], r["expected"])
+                for r in mine["sessions"]] == [("whatsapp", "main", False)]
+        with conn.transaction():
+            back = store_tier.node_expectation_set(conn, AGENT, NODE, tool="gh", expected=None)
+            none = store_tier.node_expectation_set(conn, AGENT, NODE, tool="codex",
+                                                   expected=None)
+        assert (back["before"], back["changed"], none["changed"]) == (True, True, False)
+        assert store_tier.node_expectations(conn, AGENT, [NODE])["sign_ins"] == []
+        for bad in ({"tool": "stub"}, {"tool": "gh", "capability": "whatsapp"},
+                    {"capability": "whatsapp"}):
+            with pytest.raises(store_tier.StoreError):
+                store_tier.node_expectation_set(conn, AGENT, NODE, expected=True, **bad)
+
+
+def test_the_owners_words_follow_the_registry_id_and_go_with_the_node(nodes):
+    with _conn() as conn:
+        with conn.transaction():
+            store_tier.node_expectation_set(conn, AGENT, NODE, tool="gh", expected=True)
+            store_tier.node_expectation_set(conn, AGENT, NODE, capability="telegram",
+                                            connection="main", expected=True)
+            conn.execute("UPDATE capabilities_nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
+                         (NODE,))
+        moved = store_tier.node_expectations(conn, AGENT, ["aaaaaaaaaaaa"])
+        assert [len(moved["sign_ins"]), len(moved["sessions"])] == [1, 1]
+        with conn.transaction():
+            conn.execute("DELETE FROM capabilities_nodes WHERE id = 'aaaaaaaaaaaa'")
+        assert conn.execute(
+            "SELECT (SELECT count(*) FROM capabilities_node_login_expectations)"
+            " + (SELECT count(*) FROM capabilities_node_session_expectations)"
+            ).fetchone()[0] == 0

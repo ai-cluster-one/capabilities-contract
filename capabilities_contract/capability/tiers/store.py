@@ -307,6 +307,10 @@ SERVICE_INSTANCE_TEXT_CHARS = 2000
 STORE_NODE_STATES_TABLE = "capabilities_node_states"
 STORE_NODE_LOGINS_TABLE = "capabilities_node_logins"
 STORE_NODE_SESSIONS_TABLE = "capabilities_node_sessions"
+# The owner's word, per agent and node, on whether a sign-in or a device
+# session is expected there, over what the node's placed services need.
+STORE_NODE_LOGIN_EXPECTATIONS_TABLE = "capabilities_node_login_expectations"
+STORE_NODE_SESSION_EXPECTATIONS_TABLE = "capabilities_node_session_expectations"
 # The tools whose sign-in a node reports for each agent, each a pair of
 # columns, and the closed set of what a tool's own answer can say of it.
 NODE_STATE_TOOLS = ("claude", "codex", "gh")
@@ -315,7 +319,7 @@ NODE_LOGIN_STATES = ("signed_in", "signed_out", "absent", "unknown")
 # again within this many seconds reads as unreachable.
 NODE_STATE_FRESH_SECONDS = 90
 NODE_STATE_TEXT_CHARS = 500
-STORE_TABLES_VERSION = (1, 15)
+STORE_TABLES_VERSION = (1, 16)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -1308,6 +1312,85 @@ def record_table_steps() -> list[tuple[str, str]]:
          " states none.';"
          " COMMENT ON COLUMN capabilities_node_sessions.checked_at IS"
          " 'The store''s time of the write that last asked the capability.'"),
+        # What a node is expected to have. Each agent's sign-in row says which
+        # tools the services it places on that node need, as the node's own
+        # manager derives it from their manifests; beside it, the owner's word
+        # per tool and per device-bound connection, expected on or off, which
+        # stands over what the services need. An override is the owner's, not
+        # the node's: no manager write replaces it, and it goes only with its
+        # node or when the owner takes it back.
+        ("0031-node-expectations",
+         "ALTER TABLE capabilities_node_logins"
+         " ADD COLUMN claude_needed boolean NOT NULL DEFAULT false,"
+         " ADD COLUMN codex_needed boolean NOT NULL DEFAULT false,"
+         " ADD COLUMN gh_needed boolean NOT NULL DEFAULT false;"
+         " CREATE TABLE capabilities_node_login_expectations ("
+         " project_id text NOT NULL CHECK (project_id <> ''),"
+         " node text NOT NULL"
+         "  REFERENCES capabilities_nodes (id) ON DELETE CASCADE ON UPDATE CASCADE,"
+         " tool text NOT NULL CHECK (tool IN ('claude', 'codex', 'gh')),"
+         " expected boolean NOT NULL,"
+         " updated_at timestamptz NOT NULL DEFAULT now(),"
+         " updated_by text CHECK (updated_by <> ''),"
+         " PRIMARY KEY (project_id, node, tool));"
+         " CREATE INDEX capabilities_node_login_expectations_node"
+         "  ON capabilities_node_login_expectations (node);"
+         " CREATE TABLE capabilities_node_session_expectations ("
+         " project_id text NOT NULL CHECK (project_id <> ''),"
+         " node text NOT NULL"
+         "  REFERENCES capabilities_nodes (id) ON DELETE CASCADE ON UPDATE CASCADE,"
+         " capability text NOT NULL CHECK (capability ~ '^[a-z][a-z0-9_-]*$'),"
+         " connection text NOT NULL CHECK (connection <> ''),"
+         " expected boolean NOT NULL,"
+         " updated_at timestamptz NOT NULL DEFAULT now(),"
+         " updated_by text CHECK (updated_by <> ''),"
+         " PRIMARY KEY (project_id, node, capability, connection));"
+         " CREATE INDEX capabilities_node_session_expectations_node"
+         "  ON capabilities_node_session_expectations (node);"
+         " COMMENT ON COLUMN capabilities_node_logins.claude_needed IS"
+         " 'Whether a service the agent places on this node needs Claude Code signed"
+         " in here, as the node''s manager derives it from the services'' manifests.';"
+         " COMMENT ON COLUMN capabilities_node_logins.codex_needed IS"
+         " 'Whether a service the agent places on this node needs Codex signed in"
+         " here, in claude_needed''s terms.';"
+         " COMMENT ON COLUMN capabilities_node_logins.gh_needed IS"
+         " 'Whether a service the agent places on this node needs the GitHub CLI"
+         " signed in here, in claude_needed''s terms.';"
+         " COMMENT ON TABLE capabilities_node_login_expectations IS"
+         " 'The owner''s word on whether a tool''s sign-in is expected for an agent on"
+         " a node, standing over whether its placed services need it. A tool with no"
+         " row is expected where they need it.';"
+         " COMMENT ON COLUMN capabilities_node_login_expectations.project_id IS"
+         " 'The agent whose sign-in it is.';"
+         " COMMENT ON COLUMN capabilities_node_login_expectations.node IS"
+         " 'The node''s id in capabilities_nodes.';"
+         " COMMENT ON COLUMN capabilities_node_login_expectations.tool IS"
+         " 'The tool: claude, codex or gh.';"
+         " COMMENT ON COLUMN capabilities_node_login_expectations.expected IS"
+         " 'Whether the sign-in is expected there: true on, false off.';"
+         " COMMENT ON COLUMN capabilities_node_login_expectations.updated_at IS"
+         " 'When the owner last set it.';"
+         " COMMENT ON COLUMN capabilities_node_login_expectations.updated_by IS"
+         " 'Who set it, where the writer names itself.';"
+         " COMMENT ON TABLE capabilities_node_session_expectations IS"
+         " 'The owner''s word on whether a device-bound connection of an agent is"
+         " expected to hold a live session on a node, standing over whether the agent"
+         " places that capability''s service there. A connection with no row is"
+         " expected where it is placed.';"
+         " COMMENT ON COLUMN capabilities_node_session_expectations.project_id IS"
+         " 'The agent whose connection it is.';"
+         " COMMENT ON COLUMN capabilities_node_session_expectations.node IS"
+         " 'The node''s id in capabilities_nodes.';"
+         " COMMENT ON COLUMN capabilities_node_session_expectations.capability IS"
+         " 'The device-bound capability the connection is of.';"
+         " COMMENT ON COLUMN capabilities_node_session_expectations.connection IS"
+         " 'The connection''s id within that capability.';"
+         " COMMENT ON COLUMN capabilities_node_session_expectations.expected IS"
+         " 'Whether a live session is expected there: true on, false off.';"
+         " COMMENT ON COLUMN capabilities_node_session_expectations.updated_at IS"
+         " 'When the owner last set it.';"
+         " COMMENT ON COLUMN capabilities_node_session_expectations.updated_by IS"
+         " 'Who set it, where the writer names itself.'"),
     ]
 
 
@@ -1362,7 +1445,9 @@ NODE_STATE_COLUMNS = ("load_1", "load_5", "load_15", "cpu_count", "memory_used_b
                       "booted_at", "boot_line", "image_version", "reported_at", "fresh_until")
 NODE_LOGIN_COLUMNS = tuple(f"{tool}_{part}" for tool in NODE_STATE_TOOLS
                            for part in ("login", "account"))
+NODE_LOGIN_NEED_COLUMNS = tuple(f"{tool}_needed" for tool in NODE_STATE_TOOLS)
 NODE_SESSION_COLUMNS = ("node", "capability", "connection", "live", "account", "checked_at")
+NODE_EXPECTATION_COLUMNS = ("expected", "updated_at", "updated_by")
 
 
 def _node_text(value: Any) -> str | None:
@@ -1402,13 +1487,17 @@ def node_state_put(conn: Any, node: str, *, load: Sequence[float] | None = None,
 
 
 def node_logins_put(conn: Any, project_id: str, node: str,
-                    logins: dict[str, tuple[str, str | None]]) -> None:
+                    logins: dict[str, tuple[str, str | None]],
+                    needed: Sequence[str] | None = None) -> None:
     """Write the project's whole row of whether its tools are signed in on
     `node`; `checked_at` is the store's now. `logins` maps each of
     NODE_STATE_TOOLS to (state, account), a tool it leaves out written as
-    unknown; an account is kept only where its tool is signed in."""
+    unknown; an account is kept only where its tool is signed in. `needed`
+    names the tools the services the project places on `node` need signed
+    in there; None leaves what the row says of that as it is, none on a new
+    row."""
     logins = dict(logins or {})
-    unknown = sorted(set(logins) - set(NODE_STATE_TOOLS))
+    unknown = sorted((set(logins) | set(needed or ())) - set(NODE_STATE_TOOLS))
     if unknown:
         raise StoreError("bad_state", f"no sign-in is kept for {', '.join(unknown)}; "
                          f"the tools are {', '.join(NODE_STATE_TOOLS)}")
@@ -1419,12 +1508,15 @@ def node_logins_put(conn: Any, project_id: str, node: str,
             raise StoreError("bad_state", f"{tool} login state {state!r} is not one of "
                              f"{', '.join(NODE_LOGIN_STATES)}")
         values += [state, _node_text(account) if state == "signed_in" else None]
+    columns: tuple[str, ...] = NODE_LOGIN_COLUMNS
+    if needed is not None:
+        values += [tool in needed for tool in NODE_STATE_TOOLS]
+        columns += NODE_LOGIN_NEED_COLUMNS
     conn.execute(
         "INSERT INTO capabilities_node_logins (project_id, node, "
-        f"{', '.join(NODE_LOGIN_COLUMNS)}, checked_at) VALUES (%s, %s, " + ", ".join(["%s"] * len(NODE_LOGIN_COLUMNS))
+        f"{', '.join(columns)}, checked_at) VALUES (%s, %s, " + ", ".join(["%s"] * len(columns))
         + ", now()) ON CONFLICT (project_id, node) DO UPDATE SET "
-        + ", ".join(f"{column} = EXCLUDED.{column}"
-                    for column in (*NODE_LOGIN_COLUMNS, "checked_at")),
+        + ", ".join(f"{column} = EXCLUDED.{column}" for column in (*columns, "checked_at")),
         (project_id, node, *values))
 
 
@@ -1486,9 +1578,9 @@ def node_states(conn: Any, nodes: Sequence[str]) -> list[dict[str, Any]]:
 
 def node_logins(conn: Any, project_id: str, nodes: Sequence[str]) -> list[dict[str, Any]]:
     """The project's sign-ins on `nodes`, by node: whether each of its tools is
-    signed in there and as whom, and when that was asked. A node with no row
-    for the project is not answered."""
-    columns = ("node", *NODE_LOGIN_COLUMNS, "checked_at")
+    signed in there and as whom, whether its placed services need it, and
+    when that was asked. A node with no row for the project is not answered."""
+    columns = ("node", *NODE_LOGIN_COLUMNS, *NODE_LOGIN_NEED_COLUMNS, "checked_at")
     found = conn.execute(
         f"SELECT {', '.join(columns)} FROM capabilities_node_logins"
         " WHERE project_id = %s AND node = ANY (%s) ORDER BY node",
@@ -1503,6 +1595,65 @@ def node_sessions(conn: Any, project_id: str, nodes: Sequence[str]) -> list[dict
         " WHERE project_id = %s AND node = ANY (%s) ORDER BY node, capability, connection",
         (project_id, list(nodes))).fetchall()
     return [dict(zip(NODE_SESSION_COLUMNS, row, strict=True)) for row in found]
+
+
+def node_expectation_set(conn: Any, project_id: str, node: str, *,
+                         tool: str | None = None, capability: str | None = None,
+                         connection: str | None = None, expected: bool | None,
+                         by: str | None = None) -> dict[str, Any]:
+    """Set the owner's word on whether the project's sign-in of `tool`, or the
+    live session of `capability`'s `connection`, is expected on `node`: True
+    on, False off, None to take it back so that what the placed services need
+    decides again. Answers {before, after, changed}, each word True, False or
+    None."""
+    if (tool is None) == (capability is None) or (capability is None) != (connection is None):
+        raise StoreError("bad_state", "an expectation names a tool, or a capability and"
+                         " its connection")
+    if tool is not None and tool not in NODE_STATE_TOOLS:
+        raise StoreError("bad_state", f"no sign-in is kept for {tool}; the tools are"
+                         f" {', '.join(NODE_STATE_TOOLS)}")
+    if expected is not None and not isinstance(expected, bool):
+        raise StoreError("bad_state", "an expectation is true, false or none")
+    if tool is not None:
+        table, keys, key_values = ("capabilities_node_login_expectations", ("tool",), (tool,))
+    else:
+        table, keys, key_values = ("capabilities_node_session_expectations",
+                                   ("capability", "connection"), (capability, connection))
+    where = " AND ".join(f"{column} = %s" for column in ("project_id", "node", *keys))
+    params = (project_id, node, *key_values)
+    row = conn.execute(f"SELECT expected FROM {table} WHERE {where} FOR UPDATE",
+                       params).fetchone()
+    before = row[0] if row else None
+    if expected is None:
+        if row:
+            conn.execute(f"DELETE FROM {table} WHERE {where}", params)
+    elif before != expected:
+        conn.execute(
+            f"INSERT INTO {table} (project_id, node, {', '.join(keys)}, expected, updated_by)"
+            f" VALUES (%s, %s, {', '.join(['%s'] * len(keys))}, %s, %s)"
+            f" ON CONFLICT (project_id, node, {', '.join(keys)}) DO UPDATE SET"
+            " expected = EXCLUDED.expected, updated_at = now(),"
+            " updated_by = EXCLUDED.updated_by",
+            (*params, expected, _node_text(by)))
+    return {"before": before, "after": expected, "changed": before != expected}
+
+
+def node_expectations(conn: Any, project_id: str,
+                      nodes: Sequence[str]) -> dict[str, list[dict[str, Any]]]:
+    """The owner's words for the project on `nodes`: {sign_ins [{node, tool,
+    expected, updated_at, updated_by}], sessions [{node, capability,
+    connection, expected, updated_at, updated_by}]}."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for kind, table, keys in (("sign_ins", "capabilities_node_login_expectations", ("tool",)),
+                              ("sessions", "capabilities_node_session_expectations",
+                               ("capability", "connection"))):
+        columns = ("node", *keys, *NODE_EXPECTATION_COLUMNS)
+        found = conn.execute(
+            f"SELECT {', '.join(columns)} FROM {table}"
+            " WHERE project_id = %s AND node = ANY (%s)"
+            f" ORDER BY node, {', '.join(keys)}", (project_id, list(nodes))).fetchall()
+        out[kind] = [dict(zip(columns, row, strict=True)) for row in found]
+    return out
 
 
 def _refuse_record_write(capability: str, collection: str) -> None:
