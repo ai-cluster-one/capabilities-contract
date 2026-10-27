@@ -3452,7 +3452,9 @@ class AgentRecords(StoreRecords):
 
     Who writes what: the agent's master, and every node its link lets write
     (`may_write`), writes the rows every node shares (node null) and the rows
-    for its own node; a row for another node is the master's alone. While the
+    for its own node; a row for another node is the master's alone. A node
+    that is not the master and already holds its own row for what it writes
+    reads it from that row, so its write lands there. While the
     agent's `migrating_since` is set, only the migration on its master writes.
     A settings document is written in one transaction under its advisory lock:
     assembled, changed, checked whole, then stored as the paths that changed,
@@ -3544,6 +3546,24 @@ class AgentRecords(StoreRecords):
                 f"writes the shared rows and its own, not rows for node {wanted}",
                 f"write it on the master {state.get('master') or '(none registered)'}")
         return wanted
+
+    def _landing(self, conn: Any, scope: str | None, wanted: str | None,
+                 actor: str | None, table: str, agent: str | None, where: str,
+                 params: Sequence[Any] = ()) -> str | None:
+        """The node a write lands on, as `_authority` decides it, except that
+        a node other than the master that already holds its own row of
+        `table` for what is written - the agent's, matching `where` - reads
+        it from that row, so a write naming no node lands there."""
+        at = self._authority(conn, scope, wanted, actor)
+        if at is not None or wanted is not None:
+            return at
+        mine = ((_agent_state(conn, self.project_id) or {}).get("nodes") or {}).get(self.node)
+        if mine is None or mine["is_master"]:
+            return at
+        found = conn.execute(
+            f"SELECT 1 FROM {table} WHERE coalesce(agent_id, '') = coalesce(%s::text, '') "
+            f"AND {where} AND node = %s", (agent, *params, self.node)).fetchone()
+        return self.node if found is not None else at
 
     def _place_node(self, conn: Any, node: str, actor: str | None) -> str:
         """A placement row is written where the registry lets this node write
@@ -3845,36 +3865,10 @@ class AgentRecords(StoreRecords):
         agent = self._agent(scope)
         who = self.actor_name(actor)
 
-        def work(conn: Any) -> dict[str, Any]:
-            node = self._authority(conn, scope, None, actor)
-            self._lock_document(conn, agent, capability, node)
-            if base is not _UNREAD:
-                [(now,)] = conn.execute(
-                    "SELECT max(generation) FROM capabilities_settings_documents "
-                    "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') "
-                    "AND capability = %s AND (node IS NULL OR node = %s)",
-                    (agent, capability, self.node)).fetchall()
-                if (None if now is None else int(now)) != base:
-                    raise StoreError(
-                        "stale_edit",
-                        f"the {scope} settings of {capability} are at generation "
-                        f"{now} now, not {base} as they were when the edit began",
-                        "read them again and apply the change again")
-            old, generation = self._document_rows(conn, agent, capability, node)
-            exists = generation is not None or bool(old)
-            current = (settings_tree(list(old.items())) if exists
-                       else _json_copy(seed or {}) if node is None else {})
-            before = _json_copy(current)
-            after = change(_json_copy(current))
-            if not isinstance(after, dict):
-                raise StoreError("bad_setting", "a settings document is an object")
-            after = _json_copy(after)
-            if check is not None:
-                problems = check(self._as_read(conn, agent, capability, node, after,
-                                               seed)) or []
-                if problems:
-                    raise StoreError("settings_invalid", str(problems[0]))
-            new = settings_leaves(after)
+        def put(conn: Any, node: str | None, old: dict[tuple, Any],
+                new: dict[tuple, Any], generation: int | None) -> tuple[int, int]:
+            """Store one document's paths that differ, removals first, each
+            with a trail row; its generation and how many paths changed."""
             changed = 0
 
             def trail(action: str, path: tuple, was: Any, now: Any) -> int:
@@ -3920,9 +3914,75 @@ class AgentRecords(StoreRecords):
                 "ON CONFLICT ((coalesce(agent_id, '')), capability, (coalesce(node, ''))) "
                 "DO UPDATE SET generation = EXCLUDED.generation",
                 (agent, capability, node, generation or 0))
-            return {"before": before, "after": after, "generation": generation or 0,
-                    "changed": changed, "node": node, "actor": who,
-                    "source": self._table_source("setting")}
+            return generation or 0, changed
+
+        def work(conn: Any) -> dict[str, Any]:
+            # A node holding paths of its own in this document writes those
+            # paths there, and the rest in the shared document.
+            node = self._landing(conn, scope, None, actor, "capabilities_settings",
+                                 agent, "capability = %s", (capability,))
+            self._lock_document(conn, agent, capability, None)
+            if node is not None:
+                self._lock_document(conn, agent, capability, node)
+            if base is not _UNREAD:
+                [(now,)] = conn.execute(
+                    "SELECT max(generation) FROM capabilities_settings_documents "
+                    "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') "
+                    "AND capability = %s AND (node IS NULL OR node = %s)",
+                    (agent, capability, self.node)).fetchall()
+                if (None if now is None else int(now)) != base:
+                    raise StoreError(
+                        "stale_edit",
+                        f"the {scope} settings of {capability} are at generation "
+                        f"{now} now, not {base} as they were when the edit began",
+                        "read them again and apply the change again")
+            shared, generation = self._document_rows(conn, agent, capability, None)
+            exists = generation is not None or bool(shared)
+            current = (settings_tree(list(shared.items())) if exists
+                       else _json_copy(seed or {}))
+            start = settings_leaves(current)
+            mine: dict[tuple, Any] = {}
+            mine_generation = None
+            if node is not None:
+                mine, mine_generation = self._document_rows(conn, agent, capability, node)
+                for path, value in sorted(mine.items()):
+                    _tree_put(current, list(path), value)
+            before = _json_copy(current)
+            after = change(_json_copy(current))
+            if not isinstance(after, dict):
+                raise StoreError("bad_setting", "a settings document is an object")
+            after = _json_copy(after)
+            if check is not None:
+                read = (after if node is not None
+                        else self._as_read(conn, agent, capability, None, after, seed))
+                problems = check(read) or []
+                if problems:
+                    raise StoreError("settings_invalid", str(problems[0]))
+            new = settings_leaves(after)
+
+            def held(path: tuple) -> bool:
+                return any(m[:len(path)] == path or path[:len(m)] == m for m in mine)
+
+            new_mine = {p: v for p, v in new.items() if held(p)}
+            new_shared = {p: v for p, v in new.items() if not held(p)}
+            new_shared.update({p: v for p, v in start.items() if held(p)})
+
+            def same(a: dict, b: dict) -> bool:
+                return a.keys() == b.keys() and all(
+                    _canonical(a[p]) == _canonical(b[p]) for p in a)
+
+            changed = 0
+            mine_moved = node is not None and not same(mine, new_mine)
+            if mine_moved:
+                mine_generation, count = put(conn, node, mine, new_mine, mine_generation)
+                changed += count
+            if node is None or not same(start, new_shared):
+                generation, count = put(conn, None, shared, new_shared, generation)
+                changed += count
+            return {"before": before, "after": after,
+                    "generation": max(generation or 0, mine_generation or 0),
+                    "changed": changed, "node": node if mine_moved else None,
+                    "actor": who, "source": self._table_source("setting")}
         return self._write(work)
 
     def _as_read(self, conn: Any, agent: str | None, capability: str,
@@ -4001,11 +4061,15 @@ class AgentRecords(StoreRecords):
             if value not in (None, "") and cid is None:
                 raise StoreError("bad_default", "the default pointer names a connection id")
             self._write(lambda conn: self._put_default_at(
-                conn, capability, cid, agent, self._authority(conn, scope, None, actor)))
+                conn, capability, cid, agent, self._landing(
+                    conn, scope, None, actor, "capabilities_connection_grants", agent,
+                    "capability = %s AND is_default", (capability,))))
             return None
         if collection == "identifier":
             def work(conn: Any) -> None:
-                at = self._authority(conn, scope, None, actor)
+                at = self._landing(
+                    conn, scope, None, actor, "capabilities_identifiers", agent,
+                    "capability = %s AND label = %s", (capability, key))
                 conn.execute(
                     "INSERT INTO capabilities_identifiers "
                     "(agent_id, capability, node, label, value, note) "
@@ -4025,7 +4089,9 @@ class AgentRecords(StoreRecords):
                                  '{"enabled": true|false}')
             wanted = _node_check(node)
             self._write(lambda conn: _upsert_policy(
-                conn, agent, key, self._authority(conn, scope, wanted, actor),
+                conn, agent, key, self._landing(
+                    conn, scope, wanted, actor, "capabilities_policy", agent,
+                    "capability = %s", (key,)),
                 value["enabled"]))
             return None
         if collection == "connection":
@@ -4054,14 +4120,18 @@ class AgentRecords(StoreRecords):
                                 if added and own and agent is not None else grant)
                 if wanted_grant:
                     fields, wanted = self._grant_value(key, wanted_grant)
-                    self._put_grant_at(conn, capability, key, fields, agent,
-                                       wanted if at is None else at)
+                    if at is None:
+                        at = self._landing(
+                            conn, scope, wanted, actor, "capabilities_connection_grants",
+                            agent, "capability = %s AND connection = %s", (capability, key))
+                    self._put_grant_at(conn, capability, key, fields, agent, at)
             self._write(work)
             return None
         fields, wanted = self._grant_value(key, value)
         self._write(lambda conn: self._put_grant_at(
             conn, capability, key, fields, agent,
-            self._authority(conn, scope, wanted, actor)))
+            self._landing(conn, scope, wanted, actor, "capabilities_connection_grants",
+                          agent, "capability = %s AND connection = %s", (capability, key))))
         return None
 
     def delete(self, capability: str, collection: str, key: str,
@@ -4087,23 +4157,30 @@ class AgentRecords(StoreRecords):
             return True
         if collection == "setting":
             return bool(self._write(lambda conn: self._put_default_at(
-                conn, capability, None, agent, self._authority(conn, scope, None, None))))
+                conn, capability, None, agent, self._landing(
+                    conn, scope, None, None, "capabilities_connection_grants", agent,
+                    "capability = %s AND is_default", (capability,)))))
         wanted = _node_check(node) if collection == "policy" else None
         if collection == "identifier":
             sql = ("DELETE FROM capabilities_identifiers "
                    "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
                    "AND label = %s AND coalesce(node, '') = coalesce(%s::text, '')")
             target = (agent, capability, key)
+            own = ("capabilities_identifiers", "capability = %s AND label = %s",
+                   (capability, key))
         elif collection == "policy":
             sql = ("DELETE FROM capabilities_policy "
                    "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
                    "AND coalesce(node, '') = coalesce(%s::text, '')")
             target = (agent, key)
+            own = ("capabilities_policy", "capability = %s", (key,))
         elif collection == "grant":
             sql = ("DELETE FROM capabilities_connection_grants "
                    "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
                    "AND connection = %s AND coalesce(node, '') = coalesce(%s::text, '')")
             target = (agent, capability, key)
+            own = ("capabilities_connection_grants", "capability = %s AND connection = %s",
+                   (capability, key))
         else:
             def work(conn: Any) -> bool:
                 if self._authority(conn, scope, None, None) is not None:
@@ -4115,7 +4192,8 @@ class AgentRecords(StoreRecords):
                 return self._drop_connection(conn, capability, key, agent)
             return bool(self._write(work))
         return bool(self._write(lambda conn: conn.execute(
-            sql, (*target, self._authority(conn, scope, wanted, None))).rowcount > 0))
+            sql, (*target, self._landing(conn, scope, wanted, None, own[0], agent, own[1],
+                                          own[2]))).rowcount > 0))
 
 
 def _upsert_policy(conn: Any, agent: str | None, capability: str, node: str | None,
