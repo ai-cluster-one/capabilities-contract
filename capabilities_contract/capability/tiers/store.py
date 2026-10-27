@@ -302,11 +302,13 @@ SERVICE_INSTANCE_STATES = ("starting", "ready", "unusable", "degraded", "failing
                            "held", "waiting", "stopping")
 SERVICE_INSTANCE_TEXT_CHARS = 2000
 # What each node says of itself on a short beat: one row per node, shared by
-# every agent on it, and per agent the device-bound sessions it holds there.
+# every agent on it, and per agent the sign-ins its tools hold there and the
+# device-bound sessions it holds there.
 STORE_NODE_STATES_TABLE = "capabilities_node_states"
+STORE_NODE_LOGINS_TABLE = "capabilities_node_logins"
 STORE_NODE_SESSIONS_TABLE = "capabilities_node_sessions"
-# The tools whose sign-in a node reports, each a pair of columns, and the
-# closed set of what a tool's own answer can say of it.
+# The tools whose sign-in a node reports for each agent, each a pair of
+# columns, and the closed set of what a tool's own answer can say of it.
 NODE_STATE_TOOLS = ("claude", "codex", "gh")
 NODE_LOGIN_STATES = ("signed_in", "signed_out", "absent", "unknown")
 # How long a node's row stands for it: a node that has not written its row
@@ -1159,12 +1161,14 @@ def record_table_steps() -> list[tuple[str, str]]:
         # beat: one row per machine, shared by every agent on it as its
         # registry row is, so it carries no project. A node stands for itself
         # until fresh_until, the store's time, and reads as unreachable once
-        # that has passed. Beside it, per agent, whether each device-bound
-        # connection holds a live session on that node; the manager replaces
-        # an agent's set for one capability on each write. Both name the node
-        # through a foreign key to the registry: a row means nothing without
-        # its node, a rekey moves it with the registry's id, and removing the
-        # node removes it.
+        # that has passed. Beside it, per agent, whether its tools are signed
+        # in on that node and whether each device-bound connection holds a
+        # live session there. A sign-in is per agent rather than per machine
+        # because a tool keeps it in the home of the OS user it runs as, and
+        # one machine can hold agents of several OS users, each under its own
+        # manager. All three name the node through a foreign key to the
+        # registry: a row means nothing without its node, a rekey moves it
+        # with the registry's id, and removing the node removes it.
         ("0030-node-states",
          "CREATE TABLE capabilities_node_states ("
          " node text PRIMARY KEY"
@@ -1180,6 +1184,14 @@ def record_table_steps() -> list[tuple[str, str]]:
          " booted_at timestamptz,"
          " boot_line text CHECK (boot_line <> ''),"
          " image_version text CHECK (image_version <> ''),"
+         " reported_at timestamptz NOT NULL DEFAULT now(),"
+         " fresh_until timestamptz NOT NULL,"
+         " CONSTRAINT capabilities_node_states_fresh_after_report"
+         "  CHECK (fresh_until > reported_at));"
+         " CREATE TABLE capabilities_node_logins ("
+         " project_id text NOT NULL CHECK (project_id <> ''),"
+         " node text NOT NULL"
+         "  REFERENCES capabilities_nodes (id) ON DELETE CASCADE ON UPDATE CASCADE,"
          " claude_login text NOT NULL DEFAULT 'unknown'"
          "  CHECK (claude_login IN ('signed_in', 'signed_out', 'absent', 'unknown')),"
          " claude_account text CHECK (claude_account <> ''),"
@@ -1189,14 +1201,14 @@ def record_table_steps() -> list[tuple[str, str]]:
          " gh_login text NOT NULL DEFAULT 'unknown'"
          "  CHECK (gh_login IN ('signed_in', 'signed_out', 'absent', 'unknown')),"
          " gh_account text CHECK (gh_account <> ''),"
-         " reported_at timestamptz NOT NULL DEFAULT now(),"
-         " fresh_until timestamptz NOT NULL,"
-         " CONSTRAINT capabilities_node_states_fresh_after_report"
-         "  CHECK (fresh_until > reported_at),"
-         " CONSTRAINT capabilities_node_states_account_signed_in CHECK"
+         " checked_at timestamptz NOT NULL DEFAULT now(),"
+         " PRIMARY KEY (project_id, node),"
+         " CONSTRAINT capabilities_node_logins_account_signed_in CHECK"
          "  ((claude_account IS NULL OR claude_login = 'signed_in')"
          "   AND (codex_account IS NULL OR codex_login = 'signed_in')"
          "   AND (gh_account IS NULL OR gh_login = 'signed_in')));"
+         " CREATE INDEX capabilities_node_logins_node"
+         "  ON capabilities_node_logins (node);"
          " CREATE TABLE capabilities_node_sessions ("
          " project_id text NOT NULL CHECK (project_id <> ''),"
          " node text NOT NULL"
@@ -1245,29 +1257,41 @@ def record_table_steps() -> list[tuple[str, str]]:
          " null off the image.';"
          " COMMENT ON COLUMN capabilities_node_states.image_version IS"
          " 'The version of the agent-node image the node runs; null off the image.';"
-         " COMMENT ON COLUMN capabilities_node_states.claude_login IS"
-         " 'Whether Claude Code is signed in on this node, as its own status answer"
-         " says: signed_in, signed_out, absent (not installed) or unknown (its answer"
-         " could not be read).';"
-         " COMMENT ON COLUMN capabilities_node_states.claude_account IS"
-         " 'The account Claude Code states it is signed in as; null unless signed in.';"
-         " COMMENT ON COLUMN capabilities_node_states.codex_login IS"
-         " 'Whether Codex is signed in on this node, as its own status answer says,"
-         " in claude_login''s terms.';"
-         " COMMENT ON COLUMN capabilities_node_states.codex_account IS"
-         " 'The account Codex states it is signed in as; null unless signed in and"
-         " where it states none.';"
-         " COMMENT ON COLUMN capabilities_node_states.gh_login IS"
-         " 'Whether the GitHub CLI is signed in to github.com on this node, as its own"
-         " status answer says, in claude_login''s terms.';"
-         " COMMENT ON COLUMN capabilities_node_states.gh_account IS"
-         " 'The github.com login the GitHub CLI is signed in as; null unless signed in.';"
          " COMMENT ON COLUMN capabilities_node_states.reported_at IS"
          " 'The store''s time of the node''s last write of this row.';"
          " COMMENT ON COLUMN capabilities_node_states.fresh_until IS"
          " 'The store''s time until which the row stands for the node: its write time"
          " and the stated interval. Once it has passed, the node reads as"
          " unreachable.';"
+         " COMMENT ON TABLE capabilities_node_logins IS"
+         " 'Per agent, whether Claude Code, Codex and the GitHub CLI are signed in on a"
+         " node and as whom, as each tool answers for the OS user the agent''s folder"
+         " there belongs to. Written by that OS user''s capabilities manager, which"
+         " replaces the agent''s row on each write; a machine with several OS users"
+         " has one manager each, and none writes another''s agents.';"
+         " COMMENT ON COLUMN capabilities_node_logins.project_id IS"
+         " 'The agent whose tools they are.';"
+         " COMMENT ON COLUMN capabilities_node_logins.node IS"
+         " 'The node''s id in capabilities_nodes.';"
+         " COMMENT ON COLUMN capabilities_node_logins.claude_login IS"
+         " 'Whether Claude Code is signed in for this agent on this node, as its own"
+         " status answer there says: signed_in, signed_out, absent (not installed) or"
+         " unknown (its answer could not be read).';"
+         " COMMENT ON COLUMN capabilities_node_logins.claude_account IS"
+         " 'The account Claude Code states it is signed in as; null unless signed in.';"
+         " COMMENT ON COLUMN capabilities_node_logins.codex_login IS"
+         " 'Whether Codex is signed in on this node, as its own status answer says,"
+         " in claude_login''s terms.';"
+         " COMMENT ON COLUMN capabilities_node_logins.codex_account IS"
+         " 'The account Codex states it is signed in as; null unless signed in and"
+         " where it states none.';"
+         " COMMENT ON COLUMN capabilities_node_logins.gh_login IS"
+         " 'Whether the GitHub CLI is signed in to github.com on this node, as its own"
+         " status answer says, in claude_login''s terms.';"
+         " COMMENT ON COLUMN capabilities_node_logins.gh_account IS"
+         " 'The github.com login the GitHub CLI is signed in as; null unless signed in.';"
+         " COMMENT ON COLUMN capabilities_node_logins.checked_at IS"
+         " 'The store''s time of the write that last asked the tools.';"
          " COMMENT ON TABLE capabilities_node_sessions IS"
          " 'Per agent, whether each connection of a device-bound capability holds a"
          " live session on a node, as that capability answers in the agent''s folder"
@@ -1335,10 +1359,9 @@ def service_instance_drop(conn: Any, project_id: str, capability: str, node: str
 
 NODE_STATE_COLUMNS = ("load_1", "load_5", "load_15", "cpu_count", "memory_used_bytes",
                       "memory_limit_bytes", "disk_used_bytes", "disk_total_bytes",
-                      "booted_at", "boot_line", "image_version",
-                      *(f"{tool}_{part}" for tool in NODE_STATE_TOOLS
-                        for part in ("login", "account")),
-                      "reported_at", "fresh_until")
+                      "booted_at", "boot_line", "image_version", "reported_at", "fresh_until")
+NODE_LOGIN_COLUMNS = tuple(f"{tool}_{part}" for tool in NODE_STATE_TOOLS
+                           for part in ("login", "account"))
 NODE_SESSION_COLUMNS = ("node", "capability", "connection", "live", "account", "checked_at")
 
 
@@ -1353,34 +1376,18 @@ def node_state_put(conn: Any, node: str, *, load: Sequence[float] | None = None,
                    disk_used_bytes: int | None = None, disk_total_bytes: int | None = None,
                    booted_at: Any = None, boot_line: str | None = None,
                    image_version: str | None = None,
-                   logins: dict[str, tuple[str, str | None]] | None = None,
                    fresh_seconds: float = NODE_STATE_FRESH_SECONDS) -> dict[str, Any]:
     """Write the whole row of what `node` says of itself now; `reported_at` is
-    the store's now and `fresh_until` that and `fresh_seconds`. `logins` maps
-    each of NODE_STATE_TOOLS to (state, account), a tool it leaves out written
-    as unknown; an account is kept only where its tool is signed in. Text is
-    one line of at most NODE_STATE_TEXT_CHARS characters, and an empty string
-    is written as nothing. Answers {reported_at, fresh_until}."""
-    logins = dict(logins or {})
-    unknown = sorted(set(logins) - set(NODE_STATE_TOOLS))
-    if unknown:
-        raise StoreError("bad_state", f"no node state is kept for {', '.join(unknown)}; "
-                         f"the tools are {', '.join(NODE_STATE_TOOLS)}")
+    the store's now and `fresh_until` that and `fresh_seconds`. Text is one
+    line of at most NODE_STATE_TEXT_CHARS characters, and an empty string is
+    written as nothing. Answers {reported_at, fresh_until}."""
     if not fresh_seconds > 0:
         raise StoreError("bad_state", "a node's state stands for a positive interval")
     loads = list(load) if load is not None else [None, None, None]
     if len(loads) != 3:
         raise StoreError("bad_state", "a node's load is three averages: 1, 5 and 15 minutes")
-    tools: list[Any] = []
-    for tool in NODE_STATE_TOOLS:
-        state, account = logins.get(tool) or ("unknown", None)
-        if state not in NODE_LOGIN_STATES:
-            raise StoreError("bad_state", f"{tool} login state {state!r} is not one of "
-                             f"{', '.join(NODE_LOGIN_STATES)}")
-        tools += [state, _node_text(account) if state == "signed_in" else None]
     values = [*loads, cpu_count, memory_used_bytes, memory_limit_bytes, disk_used_bytes,
-              disk_total_bytes, booted_at, _node_text(boot_line), _node_text(image_version),
-              *tools]
+              disk_total_bytes, booted_at, _node_text(boot_line), _node_text(image_version)]
     written = NODE_STATE_COLUMNS[:-2]
     row = conn.execute(
         f"INSERT INTO capabilities_node_states (node, {', '.join(written)}, reported_at,"
@@ -1392,6 +1399,33 @@ def node_state_put(conn: Any, node: str, *, load: Sequence[float] | None = None,
         + " RETURNING reported_at, fresh_until",
         (node, *values, float(fresh_seconds))).fetchone()
     return {"reported_at": row[0], "fresh_until": row[1]}
+
+
+def node_logins_put(conn: Any, project_id: str, node: str,
+                    logins: dict[str, tuple[str, str | None]]) -> None:
+    """Write the project's whole row of whether its tools are signed in on
+    `node`; `checked_at` is the store's now. `logins` maps each of
+    NODE_STATE_TOOLS to (state, account), a tool it leaves out written as
+    unknown; an account is kept only where its tool is signed in."""
+    logins = dict(logins or {})
+    unknown = sorted(set(logins) - set(NODE_STATE_TOOLS))
+    if unknown:
+        raise StoreError("bad_state", f"no sign-in is kept for {', '.join(unknown)}; "
+                         f"the tools are {', '.join(NODE_STATE_TOOLS)}")
+    values: list[Any] = []
+    for tool in NODE_STATE_TOOLS:
+        state, account = logins.get(tool) or ("unknown", None)
+        if state not in NODE_LOGIN_STATES:
+            raise StoreError("bad_state", f"{tool} login state {state!r} is not one of "
+                             f"{', '.join(NODE_LOGIN_STATES)}")
+        values += [state, _node_text(account) if state == "signed_in" else None]
+    conn.execute(
+        "INSERT INTO capabilities_node_logins (project_id, node, "
+        f"{', '.join(NODE_LOGIN_COLUMNS)}, checked_at) VALUES (%s, %s, " + ", ".join(["%s"] * len(NODE_LOGIN_COLUMNS))
+        + ", now()) ON CONFLICT (project_id, node) DO UPDATE SET "
+        + ", ".join(f"{column} = EXCLUDED.{column}"
+                    for column in (*NODE_LOGIN_COLUMNS, "checked_at")),
+        (project_id, node, *values))
 
 
 def node_sessions_put(conn: Any, project_id: str, node: str, capability: str,
@@ -1409,18 +1443,27 @@ def node_sessions_put(conn: Any, project_id: str, node: str, capability: str,
                       _node_text(account)))
 
 
-def node_sessions_prune(conn: Any, node: str,
-                        kept: Sequence[tuple[str, str]]) -> int:
-    """Delete the sessions on `node` of every (project, capability) not in
-    `kept`: an agent gone from the node, a capability no longer installed or
-    no longer device-bound. Answers how many rows went."""
+def node_agents_prune(conn: Any, node: str, asked: Sequence[str],
+                      kept: Sequence[tuple[str, str]]) -> int:
+    """Delete on `node` the sessions of each project in `asked` whose
+    (project, capability) is not in `kept` - a capability no longer installed
+    or no longer device-bound - and the sessions and sign-ins of every project
+    no longer linked to the node. A project linked to the node but not asked
+    is another manager's on the same machine and keeps its rows. Answers how
+    many rows went."""
     projects = [project for project, _capability in kept]
     capabilities = [capability for _project, capability in kept]
-    return conn.execute(
-        "DELETE FROM capabilities_node_sessions s WHERE s.node = %s AND NOT EXISTS"
-        " (SELECT 1 FROM unnest(%s::text[], %s::text[]) AS k (project_id, capability)"
-        "  WHERE k.project_id = s.project_id AND k.capability = s.capability)",
-        (node, projects, capabilities)).rowcount
+    unlinked = (" NOT EXISTS (SELECT 1 FROM capabilities_agent_nodes l"
+                "  WHERE l.agent_id = t.project_id AND l.node = t.node)")
+    gone = conn.execute(
+        "DELETE FROM capabilities_node_sessions t WHERE t.node = %s AND ((t.project_id = ANY (%s)"
+        " AND NOT EXISTS (SELECT 1 FROM unnest(%s::text[], %s::text[]) AS k (project_id,"
+        " capability) WHERE k.project_id = t.project_id AND k.capability = t.capability))"
+        " OR" + unlinked + ")",
+        (node, list(asked), projects, capabilities)).rowcount
+    return gone + conn.execute(
+        "DELETE FROM capabilities_node_logins t WHERE t.node = %s AND" + unlinked,
+        (node,)).rowcount
 
 
 def node_states(conn: Any, nodes: Sequence[str]) -> list[dict[str, Any]]:
@@ -1439,6 +1482,18 @@ def node_states(conn: Any, nodes: Sequence[str]) -> list[dict[str, Any]]:
                       "uptime_seconds": int(uptime) if uptime is not None else None})
         out.append(entry)
     return out
+
+
+def node_logins(conn: Any, project_id: str, nodes: Sequence[str]) -> list[dict[str, Any]]:
+    """The project's sign-ins on `nodes`, by node: whether each of its tools is
+    signed in there and as whom, and when that was asked. A node with no row
+    for the project is not answered."""
+    columns = ("node", *NODE_LOGIN_COLUMNS, "checked_at")
+    found = conn.execute(
+        f"SELECT {', '.join(columns)} FROM capabilities_node_logins"
+        " WHERE project_id = %s AND node = ANY (%s) ORDER BY node",
+        (project_id, list(nodes))).fetchall()
+    return [dict(zip(columns, row, strict=True)) for row in found]
 
 
 def node_sessions(conn: Any, project_id: str, nodes: Sequence[str]) -> list[dict[str, Any]]:
