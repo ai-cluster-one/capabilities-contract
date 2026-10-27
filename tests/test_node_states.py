@@ -1,0 +1,161 @@
+"""Each node's state row and its agents' device-bound sessions: ledger step
+0030-node-states and the store tier's helpers that write and read them."""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from capabilities_contract.capability import store as store_tier
+from capabilities_contract.db import connect, disconnect, migrate
+
+NODE = "0a0b0c0d0e0f"
+OTHER = "0f0e0d0c0b0a"
+AGENT = "prj_000000000001"
+
+
+def _migrate(steps, major, minor):
+    with connect(application_name="setup", transaction=True) as conn:
+        result = migrate(conn, store_tier.STORE_OWNER, steps, major=major, minor=minor)
+        conn.commit()
+    disconnect()
+    return result
+
+
+@pytest.fixture()
+def nodes(store):
+    major, minor = store_tier.STORE_TABLES_VERSION
+    _migrate(store_tier.record_table_steps(), major, minor)
+    with connect(application_name="setup", transaction=True) as conn, conn.transaction():
+        for node in (NODE, OTHER):
+            conn.execute("INSERT INTO capabilities_nodes (id, label, kind)"
+                         " VALUES (%s, %s, 'server')", (node, node))
+    disconnect()
+    return store
+
+
+def _conn():
+    return connect(application_name="test", transaction=True)
+
+
+def test_a_store_at_the_last_step_takes_only_the_node_states_step(store):
+    steps = store_tier.record_table_steps()
+    assert steps[-1][0] == "0030-node-states"
+    assert store_tier.STORE_TABLES_VERSION == (1, 15)
+    _migrate(steps[:-1], 1, 14)
+    result = _migrate(steps, *store_tier.STORE_TABLES_VERSION)
+    assert result.applied == ["0030-node-states"]
+    with _conn() as conn:
+        for table in ("capabilities_node_states", "capabilities_node_sessions"):
+            [(comment,)] = conn.execute("SELECT obj_description(to_regclass(%s))",
+                                        (table,)).fetchall()
+            assert comment
+        uncommented = conn.execute(
+            "SELECT a.attname FROM pg_attribute a WHERE a.attrelid ="
+            " to_regclass('capabilities_node_states') AND a.attnum > 0"
+            " AND col_description(a.attrelid, a.attnum) IS NULL").fetchall()
+        assert uncommented == []
+
+
+def test_a_node_writes_its_whole_row_and_reads_reachable_until_it_goes_stale(nodes):
+    with _conn() as conn:
+        with conn.transaction():
+            first = store_tier.node_state_put(
+                conn, NODE, load=(0.5, 0.25, 0.125), cpu_count=4,
+                memory_used_bytes=1 << 30, memory_limit_bytes=3 << 30,
+                disk_used_bytes=10 << 30, disk_total_bytes=70 << 30,
+                booted_at="2026-10-27T00:00:00+00:00", boot_line="running agent x\n",
+                image_version="0.0.12",
+                logins={"claude": ("signed_in", "someone@example.test"),
+                        "codex": ("signed_out", "ignored"), "gh": ("absent", None)})
+        assert (first["fresh_until"] - first["reported_at"]).total_seconds() == \
+            store_tier.NODE_STATE_FRESH_SECONDS
+        [row] = store_tier.node_states(conn, [NODE, OTHER])
+    assert row["node"] == NODE and row["reachable"] is True
+    assert (row["load_1"], row["load_15"], row["cpu_count"]) == (0.5, 0.125, 4)
+    assert (row["memory_limit_bytes"], row["disk_total_bytes"]) == (3 << 30, 70 << 30)
+    assert row["boot_line"] == "running agent x" and row["image_version"] == "0.0.12"
+    assert (row["claude_login"], row["claude_account"]) == ("signed_in", "someone@example.test")
+    assert (row["codex_login"], row["codex_account"]) == ("signed_out", None)
+    assert (row["gh_login"], row["gh_account"]) == ("absent", None)
+    assert row["uptime_seconds"] > 0
+
+    # A write replaces the row whole; a tool it leaves out is unknown.
+    with _conn() as conn:
+        with conn.transaction():
+            store_tier.node_state_put(conn, NODE, cpu_count=2, fresh_seconds=0.5)
+        time.sleep(1.0)
+        [row] = store_tier.node_states(conn, [NODE])
+        count = conn.execute("SELECT count(*) FROM capabilities_node_states").fetchone()[0]
+    assert count == 1
+    assert (row["cpu_count"], row["load_1"], row["boot_line"]) == (2, None, None)
+    assert (row["claude_login"], row["claude_account"]) == ("unknown", None)
+    assert row["reachable"] is False
+
+
+def test_the_helper_and_the_store_refuse_what_the_row_cannot_say(nodes):
+    with _conn() as conn:
+        for bad in ({"logins": {"claude": ("logged_in", None)}},
+                    {"logins": {"vim": ("signed_in", None)}},
+                    {"load": (1.0, 2.0)}, {"fresh_seconds": 0}):
+            with pytest.raises(store_tier.StoreError) as raised:
+                store_tier.node_state_put(conn, NODE, **bad)
+            assert raised.value.slug == "bad_state"
+    import psycopg
+    for column, value in (("claude_login", "logged_in"), ("gh_login", ""),
+                          ("load_1", -1), ("cpu_count", 0), ("memory_limit_bytes", 0),
+                          ("boot_line", ""), ("image_version", ""),
+                          ("codex_account", "x")):
+        with _conn() as conn, pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(f"INSERT INTO capabilities_node_states (node, fresh_until, {column})"
+                         " VALUES (%s, now() + interval '1 minute', %s)", (NODE, value))
+    with _conn() as conn, pytest.raises(psycopg.errors.CheckViolation):
+        conn.execute("INSERT INTO capabilities_node_states (node, fresh_until)"
+                     " VALUES (%s, now() - interval '1 second')", (NODE,))
+    with _conn() as conn, pytest.raises(psycopg.errors.ForeignKeyViolation):
+        conn.execute("INSERT INTO capabilities_node_states (node, fresh_until)"
+                     " VALUES ('nowhere', now() + interval '1 minute')")
+    with _conn() as conn, pytest.raises(psycopg.errors.CheckViolation):
+        conn.execute("INSERT INTO capabilities_node_sessions (project_id, node, capability,"
+                     " connection, live) VALUES ('', %s, 'whatsapp', 'main', true)", (NODE,))
+
+
+def test_a_write_replaces_one_capabilitys_sessions_and_a_prune_drops_the_rest(nodes):
+    with _conn() as conn:
+        with conn.transaction():
+            store_tier.node_sessions_put(conn, AGENT, NODE, "whatsapp",
+                                         [("main", True, "+10000000000"), ("spare", False, None)])
+            store_tier.node_sessions_put(conn, AGENT, NODE, "telegram", [("main", True, None)])
+            store_tier.node_sessions_put(conn, "prj_000000000002", NODE, "whatsapp",
+                                         [("main", False, None)])
+        rows = store_tier.node_sessions(conn, AGENT, [NODE])
+    assert [(r["capability"], r["connection"], r["live"], r["account"]) for r in rows] == [
+        ("telegram", "main", True, None), ("whatsapp", "main", True, "+10000000000"),
+        ("whatsapp", "spare", False, None)]
+    with _conn() as conn:
+        with conn.transaction():
+            store_tier.node_sessions_put(conn, AGENT, NODE, "whatsapp", [("main", False, None)])
+            gone = store_tier.node_sessions_prune(conn, NODE, [(AGENT, "whatsapp")])
+        assert gone == 2  # this agent's telegram, and the other agent's whatsapp
+        rows = store_tier.node_sessions(conn, AGENT, [NODE, OTHER])
+    assert [(r["capability"], r["connection"], r["live"]) for r in rows] == [
+        ("whatsapp", "main", False)]
+
+
+def test_both_tables_follow_the_registry_id_and_go_with_the_node(nodes):
+    with _conn() as conn:
+        with conn.transaction():
+            store_tier.node_state_put(conn, NODE, cpu_count=1)
+            store_tier.node_sessions_put(conn, AGENT, NODE, "whatsapp", [("main", True, None)])
+            conn.execute("UPDATE capabilities_nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
+                         (NODE,))
+        assert [r["node"] for r in store_tier.node_states(conn, ["aaaaaaaaaaaa"])] == [
+            "aaaaaaaaaaaa"]
+        assert [r["node"] for r in store_tier.node_sessions(conn, AGENT, ["aaaaaaaaaaaa"])] \
+            == ["aaaaaaaaaaaa"]
+        with conn.transaction():
+            conn.execute("DELETE FROM capabilities_nodes WHERE id = 'aaaaaaaaaaaa'")
+        assert conn.execute("SELECT (SELECT count(*) FROM capabilities_node_states)"
+                            " + (SELECT count(*) FROM capabilities_node_sessions)"
+                            ).fetchone()[0] == 0
