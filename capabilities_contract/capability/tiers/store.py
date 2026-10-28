@@ -325,7 +325,16 @@ NODE_LOGIN_STATES = ("signed_in", "signed_out", "absent", "unknown")
 # again within this many seconds reads as unreachable.
 NODE_STATE_FRESH_SECONDS = 90
 NODE_STATE_TEXT_CHARS = 500
-STORE_TABLES_VERSION = (1, 17)
+# The last lines each process a node's manager runs printed - the node manager
+# itself, and each placed service's supervisor with what its service wrote to
+# stderr - per agent: at most NODE_LOG_LINES of a source, each cut to
+# NODE_LOG_LINE_CHARS, with what reads as a secret masked before it is written.
+STORE_NODE_LOGS_TABLE = "capabilities_node_logs"
+NODE_LOG_MANAGER = "manager"
+NODE_LOG_LINES = 100
+NODE_LOG_LINE_CHARS = 500
+NODE_LOG_MASK = "***"
+STORE_TABLES_VERSION = (1, 18)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -1494,6 +1503,43 @@ def record_table_steps() -> list[tuple[str, str]]:
          " COMMENT ON COLUMN capabilities_node_updates.doctors IS"
          " 'The answers of the doctors of the services placed on the node, as its"
          " manager reports them: after the update, and after a rollback.'"),
+        # What a node's log says lately, so it can be read without reaching the
+        # machine: per agent and source - the node's manager, or one service it
+        # places there - the last lines that process printed, bounded and with
+        # what reads as a secret masked by the store tier's one writer. Per
+        # agent, as a sign-in is, because a machine can run a manager under
+        # each of several OS users; a row outlives the process that wrote it,
+        # so the last words of a stopped service stay readable, and goes when
+        # the service is no longer placed on the node or the agent is no
+        # longer linked to it, or with the node.
+        ("0033-node-logs",
+         "CREATE TABLE capabilities_node_logs ("
+         " project_id text NOT NULL CHECK (project_id <> ''),"
+         " node text NOT NULL"
+         "  REFERENCES capabilities_nodes (id) ON DELETE CASCADE ON UPDATE CASCADE,"
+         " source text NOT NULL CHECK (source ~ '^[a-z][a-z0-9_-]*$'),"
+         " lines text[] NOT NULL DEFAULT '{}'"
+         "  CHECK (cardinality(lines) <= 100),"
+         " captured_at timestamptz NOT NULL DEFAULT now(),"
+         " PRIMARY KEY (project_id, node, source));"
+         " CREATE INDEX capabilities_node_logs_node ON capabilities_node_logs (node);"
+         " COMMENT ON TABLE capabilities_node_logs IS"
+         " 'Per agent, the last lines each process its node''s capabilities manager"
+         " runs there printed: the manager itself and each placed service''s"
+         " supervisor, with what the service wrote to stderr. Written by those"
+         " processes through the store tier, which keeps at most 100 lines of"
+         " at most 500 characters each and masks what reads as a secret.';"
+         " COMMENT ON COLUMN capabilities_node_logs.project_id IS"
+         " 'The agent the process runs for.';"
+         " COMMENT ON COLUMN capabilities_node_logs.node IS"
+         " 'The node''s id in capabilities_nodes.';"
+         " COMMENT ON COLUMN capabilities_node_logs.source IS"
+         " 'manager for the node''s manager (node run), else the capability whose"
+         " service the lines are of.';"
+         " COMMENT ON COLUMN capabilities_node_logs.lines IS"
+         " 'The source''s last lines, oldest first.';"
+         " COMMENT ON COLUMN capabilities_node_logs.captured_at IS"
+         " 'The store''s time of the write that last replaced the lines.'"),
     ]
 
 
@@ -1556,6 +1602,7 @@ NODE_EXPECTATION_COLUMNS = ("expected", "updated_at", "updated_by")
 NODE_UPDATE_OFFER_COLUMNS = ("update_available", "update_offer", "update_checked_at")
 NODE_UPDATE_COLUMNS = ("id", "node", "state", "requested_at", "requested_by", "started_at",
                        "finished_at", "reason", "versions_before", "versions_after", "doctors")
+NODE_LOG_COLUMNS = ("node", "source", "lines", "captured_at")
 
 
 def _node_text(value: Any) -> str | None:
@@ -1647,8 +1694,8 @@ def node_agents_prune(conn: Any, node: str, asked: Sequence[str],
                       kept: Sequence[tuple[str, str]]) -> int:
     """Delete on `node` the sessions of each project in `asked` whose
     (project, capability) is not in `kept` - a capability no longer installed
-    or no longer device-bound - and the sessions and sign-ins of every project
-    no longer linked to the node. A project linked to the node but not asked
+    or no longer device-bound - and the sessions, sign-ins and log lines of
+    every project no longer linked to the node. A project linked to the node but not asked
     is another manager's on the same machine and keeps its rows. Answers how
     many rows went."""
     projects = [project for project, _capability in kept]
@@ -1661,9 +1708,10 @@ def node_agents_prune(conn: Any, node: str, asked: Sequence[str],
         " capability) WHERE k.project_id = t.project_id AND k.capability = t.capability))"
         " OR" + unlinked + ")",
         (node, list(asked), projects, capabilities)).rowcount
-    return gone + conn.execute(
-        "DELETE FROM capabilities_node_logins t WHERE t.node = %s AND" + unlinked,
-        (node,)).rowcount
+    for table in ("capabilities_node_logins", "capabilities_node_logs"):
+        gone += conn.execute(f"DELETE FROM {table} t WHERE t.node = %s AND" + unlinked,
+                             (node,)).rowcount
+    return gone
 
 
 def node_states(conn: Any, nodes: Sequence[str]) -> list[dict[str, Any]]:
@@ -1705,6 +1753,76 @@ def node_sessions(conn: Any, project_id: str, nodes: Sequence[str]) -> list[dict
         " WHERE project_id = %s AND node = ANY (%s) ORDER BY node, capability, connection",
         (project_id, list(nodes))).fetchall()
     return [dict(zip(NODE_SESSION_COLUMNS, row, strict=True)) for row in found]
+
+
+# What reads as a secret in a log line, each with what replaces it: a
+# credential in a URL, a bearer or basic authorization, a value given to a key
+# whose name says it is secret, a private key, and the shapes of the tokens
+# and keys the package's systems issue.
+_NODE_LOG_SECRET_PATTERNS = (
+    (re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://[^\s:/@]*:)[^\s@/]+@"), r"\1***@"),
+    (re.compile(r"(?i)(\b(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]{8,}"), r"\1***"),
+    (re.compile(r"(?i)([a-z0-9_.-]*(?:pass(?:word|wd)?|secret|token|api[_-]?key"
+                r"|access[_-]?key|private[_-]?key|credential|cookie|authorization|dsn)"
+                r"[a-z0-9_.-]*[\"']?\s*[:=]\s*[\"']?)[^\s\"',;&]+"), r"\1***"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)"),
+     "***"),
+    (re.compile(r"\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}"
+                r"|github_pat_[A-Za-z0-9_]{20,}|xox[abposre]-[A-Za-z0-9-]{10,}"
+                r"|xapp-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}"
+                r"|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})"), "***"),
+)
+
+
+def node_log_mask(line: str, secrets: Sequence[str] = ()) -> str:
+    """`line` with each of `secrets`, and whatever reads as a secret
+    (_NODE_LOG_SECRET_PATTERNS), replaced by NODE_LOG_MASK."""
+    for secret in sorted({s for s in secrets if s and len(s) >= 4}, key=len, reverse=True):
+        line = line.replace(secret, NODE_LOG_MASK)
+    for pattern, replacement in _NODE_LOG_SECRET_PATTERNS:
+        line = pattern.sub(replacement, line)
+    return line
+
+
+def node_log_put(conn: Any, project_id: str, node: str, source: str,
+                 lines: Sequence[str], *, secrets: Sequence[str] = ()) -> dict[str, Any]:
+    """Replace the project's last log lines of `source` on `node` - the node's
+    manager (NODE_LOG_MANAGER) or a capability whose service runs there - with
+    the last NODE_LOG_LINES of `lines`, oldest first. Each is kept as one line
+    with every one of `secrets`, and whatever reads as a secret, masked, then
+    cut to NODE_LOG_LINE_CHARS characters; `captured_at` is the store's now.
+    Answers {lines, captured_at}."""
+    if not isinstance(source, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", source):
+        raise StoreError("bad_state", f"a node's log source is {NODE_LOG_MANAGER} or a"
+                         f" capability's name, not {source!r}")
+    kept = []
+    for line in list(lines)[-NODE_LOG_LINES:]:
+        line = " ".join(str(line).replace("\x00", "").splitlines()).rstrip()
+        kept.append(node_log_mask(line, secrets)[:NODE_LOG_LINE_CHARS])
+    row = conn.execute(
+        "INSERT INTO capabilities_node_logs (project_id, node, source, lines)"
+        " VALUES (%s, %s, %s, %s) ON CONFLICT (project_id, node, source) DO UPDATE SET"
+        " lines = EXCLUDED.lines, captured_at = now() RETURNING captured_at",
+        (project_id, node, source, kept)).fetchone()
+    return {"lines": len(kept), "captured_at": row[0]}
+
+
+def node_logs_prune(conn: Any, project_id: str, node: str, sources: Sequence[str]) -> int:
+    """Delete the project's log lines on `node` of every source not in
+    `sources`: a service no longer placed there. Answers how many rows went."""
+    return conn.execute(
+        "DELETE FROM capabilities_node_logs WHERE project_id = %s AND node = %s"
+        " AND NOT (source = ANY (%s))", (project_id, node, list(sources))).rowcount
+
+
+def node_logs(conn: Any, project_id: str, nodes: Sequence[str]) -> list[dict[str, Any]]:
+    """The project's last log lines on `nodes`, by node and source:
+    {node, source, lines, captured_at}."""
+    found = conn.execute(
+        f"SELECT {', '.join(NODE_LOG_COLUMNS)} FROM capabilities_node_logs"
+        " WHERE project_id = %s AND node = ANY (%s) ORDER BY node, source",
+        (project_id, list(nodes))).fetchall()
+    return [dict(zip(NODE_LOG_COLUMNS, row, strict=True)) for row in found]
 
 
 def node_expectation_set(conn: Any, project_id: str, node: str, *,

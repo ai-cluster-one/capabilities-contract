@@ -293,10 +293,9 @@ def test_the_owners_words_follow_the_registry_id_and_go_with_the_node(nodes):
 
 def test_a_store_at_the_expectations_step_takes_only_the_updates_step(store):
     steps = store_tier.record_table_steps()
-    assert steps[-1][0] == "0032-node-updates"
-    assert store_tier.STORE_TABLES_VERSION == (1, 17)
-    _migrate(steps[:-1], 1, 16)
-    result = _migrate(steps, *store_tier.STORE_TABLES_VERSION)
+    at = [step[0] for step in steps].index("0032-node-updates")
+    _migrate(steps[:at], 1, 16)
+    result = _migrate(steps[:at + 1], 1, 17)
     assert result.applied == ["0032-node-updates"]
     with _conn() as conn:
         [(comment,)] = conn.execute("SELECT obj_description("
@@ -399,3 +398,86 @@ def test_an_update_run_is_asked_taken_up_and_ended_one_at_a_time_per_node(nodes)
             conn.execute("DELETE FROM capabilities_nodes WHERE id = 'aaaaaaaaaaaa'")
         assert conn.execute("SELECT count(*) FROM capabilities_node_updates"
                             " WHERE node <> %s", (OTHER,)).fetchone()[0] == 0
+
+
+def test_a_store_at_the_updates_step_takes_only_the_logs_step(store):
+    steps = store_tier.record_table_steps()
+    assert steps[-1][0] == "0033-node-logs"
+    assert store_tier.STORE_TABLES_VERSION == (1, 18)
+    _migrate(steps[:-1], 1, 17)
+    result = _migrate(steps, *store_tier.STORE_TABLES_VERSION)
+    assert result.applied == ["0033-node-logs"]
+    with _conn() as conn:
+        [(comment,)] = conn.execute("SELECT obj_description("
+                                    "to_regclass('capabilities_node_logs'))").fetchall()
+        assert comment
+        uncommented = conn.execute(
+            "SELECT a.attname FROM pg_attribute a"
+            " WHERE a.attrelid = to_regclass('capabilities_node_logs')"
+            " AND a.attnum > 0 AND NOT a.attisdropped"
+            " AND col_description(a.attrelid, a.attnum) IS NULL").fetchall()
+        assert uncommented == []
+
+
+def test_a_sources_last_lines_are_kept_bounded_and_without_secrets(nodes):
+    lines = [f"line {n}" for n in range(store_tier.NODE_LOG_LINES + 20)]
+    lines[-1] = "x" * (store_tier.NODE_LOG_LINE_CHARS + 50)
+    lines[-2] = "cannot reach postgresql://agent:hunter2pass@db:5432/agent"
+    lines[-3] = ("export TELEGRAM_BOT_TOKEN=123456:AAbbCCdd"
+                 " and Authorization: Bearer abcdef0123456789")
+    lines[-4] = "said the one value it holds: plainvalue-77 and a key sk-ant-api03-abcdefghijklmnop"
+    lines[-5] = "two\nlines"
+    with _conn() as conn:
+        with conn.transaction():
+            wrote = store_tier.node_log_put(conn, AGENT, NODE, "telegram", lines,
+                                            secrets=["plainvalue-77"])
+            store_tier.node_log_put(conn, AGENT, NODE, store_tier.NODE_LOG_MANAGER,
+                                    ["[capabilities node] reconciled"])
+        assert wrote["lines"] == store_tier.NODE_LOG_LINES
+        rows = store_tier.node_logs(conn, AGENT, [NODE, OTHER])
+        assert [(r["node"], r["source"]) for r in rows] == [(NODE, "manager"),
+                                                             (NODE, "telegram")]
+        kept = rows[1]["lines"]
+        assert len(kept) == store_tier.NODE_LOG_LINES and kept[0] == "line 20"
+        assert len(kept[-1]) == store_tier.NODE_LOG_LINE_CHARS
+        assert kept[-5] == "two lines"
+        text = "\n".join(kept)
+        for secret in ("hunter2pass", "123456:AAbbCCdd", "abcdef0123456789", "plainvalue-77",
+                       "sk-ant-api03"):
+            assert secret not in text
+        assert "postgresql://agent:***@db:5432/agent" in text
+        # A later write replaces the source's lines; another agent sees none of them.
+        with conn.transaction():
+            store_tier.node_log_put(conn, AGENT, NODE, "telegram", ["restarted"])
+        assert [r["lines"] for r in store_tier.node_logs(conn, AGENT, [NODE])] == [
+            ["[capabilities node] reconciled"], ["restarted"]]
+        assert store_tier.node_logs(conn, PEER, [NODE]) == []
+        with pytest.raises(store_tier.StoreError):
+            store_tier.node_log_put(conn, AGENT, NODE, "Not A Source", ["x"])
+
+
+def test_log_lines_go_with_their_service_their_agents_link_and_their_node(nodes):
+    with _conn() as conn:
+        with conn.transaction():
+            for agent in (AGENT, PEER, GONE):
+                for source in ("manager", "telegram", "tasks"):
+                    store_tier.node_log_put(conn, agent, NODE, source, ["said"])
+            store_tier.node_log_put(conn, AGENT, OTHER, "tasks", ["said"])
+        with conn.transaction():
+            assert store_tier.node_logs_prune(conn, AGENT, NODE, ["manager", "tasks"]) == 1
+        assert [r["source"] for r in store_tier.node_logs(conn, AGENT, [NODE])] == [
+            "manager", "tasks"]
+        # An agent no longer linked to the node loses its lines there; a linked
+        # agent another manager writes for keeps its own.
+        with conn.transaction():
+            store_tier.node_agents_prune(conn, NODE, [AGENT], [])
+        assert store_tier.node_logs(conn, GONE, [NODE]) == []
+        assert len(store_tier.node_logs(conn, PEER, [NODE])) == 3
+        with conn.transaction():
+            conn.execute("UPDATE capabilities_nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
+                         (OTHER,))
+        assert [r["node"] for r in store_tier.node_logs(conn, AGENT, ["aaaaaaaaaaaa"])] == [
+            "aaaaaaaaaaaa"]
+        with conn.transaction():
+            conn.execute("DELETE FROM capabilities_nodes WHERE id = 'aaaaaaaaaaaa'")
+        assert store_tier.node_logs(conn, AGENT, ["aaaaaaaaaaaa"]) == []
