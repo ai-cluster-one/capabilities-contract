@@ -246,7 +246,9 @@ def test_the_report_names_the_level_and_sources_and_redacts_secrets(clean_env, p
     assert report == {"level": "environment", "sources": ["AGENTKIT_DB_URL"],
                       "schema": "agentkit",
                       "url": {"user": "u", "password": "***", "host": "h", "dbname": "d",
-                              "sslmode": "require", "sslpassword": "***"}}
+                              "sslmode": "require", "sslpassword": "***"},
+                      "addresses": {"transaction": {"host": "h", "port": 5432},
+                                    "session": {"host": "h", "port": 5432}}}
     assert "hunter2" not in repr(s) and "hunter2" not in json.dumps(report)
     monkeypatch.delenv("AGENTKIT_DB_URL")
     path = write_family_setting(clean_env, FAMILY)
@@ -254,7 +256,9 @@ def test_the_report_names_the_level_and_sources_and_redacts_secrets(clean_env, p
     assert report == {"level": "machine", "sources": [str(path)], "schema": "agentkit",
                       "host": "db.example.test", "port": 5432, "database": "app",
                       "user": "agent", "sslmode": "require", "sslrootcert": None,
-                      "password": "***"}
+                      "password": "***",
+                      "addresses": {"transaction": {"host": "db.example.test", "port": 5432},
+                                    "session": {"host": "db.example.test", "port": 5432}}}
 
 
 def test_the_report_of_a_url_is_what_libpq_reads_with_the_default_sslmode(clean_env, monkeypatch):

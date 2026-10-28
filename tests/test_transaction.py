@@ -8,7 +8,14 @@ import psycopg
 import pytest
 from conftest import write_family_setting
 
-from capabilities_contract.db import DbError, Setting, connect, migrate, resolve_setting
+from capabilities_contract.db import (
+    DbError,
+    Setting,
+    _connect,
+    connect,
+    migrate,
+    resolve_setting,
+)
 
 POOLER = "aws-0-region.pooler.supabase.com"
 PASSWORD = "not-a-real-secret"
@@ -88,13 +95,15 @@ def test_supabases_transaction_pooler_serves_as_the_transaction_address_only(rea
     assert _dialled(reached, split, False)["port"] == 5432
     one = Setting(level="environment", host=POOLER, port=6543, database="postgres",
                   user="postgres.ref", sslmode="require", password=PASSWORD)
-    for transaction in (False, True):
-        before = len(reached)
-        with pytest.raises(DbError) as caught:
-            connect(application_name="test", setting=one, transaction=transaction)
-        assert caught.value.slug == "transaction_pooler"
-        assert "transaction port" in caught.value.hint
-        assert len(reached) == before
+    before = len(reached)
+    with pytest.raises(DbError) as caught:
+        connect(application_name="test", setting=one, transaction=False)
+    assert caught.value.slug == "transaction_pooler"
+    assert "transaction port" in caught.value.hint
+    assert len(reached) == before
+    # Its one address a transaction pooler, the store is transaction-only.
+    _connect._PAUSED.clear()  # the split store's transaction address is the same
+    assert _dialled(reached, one, True)["port"] == 6543
 
 
 # --- where the transaction address is configured -------------------------------------

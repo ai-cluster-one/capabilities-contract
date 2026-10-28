@@ -19,7 +19,12 @@ A level may also name the store's transaction address: `AGENTKIT_DB_TRANSACTION_
 and `AGENTKIT_DB_TRANSACTION_PORT`, or `transaction_host` and `transaction_port` in the
 machine file. It is the same store reached at another endpoint, typically a
 transaction-mode pooler, with the level's own database, user, password, sslmode and
-schema. Without one, the store has one address and every connection uses it.
+schema. The address the level names otherwise is then the session address. Without one,
+the store has one address and every connection uses it, unless that address is a known
+transaction pooler (Supabase's, a host under its pooler domain on port 6543): such a
+store is transaction-only, reached by transaction connections alone, and has no session
+address until one is named apart - the session pooler as its address, the transaction
+pooler as its transaction address.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ import ipaddress
 import json
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -47,6 +53,14 @@ FORMAT_FIELDS = ("schema", *SETTING_FIELDS, *TRANSACTION_FIELDS, "password", SCH
 DEFAULT_SCHEMA = "agentkit"
 DEFAULT_PORT = 5432
 DEFAULT_SSLMODE = "require"
+
+# Supabase's transaction pooler: a host under its pooler domain on this port. It keeps
+# no session between transactions, so what a session connection sets for its session -
+# the schema binding, prepared statements, LISTEN - is lost. Its session pooler is the
+# same host on SESSION_POOLER_PORT.
+SUPABASE_POOLER_DOMAIN = ".pooler.supabase.com"
+TRANSACTION_POOLER_PORT = 6543
+SESSION_POOLER_PORT = 5432
 
 KEY_PREFIX = "AGENTKIT_DB_"
 URL_KEY = "AGENTKIT_DB_URL"
@@ -124,6 +138,61 @@ def _url_report(url: str) -> dict:
             for key, value in params.items()}
 
 
+def is_transaction_pooler(host: object, port: object) -> bool:
+    """Whether `host` and `port` are a known transaction pooler, which keeps no session
+    between transactions: Supabase's, a host under its pooler domain on port 6543."""
+    return (isinstance(host, str) and host.lower().endswith(SUPABASE_POOLER_DOMAIN)
+            and str(port) == str(TRANSACTION_POOLER_PORT))
+
+
+def _libpq_params(arguments: Callable[[], dict]) -> dict | None:
+    """The parameters libpq reads from the arguments of a connect that `arguments`
+    gives, or None where they cannot be made or parsed. Keyword values alone are
+    read without the driver."""
+    try:
+        kwargs = arguments()
+    except ValueError:
+        return None
+    if "conninfo" not in kwargs:
+        return {name: value for name, value in kwargs.items() if value is not None}
+    import psycopg
+    from psycopg.conninfo import conninfo_to_dict
+
+    try:
+        return conninfo_to_dict(**kwargs)
+    except (psycopg.Error, ValueError):
+        return None
+
+
+def _endpoints(params: dict) -> list[tuple[str, str]]:
+    """Each host and port libpq tries for `params`, as it resolves them: a host or port
+    not named is PGHOST's or PGPORT's, and a port named by neither is 5432. A host that
+    is neither named nor in PGHOST is the empty string, libpq's local default."""
+    hosts = str(params.get("host") or params.get("hostaddr")
+                or os.environ.get("PGHOST") or "").split(",")
+    ports = str(params.get("port") or os.environ.get("PGPORT") or "").split(",")
+    if len(ports) == 1:
+        ports = ports * len(hosts)
+    return [(host.strip(), port.strip() or str(DEFAULT_PORT))
+            for host, port in zip(hosts, ports, strict=False)]
+
+
+def _address_report(arguments: Callable[[], dict]) -> dict:
+    """The address a connect with the arguments `arguments` gives dials, as {"host",
+    "port"}: the port a number, or, for several endpoints, both as libpq's
+    comma-separated lists. None stands for what cannot be read: no host named
+    (libpq's local default) or an unparseable setting."""
+    params = _libpq_params(arguments)
+    if params is None:
+        return {"host": None, "port": None}
+    found = _endpoints(params)
+    if len(found) == 1:
+        host, port = found[0]
+        return {"host": host or None, "port": int(port) if port.isdigit() else port}
+    return {"host": ",".join(host for host, _ in found),
+            "port": ",".join(port for _, port in found)}
+
+
 @dataclass(frozen=True)
 class Setting:
     """Where the database is, which schema it binds, and where that was found.
@@ -136,7 +205,11 @@ class Setting:
 
     `transaction_host` and `transaction_port` name the store's transaction address
     when the level set one (either may be None, standing for the session address's
-    own host or port); `has_transaction_address` says whether it did."""
+    own host or port); `has_transaction_address` says whether it did, that is whether
+    the store's two addresses are named apart. `has_session_address` says whether the
+    store has a session address: its address, when a transaction address is named apart
+    or when that one address is not a known transaction pooler. A store whose one address
+    is a known transaction pooler is transaction-only."""
 
     schema: str = DEFAULT_SCHEMA
     level: str = ""
@@ -155,6 +228,23 @@ class Setting:
     @property
     def has_transaction_address(self) -> bool:
         return self.transaction_host is not None or self.transaction_port is not None
+
+    @property
+    def has_session_address(self) -> bool:
+        """Whether the store has a session address: a transaction address is named
+        apart, the address being then the session address, or the store's one address
+        is not a known transaction pooler."""
+        return self.has_transaction_address or self._transaction_pooler_endpoint() is None
+
+    def _transaction_pooler_endpoint(self) -> tuple[str, int] | None:
+        """The first host and port of the setting's address, as libpq reads it, that is
+        a known transaction pooler, or None. A setting libpq cannot parse gives None;
+        connecting reports it."""
+        params = _libpq_params(self.connect_kwargs)
+        for host, port in _endpoints(params) if params is not None else ():
+            if is_transaction_pooler(host, port):
+                return host, int(port)
+        return None
 
     def transaction_kwargs(self) -> dict:
         """Arguments for `psycopg.connect` to the transaction address: the session
@@ -184,10 +274,19 @@ class Setting:
         return out
 
     def report(self) -> dict:
-        """The setting in force for a status or doctor surface, secrets redacted."""
+        """The setting in force for a status or doctor surface, secrets redacted.
+
+        `addresses` gives the address each kind of connection dials, as libpq resolves
+        it: `transaction` the transaction address, or the one address when none is
+        named apart, and `session` the session address, or None for a
+        transaction-only store."""
         out = {"level": self.level, "sources": list(self.sources), "schema": self.schema}
         if self.has_transaction_address:
             out["transaction"] = {"host": self.transaction_host, "port": self.transaction_port}
+        out["addresses"] = {
+            "transaction": _address_report(self.transaction_kwargs),
+            "session": (_address_report(self.connect_kwargs)
+                        if self.has_session_address else None)}
         if self.url is not None:
             out["url"] = _url_report(self.url)
             return out

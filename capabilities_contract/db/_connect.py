@@ -1,6 +1,8 @@
 """A connection bound to the configured schema. psycopg is imported here, lazily.
 
-A store has a session address and, when its setting names one, a transaction address.
+A store has a transaction address and, unless it is transaction-only - its one address
+a known transaction pooler - a session address; the two are one address unless its
+setting names a transaction address apart.
 A session connection binds the schema for its session and may hold session state:
 `LISTEN`, session advisory locks, session settings. A transaction connection carries no
 session state at all, so it works through a transaction-mode pooler: psycopg prepares
@@ -40,7 +42,14 @@ from pathlib import Path
 from typing import Any
 
 from capabilities_contract.db._errors import DbError
-from capabilities_contract.db._setting import Setting, check_schema_name, resolve_setting
+from capabilities_contract.db._setting import (
+    SESSION_POOLER_PORT,
+    SUPABASE_POOLER_DOMAIN,  # noqa: F401 - kept importable here, where it was defined
+    TRANSACTION_POOLER_PORT,
+    Setting,
+    check_schema_name,
+    resolve_setting,
+)
 
 # The schema each connection from `connect` is bound to, so `migrate` needs no
 # second argument naming it.
@@ -82,13 +91,6 @@ RECONNECT_LONGEST_SECONDS = 30.0
 PING_AFTER_SECONDS = 10
 SPARE_IDLE_SECONDS = 30
 
-# Supabase's transaction pooler: a host under its pooler domain on this port. It keeps
-# no session between transactions, so what a session connection sets for its session -
-# the schema binding, prepared statements, LISTEN - is lost. Its session pooler is the
-# same host on SESSION_POOLER_PORT. The transaction address may name it.
-SUPABASE_POOLER_DOMAIN = ".pooler.supabase.com"
-TRANSACTION_POOLER_PORT = 6543
-SESSION_POOLER_PORT = 5432
 
 def _psycopg():
     try:
@@ -773,41 +775,35 @@ def _keepalives(conn: Any) -> None:
         conn.execute("SELECT set_config(%s, %s, false)", (name, str(value)))
 
 
-def _endpoints(setting: Setting) -> list[tuple[str, int]]:
-    """Each host and port libpq would try for the setting's session address, read by
-    libpq's own parse. A setting it cannot parse gives none; connecting reports it."""
-    import psycopg
-    from psycopg.conninfo import conninfo_to_dict
-
-    try:
-        params = conninfo_to_dict(**setting.connect_kwargs())
-    except (psycopg.Error, ValueError):
-        return []
-    hosts = str(params.get("host") or "").split(",")
-    ports = str(params.get("port") or "").split(",")
-    if len(ports) == 1:
-        ports = ports * len(hosts)
-    out = []
-    for host, port in zip(hosts, ports, strict=False):
-        port = port.strip() or str(SESSION_POOLER_PORT)
-        out.append((host.strip(), int(port) if port.isdigit() else 0))
-    return out
-
-
 def _refuse_transaction_pooler(setting: Setting) -> None:
-    """Refuse, before anything is sent, a store whose session address is Supabase's
-    transaction pooler. Its transaction address may be."""
-    for host, port in _endpoints(setting):
-        if host.lower().endswith(SUPABASE_POOLER_DOMAIN) and port == TRANSACTION_POOLER_PORT:
-            raise DbError(
-                "transaction_pooler",
-                f"the store at {host}:{port} is Supabase's transaction pooler, which keeps "
-                "no session between transactions, so the schema binding, prepared statements "
-                "and notifications a session connection relies on are lost; it serves only "
-                "as the store's transaction address",
-                f"use Supabase's session pooler as the store's address: the same host, "
-                f"{host}, on port {SESSION_POOLER_PORT}, and name port "
-                f"{TRANSACTION_POOLER_PORT} as its transaction port")
+    """Refuse, before anything is sent, a session connection to a known transaction
+    pooler, which keeps no session between transactions: the store's session address
+    is one, or the store's only address is, so it has no session address at all. A
+    transaction connection may reach one."""
+    found = setting._transaction_pooler_endpoint()
+    if found is None:
+        return
+    host, port = found
+    if not setting.has_transaction_address:
+        raise DbError(
+            "transaction_pooler",
+            f"the store's only address, {host}:{port}, is Supabase's transaction pooler, "
+            "which keeps no session between transactions, so a session connection - "
+            "LISTEN, a session lock, a session setting - cannot be served there; the "
+            "store serves transaction connections only",
+            f"give the store a session address apart: Supabase's session pooler, the same "
+            f"host, {host}, on port {SESSION_POOLER_PORT}, as its address, keeping port "
+            f"{TRANSACTION_POOLER_PORT} as its transaction port (`capabilities store set "
+            f"... --session-port {SESSION_POOLER_PORT}`)")
+    raise DbError(
+        "transaction_pooler",
+        f"the store at {host}:{port} is Supabase's transaction pooler, which keeps "
+        "no session between transactions, so the schema binding, prepared statements "
+        "and notifications a session connection relies on are lost; it serves only "
+        "as the store's transaction address",
+        f"use Supabase's session pooler as the store's address: the same host, "
+        f"{host}, on port {SESSION_POOLER_PORT}, and name port "
+        f"{TRANSACTION_POOLER_PORT} as its transaction port")
 
 
 def connect(*, application_name: str, project_root: Path | str | None = None,
@@ -823,8 +819,9 @@ def connect(*, application_name: str, project_root: Path | str | None = None,
     By default it is a session connection to the store's session address, its schema
     bound for the session. With `transaction` True it is a transaction connection to
     the store's transaction address, or to its one address when the setting names no
-    transaction address: psycopg prepares no statement on it, the schema is bound with
-    `SET LOCAL` at the start of every transaction, and a statement that would leave
+    transaction address, also when that address is a transaction pooler: psycopg
+    prepares no statement on it, the schema is bound with `SET LOCAL` at the start
+    of every transaction, and a statement that would leave
     state in the session (LISTEN, PREPARE, a session SET or set_config, a session
     advisory lock) is refused as `session_state` before it is sent.
     `local_settings`, run-time parameters such as `statement_timeout`, are set
@@ -884,14 +881,17 @@ def connect(*, application_name: str, project_root: Path | str | None = None,
     TCP_USER_TIMEOUT_MILLISECONDS, which keepalives, never sent meanwhile, cannot
     notice: the statement fails as a lost connection, and a plain read that may
     run again does so on a new one.
-    A session address that is Supabase's transaction pooler is refused as
-    `transaction_pooler` before anything is sent to it."""
+    A session connection to Supabase's transaction pooler - the store's session
+    address, or its only address, when the store is transaction-only - is refused as
+    `transaction_pooler` before anything is sent to it. A transaction connection to
+    a transaction-only store is proven to answer as at a transaction address of its
+    own."""
     if not isinstance(application_name, str) or not application_name:
         raise DbError("bad_application_name", "application_name must be a non-empty string")
     setting = setting if setting is not None else resolve_setting(project_root)
     schema = check_schema_name(setting.schema)
     psycopg, _ = _psycopg()
-    if not (transaction and setting.has_transaction_address):
+    if not transaction:
         _refuse_transaction_pooler(setting)
     options = dict(application_name=application_name,
                    keepalives=1, keepalives_idle=KEEPALIVE_IDLE_SECONDS,
@@ -907,8 +907,10 @@ def connect(*, application_name: str, project_root: Path | str | None = None,
         key = _address_key(kwargs)
         conn = _lend(key, connect_timeout)
         if conn is None:
-            conn = _open_transaction(kwargs, setting.has_transaction_address,
-                                     connect_timeout)
+            # Behind a pooler - a transaction address of its own, or a store that
+            # is transaction-only - the store's answer is proven as it connects.
+            behind = setting.has_transaction_address or not setting.has_session_address
+            conn = _open_transaction(kwargs, behind, connect_timeout)
             conn._key = key
             conn._lent = True
         named = ()
