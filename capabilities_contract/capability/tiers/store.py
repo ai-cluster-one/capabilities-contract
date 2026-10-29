@@ -334,7 +334,7 @@ NODE_LOG_MANAGER = "manager"
 NODE_LOG_LINES = 100
 NODE_LOG_LINE_CHARS = 500
 NODE_LOG_MASK = "***"
-STORE_TABLES_VERSION = (1, 19)
+STORE_TABLES_VERSION = (1, 20)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -1567,6 +1567,15 @@ def record_table_steps() -> list[tuple[str, str]]:
          " COMMENT ON COLUMN capabilities_node_sessions.reason_keys IS"
          " 'The required keys that do not resolve on the node, as the capability''s"
          " connections answer reports them; set exactly when reason is key_missing.'"),
+        # A node kept on record and taken out of service: a machine that is off,
+        # or a server superseded and kept for a while. Its row and everything
+        # naming it stay; nothing is placed on it and nothing is expected of it.
+        ("0035-node-disabled",
+         "ALTER TABLE capabilities_nodes ADD COLUMN disabled_at timestamptz;"
+         " COMMENT ON COLUMN capabilities_nodes.disabled_at IS"
+         " 'When the node was disabled (`capabilities node disable`): kept on record, but"
+         " nothing is placed on it, run on it or expected of it until it is enabled"
+         " again. Null for a node in service.'"),
     ]
 
 
@@ -3758,7 +3767,8 @@ class StoreRecords(FileRecords):
         only the `service` of the project's rows changes. Placing where the
         project has no row naming the node writes one that enables the
         capability there, since a service runs only where its project enables
-        it; placing where that row disables it is refused (`disabled_on_node`).
+        it; placing where that row disables it is refused (`disabled_on_node`),
+        as is placing on a node that is disabled (`node_disabled`).
         `exclusive` - a service that runs on one node at a time - takes the
         service off every other node in the same transaction, which is how it
         moves. Answers {node, changed, unplaced, enabled_on_node?}."""
@@ -3777,6 +3787,7 @@ class StoreRecords(FileRecords):
                 "FOR UPDATE", (agent, capability, target)).fetchone()
             out: dict[str, Any] = {"node": target, "changed": False, "unplaced": []}
             if placed:
+                _refuse_disabled_node(conn, target, capability)
                 if row is not None and not row[0]:
                     raise StoreError(
                         "disabled_on_node",
@@ -5042,12 +5053,26 @@ class AgentRecords(StoreRecords):
                                           own[2]))).rowcount > 0))
 
 
+def _refuse_disabled_node(conn: Any, node: str, capability: str) -> None:
+    """Refuse to place `capability`'s service on `node` while the node is
+    disabled (`capabilities_nodes.disabled_at`)."""
+    found = conn.execute("SELECT disabled_at IS NOT NULL FROM capabilities_nodes "
+                         "WHERE id = %s", (node,)).fetchone()
+    if found is not None and found[0]:
+        raise StoreError(
+            "node_disabled",
+            f"node {node} is disabled, so {capability}'s service cannot be placed there",
+            f"enable the node first: `capabilities node enable {node}`")
+
+
 def _upsert_policy(conn: Any, agent: str | None, capability: str, node: str | None,
                    enabled: bool) -> None:
     """Write one policy row. A row the agent writes for a node of its own places
     the capability's service there exactly when it enables the capability
     there, as `enable --node` and `disable --node` always have; `place` is what
-    changes the one without the other."""
+    changes the one without the other, and neither places on a disabled node."""
+    if enabled and agent is not None and node is not None:
+        _refuse_disabled_node(conn, node, capability)
     conn.execute(
         "INSERT INTO capabilities_policy (agent_id, capability, node, enabled, service) "
         "VALUES (%s, %s, %s, %s, %s) "

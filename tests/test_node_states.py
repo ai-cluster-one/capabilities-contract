@@ -484,10 +484,9 @@ def test_log_lines_go_with_their_service_their_agents_link_and_their_node(nodes)
 
 def test_a_store_at_the_logs_step_takes_only_the_session_reasons_step(store):
     steps = store_tier.record_table_steps()
-    assert steps[-1][0] == "0034-node-session-reasons"
-    assert store_tier.STORE_TABLES_VERSION == (1, 19)
-    _migrate(steps[:-1], 1, 18)
-    result = _migrate(steps, *store_tier.STORE_TABLES_VERSION)
+    at = [step[0] for step in steps].index("0034-node-session-reasons")
+    _migrate(steps[:at], 1, 18)
+    result = _migrate(steps[:at + 1], 1, 19)
     assert result.applied == ["0034-node-session-reasons"]
     with _conn() as conn:
         uncommented = conn.execute(
@@ -532,3 +531,44 @@ def test_a_session_that_is_down_says_why_and_a_row_without_a_reason_reads_as_bef
                          " capability, connection, live, reason, reason_keys)"
                          " VALUES (%s, %s, 'telegram', 'main', %s, %s, %s)",
                          (AGENT, NODE, live, reason, keys))
+
+
+def test_a_store_at_the_session_reasons_step_takes_only_the_node_disabled_step(store):
+    steps = store_tier.record_table_steps()
+    assert steps[-1][0] == "0035-node-disabled"
+    assert store_tier.STORE_TABLES_VERSION == (1, 20)
+    _migrate(steps[:-1], 1, 19)
+    result = _migrate(steps, *store_tier.STORE_TABLES_VERSION)
+    assert result.applied == ["0035-node-disabled"]
+    with _conn() as conn:
+        [(comment,)] = conn.execute(
+            "SELECT col_description(to_regclass('capabilities_nodes'), a.attnum)"
+            " FROM pg_attribute a WHERE a.attrelid = to_regclass('capabilities_nodes')"
+            " AND a.attname = 'disabled_at'").fetchall()
+    assert comment
+
+
+def test_nothing_is_placed_on_a_disabled_node_and_what_is_there_can_be_taken_off(nodes):
+    def policy(conn, node, enabled):
+        store_tier._upsert_policy(conn, AGENT, "tasks", node, enabled)
+
+    with _conn() as conn, conn.transaction():
+        conn.execute("UPDATE capabilities_nodes SET disabled_at = now() WHERE id = %s",
+                     (NODE,))
+    refused = pytest.raises(store_tier.StoreError)
+    with _conn() as conn, refused as raised, conn.transaction():
+        policy(conn, NODE, True)
+    assert raised.value.slug == "node_disabled"
+    assert "capabilities node enable" in raised.value.hint
+    with _conn() as conn:
+        with conn.transaction():
+            policy(conn, NODE, False)
+            policy(conn, OTHER, True)
+        rows = conn.execute("SELECT node, enabled, service FROM capabilities_policy"
+                            " WHERE agent_id = %s ORDER BY node", (AGENT,)).fetchall()
+    assert rows == [(NODE, False, False), (OTHER, True, True)]
+    with _conn() as conn, conn.transaction():
+        conn.execute("UPDATE capabilities_nodes SET disabled_at = NULL WHERE id = %s",
+                     (NODE,))
+    with _conn() as conn, conn.transaction():
+        policy(conn, NODE, True)
