@@ -1442,6 +1442,15 @@ def _declared_section() -> str:
                 "      Remove it, its default pointer, and the secret lines `connection add`\n"
                 "      wrote for it; a key another connection names is kept. Refused (exit 6\n"
                 "      connection_granted) while a project is granted it, naming each one.\n"
+                f"  {NAME} connection rename <id> <label>\n"
+                "      Change what a connection is called and nothing else. Its id - the name\n"
+                "      it was added under - stays, and with it every grant, default pointer,\n"
+                "      secret's env key and service state that holds it; from then on its\n"
+                "      label names it too, wherever a connection is named (--connection,\n"
+                "      connection add|remove, connections show), and `connections` reports it\n"
+                "      as `label`. Renaming it to its id clears the label. No id or label is\n"
+                "      another connection's (exit 6 connection_exists); a connection kept in\n"
+                "      files has no label (exit 6 connection_not_in_store).\n"
                 f"  {NAME} connections show <id> --reveal <KEY>\n"
                 "      Print the value of one field below of one connection this project may\n"
                 "      use, raw and in the clear, and nothing else: the value `connections`\n"
@@ -2021,7 +2030,8 @@ def _cmd_connections_reported() -> None:
     beside it, so a reader sees why no connection may write; in a machine read
     each connection the machine lent is named as the machine's, read-only.
     Each connection carries `identity`, who it is as its record says, read
-    without a round-trip."""
+    without a round-trip, and `label`, what it is called: the label
+    `connection rename` gave it, else its id."""
     import contextlib
     import io
     captured = io.StringIO()
@@ -2046,6 +2056,11 @@ def _cmd_connections_reported() -> None:
         for cid, entry in conns.items():
             if isinstance(entry, dict):
                 entry["identity"] = _connection_identity(held.get(cid))
+    if "_connection_labels" in globals() and conns:
+        labels = _connection_labels()
+        for cid, entry in conns.items():
+            if isinstance(entry, dict):
+                entry["label"] = labels.get(cid) or cid
     if read_only_switch():
         for entry in conns.values():
             if isinstance(entry, dict):

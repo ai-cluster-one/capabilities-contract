@@ -334,7 +334,7 @@ NODE_LOG_MANAGER = "manager"
 NODE_LOG_LINES = 100
 NODE_LOG_LINE_CHARS = 500
 NODE_LOG_MASK = "***"
-STORE_TABLES_VERSION = (1, 20)
+STORE_TABLES_VERSION = (1, 21)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -1576,6 +1576,49 @@ def record_table_steps() -> list[tuple[str, str]]:
          " 'When the node was disabled (`capabilities node disable`): kept on record, but"
          " nothing is placed on it, run on it or expected of it until it is enabled"
          " again. Null for a node in service.'"),
+        # A connection's id is the name it was added under, which every grant,
+        # default pointer, node session, secret's env key and capability's own
+        # state already holds, so no reference is rewritten and the id never
+        # changes. What it is called is its label, changed at will; null shows
+        # the id. Within one capability no id or label is another row's id or
+        # label, so either one names exactly one connection.
+        ("0036-connection-label",
+         "ALTER TABLE capabilities_connections ADD COLUMN label text"
+         " CHECK (label <> '' AND label = btrim(label) AND label <> name);"
+         " CREATE UNIQUE INDEX capabilities_connections_label"
+         "  ON capabilities_connections (capability, label) WHERE label IS NOT NULL;"
+         " CREATE FUNCTION capabilities_connections_label() RETURNS trigger"
+         "  LANGUAGE plpgsql SET search_path FROM CURRENT AS $label$"
+         " BEGIN"
+         "  IF TG_OP = 'UPDATE' AND NEW.name IS DISTINCT FROM OLD.name THEN"
+         "   RAISE EXCEPTION '% connection % keeps its id; its label is what is renamed',"
+         "    OLD.capability, OLD.name USING ERRCODE = 'check_violation';"
+         "  END IF;"
+         "  PERFORM pg_advisory_xact_lock(hashtext('capabilities_connections:'"
+         "   || NEW.capability));"
+         "  IF EXISTS (SELECT 1 FROM capabilities_connections"
+         "   WHERE capability = NEW.capability AND name <> NEW.name"
+         "   AND (label = NEW.name OR name = NEW.label OR label = NEW.label)) THEN"
+         "   RAISE EXCEPTION '% connection % or its label % is already another"
+         " connection''s id or label', NEW.capability, NEW.name, NEW.label"
+         "    USING ERRCODE = 'unique_violation';"
+         "  END IF;"
+         "  RETURN NEW;"
+         " END $label$;"
+         " CREATE TRIGGER capabilities_connections_label"
+         "  BEFORE INSERT OR UPDATE OF name, label ON capabilities_connections"
+         "  FOR EACH ROW EXECUTE FUNCTION capabilities_connections_label();"
+         " COMMENT ON TABLE capabilities_connections IS"
+         " 'What a connection is: one row per (capability, name), name its id and label"
+         " what it is called, its spec the entry interior with secret references only. A"
+         " row is shared by the capability (owner null) or one agent''s own.';"
+         " COMMENT ON COLUMN capabilities_connections.name IS"
+         " 'The connection''s id: the name it was added under, never changed, and what"
+         " every grant, default pointer and node session holds.';"
+         " COMMENT ON COLUMN capabilities_connections.label IS"
+         " 'What the connection is called, set by `<capability> connection rename`; null"
+         " shows its id. No id or label of the capability is another row''s id or"
+         " label.'"),
     ]
 
 
@@ -2702,6 +2745,20 @@ class FileRecords(Records):
                 out[cid]["machine_read"] = True
         return out
 
+    def connection_labels(self, capability: str) -> dict[str, str]:
+        """What each connection is called where that is not its id, by id.
+        Files keep no label: a connection there is called by its id."""
+        return {}
+
+    def rename_connection(self, capability: str, cid: str, label: str | None,
+                          actor: str | None = None) -> None:
+        """Call connection `cid` `label`, or by its id where `label` is None
+        or the id. Only a connection the store holds has a label."""
+        raise StoreError("connection_not_in_store",
+                         f"{capability} connection {cid!r} is kept in files, where a "
+                         "connection is called by its id and has no label",
+                         "move this project into the store with `capabilities migrate`")
+
     # -- writing ---------------------------------------------------------------
 
     def set(self, capability: str, collection: str, key: str, value: Any,
@@ -3625,6 +3682,57 @@ class StoreRecords(FileRecords):
             "DELETE FROM capabilities_connections WHERE capability = %s AND name = %s",
             (capability, cid)).rowcount > 0
 
+    def connection_labels(self, capability: str) -> dict[str, str]:
+        _store_check("capability", capability, CAPABILITY_RE)
+        key = ("label", capability)
+        held = self._fresh(key)
+        if held is None:
+            # Read through the row, so a store from before labels reads none.
+            rows = self._read(
+                "SELECT c.name, to_jsonb(c) ->> 'label' FROM capabilities_connections c "
+                "WHERE c.capability = %s", (capability,))
+            held = {name: label for name, label in rows if label}
+            self._cache[key] = (time.monotonic(), held)
+        return held
+
+    def _label_connection(self, conn: Any, capability: str, cid: str,
+                          label: str | None, agent: str | None) -> None:
+        """Write what connection `cid` is called, for the writer `agent`; its
+        id, and so every row naming it, stays. One another agent owns is
+        refused, and a label that is already another connection's id or label
+        is refused by the store."""
+        import psycopg
+        row = conn.execute(
+            "SELECT owner FROM capabilities_connections WHERE capability = %s "
+            "AND name = %s FOR UPDATE", (capability, cid)).fetchone()
+        if row is None:
+            raise StoreError("unknown_connection",
+                             f"the store holds no {capability} connection {cid!r}",
+                             f"`{capability} connections` lists them")
+        if row[0] is not None and row[0] != agent:
+            raise StoreError("connection_owned",
+                             f"{capability} connection {cid!r} is agent {row[0]}'s own, "
+                             "so only that agent renames it",
+                             "rename it in that agent's project")
+        try:
+            with conn.transaction():
+                conn.execute(
+                    "UPDATE capabilities_connections SET label = %s "
+                    "WHERE capability = %s AND name = %s",
+                    (None if label in (None, cid) else label, capability, cid))
+        except psycopg.errors.UniqueViolation:
+            raise StoreError("connection_exists",
+                             f"{label!r} is already the id or label of another "
+                             f"{capability} connection",
+                             "choose another label") from None
+
+    def rename_connection(self, capability: str, cid: str, label: str | None,
+                          actor: str | None = None) -> None:
+        _store_check("capability", capability, CAPABILITY_RE)
+        _refuse_record_write(capability, "connection")
+        self._write(lambda conn: self._label_connection(conn, capability, cid, label,
+                                                        self.project_id))
+
     def _put_grant(self, conn: Any, capability: str, cid: str,
                    fields: dict[str, Any], node: str | None) -> None:
         if not self.project_id:
@@ -4195,6 +4303,12 @@ class GlobalRows(StoreRecords):
             "(coalesce(node, ''))) "
             + (f"DO UPDATE SET {updates}" if updates else "DO NOTHING"),
             values)
+
+    def rename_connection(self, capability: str, cid: str, label: str | None,
+                          actor: str | None = None) -> None:
+        _store_check("capability", capability, CAPABILITY_RE)
+        _refuse_record_write(capability, "connection")
+        self._write(lambda conn: self._label_connection(conn, capability, cid, label, None))
 
     def _clear_default(self, conn: Any, capability: str) -> bool:
         return conn.execute(
@@ -4990,6 +5104,16 @@ class AgentRecords(StoreRecords):
             self._landing(conn, scope, wanted, actor, "capabilities_connection_grants",
                           agent, "capability = %s AND connection = %s", (capability, key))))
         return None
+
+    def rename_connection(self, capability: str, cid: str, label: str | None,
+                          actor: str | None = None) -> None:
+        _store_check("capability", capability, CAPABILITY_RE)
+        _refuse_record_write(capability, "connection")
+
+        def work(conn: Any) -> None:
+            self._authority(conn, "project", None, actor)
+            self._label_connection(conn, capability, cid, label, self.project_id)
+        self._write(work)
 
     def delete(self, capability: str, collection: str, key: str,
                scope: str | None = None, node: str | None = None) -> bool:

@@ -535,10 +535,9 @@ def test_a_session_that_is_down_says_why_and_a_row_without_a_reason_reads_as_bef
 
 def test_a_store_at_the_session_reasons_step_takes_only_the_node_disabled_step(store):
     steps = store_tier.record_table_steps()
-    assert steps[-1][0] == "0035-node-disabled"
-    assert store_tier.STORE_TABLES_VERSION == (1, 20)
-    _migrate(steps[:-1], 1, 19)
-    result = _migrate(steps, *store_tier.STORE_TABLES_VERSION)
+    at = [step[0] for step in steps].index("0035-node-disabled")
+    _migrate(steps[:at], 1, 19)
+    result = _migrate(steps[:at + 1], 1, 20)
     assert result.applied == ["0035-node-disabled"]
     with _conn() as conn:
         [(comment,)] = conn.execute(

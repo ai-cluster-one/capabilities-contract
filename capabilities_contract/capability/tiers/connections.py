@@ -281,8 +281,27 @@ def _connections_registry() -> tuple[dict | None, Path | str | None]:
     return _connections_composed(), _records().collection_source(NAME, "connection")
 
 
+def _connection_labels() -> dict:
+    """What each connection is called where that is not its id, by id: the
+    label `connection rename` gave it, which the store keeps beside the id."""
+    try:
+        return _records().connection_labels(NAME)
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _labelled(wanted: str | None) -> str | None:
+    """The id of the connection called `wanted`, where that is a label and
+    not an id; a label is read only once `wanted` named no id."""
+    if not wanted:
+        return None
+    return next((cid for cid, label in _connection_labels().items() if label == wanted),
+                None)
+
+
 def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
-    """flag → default pointer → sole entry → die 6. A connection's own
+    """flag → default pointer → sole entry → die 6. The flag names a
+    connection by its id or by its label. A connection's own
     `address` field selects it too (used where a
     connection carries a human-recognizable address; absent fields never match).
 
@@ -296,6 +315,12 @@ def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict 
     if wanted:
         if wanted in conns:
             return wanted, conns[wanted]
+        if wanted not in (reg.get("withheld") or {}):
+            named = _labelled(wanted)
+            if named is not None:
+                if named in conns:
+                    return named, conns[named]
+                _grant_gate(reg, named)
         for cid, entry in conns.items():
             if (entry or {}).get("address", "").lower() == wanted.lower():
                 return cid, entry
@@ -363,6 +388,8 @@ def _doctor_gate(report: dict, wanted: str | None) -> None:
     judged by the same resolution `connections` reports, never a parallel check.
     Checks the selected connection, else every connection in the report."""
     conns = report.get("connections") or {}
+    if wanted and wanted not in conns:
+        wanted = _labelled(wanted) or wanted
     targets = [wanted] if (wanted and wanted in conns) else list(conns)
     problems: dict = {}
     for cid in targets:
@@ -664,9 +691,12 @@ def _cmd_connection(argv: list[str]) -> None:
     usage = (f"{NAME} connection add <id> [--project|--global|--machine] [--default] "
              "[--replace] [--field KEY=VALUE ...] [--env KEY=ENV_KEY ...] [--stdin] "
              "[--identity ID [--display-name TEXT]] | "
-             f"{NAME} connection remove <id> [--project|--global|--machine]")
+             f"{NAME} connection remove <id> [--project|--global|--machine] | "
+             f"{NAME} connection rename <id> <label>")
     import re as _re
     sub = argv[0] if argv else ""
+    if sub == "rename":
+        return _cmd_connection_rename(argv[1:], usage)
     if sub not in ("add", "remove"):
         _die(6, "input", f"unknown connection subcommand {sub!r}", usage)
     # `--env KEY=ENV_KEY` names, for a secret field, an env key already set,
@@ -726,6 +756,9 @@ def _cmd_connection(argv: list[str]) -> None:
         _die(6, "input", f"connection {sub} names one connection id", usage)
     cid = rest[0]
     if not _re.fullmatch(r"[a-z0-9][a-z0-9._@+-]{0,127}", cid, _re.IGNORECASE):
+        # A connection is named by its label as well as its id.
+        cid = _labelled(cid) or cid
+    if not _re.fullmatch(r"[a-z0-9][a-z0-9._@+-]{0,127}", cid, _re.IGNORECASE):
         _die(6, "input", f"connection id {cid!r} is letters, digits and . _ @ + -")
     _read_only_gate(f"`{NAME} connection {sub}`")
     declared = globals().get("CONN_FIELDS")
@@ -744,6 +777,9 @@ def _cmd_connection(argv: list[str]) -> None:
     adapter = _records()
     try:
         held = adapter.resolve_scope(NAME, "connection", scope).get(cid)
+        if held is None and _labelled(cid) is not None:
+            cid = _labelled(cid)
+            held = adapter.resolve_scope(NAME, "connection", scope).get(cid)
     except StoreError as e:
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
     existing = dict((held or {}).get("value") or {})
@@ -925,6 +961,47 @@ def _cmd_connection(argv: list[str]) -> None:
         if scope == "global" or out.get("granted") is False:
             out["hint"] = _grant_hint(cid)
     _emit(out)
+
+
+def _cmd_connection_rename(argv: list[str], usage: str) -> None:
+    """`connection rename <id> <label>` changes what a connection is called
+    and nothing else: its id, which every grant, default pointer, secret's
+    env key and this capability's own state hold, stays, so whoever used it
+    by its id keeps it and its label now names it too. The connection is
+    named by its id or its current label; renaming it to its id clears the
+    label. Only a connection the store holds has a label."""
+    flags = [w for w in argv if w.startswith("--")]
+    if flags:
+        _die(6, "input", f"unknown connection rename option {flags[0]!r}", usage)
+    if len(argv) != 2:
+        _die(6, "input", "connection rename names one connection and its new label", usage)
+    wanted, label = argv
+    if (label != label.strip() or not label or len(label) > 128
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in label)):
+        _die(6, "input", f"label {label!r} is up to 128 characters with no control "
+             "character and no space at either end", usage)
+    _read_only_gate(f"`{NAME} connection rename`")
+    adapter = _records()
+    try:
+        held = adapter.connections(NAME, write_default=WRITE_DEFAULT, include_disabled=True)
+        cid = wanted if wanted in held else _labelled(wanted)
+        if cid is None or cid not in held:
+            _die(3, "unknown_connection", f"no {NAME} connection {wanted!r}",
+                 f"`{NAME} connections` lists them")
+        source = adapter.record_source(NAME, "connection", held[cid]["scope"][0], cid)
+        if not str(source).startswith("store:"):
+            _die(6, "connection_not_in_store",
+                 f"connection {cid!r} is kept in {source}, where a connection is called "
+                 "by its id and has no label",
+                 "move this project into the store with `capabilities migrate`")
+        before = _connection_labels().get(cid)
+        adapter.rename_connection(NAME, cid, label)
+        after = _records().connection_labels(NAME).get(cid)
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+    _emit({"ok": True, "action": "rename", "connection": cid, "label": after or cid,
+           "previous_label": before or cid, "changed": (before or cid) != (after or cid),
+           "registry": source})
 
 
 def _reveal_args(argv: list[str], usage: str) -> tuple[str | None, list[str]]:
