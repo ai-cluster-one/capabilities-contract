@@ -402,10 +402,9 @@ def test_an_update_run_is_asked_taken_up_and_ended_one_at_a_time_per_node(nodes)
 
 def test_a_store_at_the_updates_step_takes_only_the_logs_step(store):
     steps = store_tier.record_table_steps()
-    assert steps[-1][0] == "0033-node-logs"
-    assert store_tier.STORE_TABLES_VERSION == (1, 18)
-    _migrate(steps[:-1], 1, 17)
-    result = _migrate(steps, *store_tier.STORE_TABLES_VERSION)
+    at = [step[0] for step in steps].index("0033-node-logs")
+    _migrate(steps[:at], 1, 17)
+    result = _migrate(steps[:at + 1], 1, 18)
     assert result.applied == ["0033-node-logs"]
     with _conn() as conn:
         [(comment,)] = conn.execute("SELECT obj_description("
@@ -481,3 +480,55 @@ def test_log_lines_go_with_their_service_their_agents_link_and_their_node(nodes)
         with conn.transaction():
             conn.execute("DELETE FROM capabilities_nodes WHERE id = 'aaaaaaaaaaaa'")
         assert store_tier.node_logs(conn, AGENT, ["aaaaaaaaaaaa"]) == []
+
+
+def test_a_store_at_the_logs_step_takes_only_the_session_reasons_step(store):
+    steps = store_tier.record_table_steps()
+    assert steps[-1][0] == "0034-node-session-reasons"
+    assert store_tier.STORE_TABLES_VERSION == (1, 19)
+    _migrate(steps[:-1], 1, 18)
+    result = _migrate(steps, *store_tier.STORE_TABLES_VERSION)
+    assert result.applied == ["0034-node-session-reasons"]
+    with _conn() as conn:
+        uncommented = conn.execute(
+            "SELECT a.attname FROM pg_attribute a"
+            " WHERE a.attrelid = to_regclass('capabilities_node_sessions')"
+            " AND a.attnum > 0 AND NOT a.attisdropped"
+            " AND col_description(a.attrelid, a.attnum) IS NULL").fetchall()
+    assert {"reason", "reason_keys"}.isdisjoint(name for (name,) in uncommented)
+
+
+def test_a_session_that_is_down_says_why_and_a_row_without_a_reason_reads_as_before(nodes):
+    with _conn() as conn:
+        with conn.transaction():
+            store_tier.node_sessions_put(conn, AGENT, NODE, "telegram", [
+                ("personal", False, None, "key_missing", ["TELEGRAM_API_HASH"]),
+                ("spare", False, None, "not_signed_in", None),
+                ("third", False, None, "session_missing", None),
+                ("work", True, "100", None, None)])
+            store_tier.node_sessions_put(conn, AGENT, NODE, "whatsapp", [("main", False, None)])
+        rows = store_tier.node_sessions(conn, AGENT, [NODE])
+    assert [(r["capability"], r["connection"], r["live"], r["account"], r["reason"],
+             r["reason_keys"]) for r in rows] == [
+        ("telegram", "personal", False, None, "key_missing", ["TELEGRAM_API_HASH"]),
+        ("telegram", "spare", False, None, "not_signed_in", None),
+        ("telegram", "third", False, None, "session_missing", None),
+        ("telegram", "work", True, "100", None, None),
+        ("whatsapp", "main", False, None, None, None)]
+    for bad in (("main", True, None, "not_signed_in", None),
+                ("main", False, None, "logged_out", None),
+                ("main", False, None, "key_missing", None),
+                ("main", False, None, "not_signed_in", ["TELEGRAM_API_HASH"])):
+        with _conn() as conn, pytest.raises(store_tier.StoreError) as raised:
+            store_tier.node_sessions_put(conn, AGENT, NODE, "telegram", [bad])
+        assert raised.value.slug == "bad_state"
+    import psycopg
+    for live, reason, keys in ((True, "not_signed_in", None), (False, "logged_out", None),
+                               (False, "key_missing", None), (False, "key_missing", []),
+                               (False, "key_missing", [""]),
+                               (False, "not_signed_in", ["TELEGRAM_API_HASH"])):
+        with _conn() as conn, pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute("INSERT INTO capabilities_node_sessions (project_id, node,"
+                         " capability, connection, live, reason, reason_keys)"
+                         " VALUES (%s, %s, 'telegram', 'main', %s, %s, %s)",
+                         (AGENT, NODE, live, reason, keys))

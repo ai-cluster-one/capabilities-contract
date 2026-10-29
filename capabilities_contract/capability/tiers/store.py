@@ -334,7 +334,7 @@ NODE_LOG_MANAGER = "manager"
 NODE_LOG_LINES = 100
 NODE_LOG_LINE_CHARS = 500
 NODE_LOG_MASK = "***"
-STORE_TABLES_VERSION = (1, 18)
+STORE_TABLES_VERSION = (1, 19)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -1540,6 +1540,33 @@ def record_table_steps() -> list[tuple[str, str]]:
          " 'The source''s last lines, oldest first.';"
          " COMMENT ON COLUMN capabilities_node_logs.captured_at IS"
          " 'The store''s time of the write that last replaced the lines.'"),
+        # Why a connection's session is down on a node, in a closed set the
+        # node's manager derives from the capability's own connections answer:
+        # a required key that does not resolve there, naming each such key as
+        # the doctor gate names it, else the capability's word that the device
+        # session is missing or not signed in. A row with no reason is one
+        # whose capability states none, or one a manager from before this step
+        # wrote; a live session has none.
+        ("0034-node-session-reasons",
+         "ALTER TABLE capabilities_node_sessions"
+         " ADD COLUMN reason text"
+         "  CHECK (reason IN ('not_signed_in', 'session_missing', 'key_missing')),"
+         " ADD COLUMN reason_keys text[]"
+         "  CHECK (cardinality(reason_keys) > 0 AND array_position(reason_keys, NULL) IS NULL"
+         "   AND array_position(reason_keys, '') IS NULL),"
+         " ADD CONSTRAINT capabilities_node_sessions_reason_when_down"
+         "  CHECK (reason IS NULL OR NOT live),"
+         " ADD CONSTRAINT capabilities_node_sessions_keys_with_key_missing"
+         "  CHECK ((reason_keys IS NOT NULL) = coalesce(reason = 'key_missing', false));"
+         " COMMENT ON COLUMN capabilities_node_sessions.reason IS"
+         " 'Why the session is down on the node: key_missing (a key the connection"
+         " requires does not resolve there, named in reason_keys), session_missing (the"
+         " capability says no device session of the connection exists there) or"
+         " not_signed_in (one exists but is not signed in). Null where the session is"
+         " live, or where the capability states no reason.';"
+         " COMMENT ON COLUMN capabilities_node_sessions.reason_keys IS"
+         " 'The required keys that do not resolve on the node, as the capability''s"
+         " connections answer reports them; set exactly when reason is key_missing.'"),
     ]
 
 
@@ -1595,7 +1622,11 @@ NODE_STATE_COLUMNS = ("load_1", "load_5", "load_15", "cpu_count", "memory_used_b
 NODE_LOGIN_COLUMNS = tuple(f"{tool}_{part}" for tool in NODE_STATE_TOOLS
                            for part in ("login", "account"))
 NODE_LOGIN_NEED_COLUMNS = tuple(f"{tool}_needed" for tool in NODE_STATE_TOOLS)
-NODE_SESSION_COLUMNS = ("node", "capability", "connection", "live", "account", "checked_at")
+NODE_SESSION_COLUMNS = ("node", "capability", "connection", "live", "account", "reason",
+                        "reason_keys", "checked_at")
+# Why a session is down on a node: a required key that does not resolve there,
+# else the device session missing, else not signed in.
+NODE_SESSION_REASONS = ("key_missing", "session_missing", "not_signed_in")
 NODE_EXPECTATION_COLUMNS = ("expected", "updated_at", "updated_by")
 # The node's update availability on its state row, which its regular state
 # write leaves alone, and an update run's row.
@@ -1676,18 +1707,33 @@ def node_logins_put(conn: Any, project_id: str, node: str,
 
 
 def node_sessions_put(conn: Any, project_id: str, node: str, capability: str,
-                      sessions: Sequence[tuple[str, bool, str | None]]) -> None:
+                      sessions: Sequence[tuple]) -> None:
     """Replace the project's sessions of `capability` on `node` with
-    `sessions`, each (connection, live, account); `checked_at` is the store's
-    now. An empty set leaves the project no row for it there."""
+    `sessions`, each (connection, live, account) or (connection, live,
+    account, reason, reason_keys): reason one of NODE_SESSION_REASONS or
+    None, never beside a live session, and reason_keys the keys that do not
+    resolve, given exactly with key_missing. `checked_at` is the store's now.
+    An empty set leaves the project no row for it there."""
+    rows = []
+    for session in sessions:
+        connection, live, account, reason, keys = (*session, None, None)[:5]
+        keys = [str(k) for k in keys or () if str(k)] or None
+        if reason is not None and (reason not in NODE_SESSION_REASONS or live):
+            raise StoreError("bad_state", f"session reason {reason!r} is not one of "
+                             f"{', '.join(NODE_SESSION_REASONS)} beside a session that "
+                             "is not live")
+        if (keys is not None) != (reason == "key_missing"):
+            raise StoreError("bad_state", "a session names the keys that do not resolve"
+                             " exactly when its reason is key_missing")
+        rows.append((connection, bool(live), _node_text(account), reason, keys))
     conn.execute("DELETE FROM capabilities_node_sessions"
                  " WHERE project_id = %s AND node = %s AND capability = %s",
                  (project_id, node, capability))
-    for connection, live, account in sessions:
+    for connection, live, account, reason, keys in rows:
         conn.execute("INSERT INTO capabilities_node_sessions (project_id, node, capability,"
-                     " connection, live, account) VALUES (%s, %s, %s, %s, %s, %s)",
-                     (project_id, node, capability, connection, bool(live),
-                      _node_text(account)))
+                     " connection, live, account, reason, reason_keys)"
+                     " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                     (project_id, node, capability, connection, live, account, reason, keys))
 
 
 def node_agents_prune(conn: Any, node: str, asked: Sequence[str],
