@@ -44,13 +44,12 @@ def _seed():
 
 def test_a_store_at_the_node_disabled_step_takes_only_the_label_step_and_keeps_every_grant(store):
     steps = store_tier.record_table_steps()
-    assert steps[-1][0] == "0036-connection-label"
-    assert store_tier.STORE_TABLES_VERSION == (1, 21)
-    _migrate(steps[:-1], 1, 20)
+    at = [step[0] for step in steps].index("0036-connection-label")
+    _migrate(steps[:at], 1, 20)
     _seed()
     before = _sql("SELECT agent_id, capability, connection, enabled, is_default"
                   " FROM capabilities_connection_grants ORDER BY agent_id")
-    result = _migrate(steps, *store_tier.STORE_TABLES_VERSION)
+    result = _migrate(steps[:at + 1], 1, 21)
     assert result.applied == ["0036-connection-label"]
     assert _sql("SELECT agent_id, capability, connection, enabled, is_default"
                 " FROM capabilities_connection_grants ORDER BY agent_id") == before

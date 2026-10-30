@@ -334,7 +334,7 @@ NODE_LOG_MANAGER = "manager"
 NODE_LOG_LINES = 100
 NODE_LOG_LINE_CHARS = 500
 NODE_LOG_MASK = "***"
-STORE_TABLES_VERSION = (1, 21)
+STORE_TABLES_VERSION = (1, 22)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -1619,6 +1619,85 @@ def record_table_steps() -> list[tuple[str, str]]:
          " 'What the connection is called, set by `<capability> connection rename`; null"
          " shows its id. No id or label of the capability is another row''s id or"
          " label.'"),
+        # An agent's kind: an ordinary agent, or a system agent an app keeps
+        # on each machine for itself, whose identity and doctrine no edit
+        # changes. A system agent stays one, lives on one node, and a node
+        # holds at most one; system agents on different machines may share a
+        # slug, which no ordinary agent shares with any.
+        ("0037-agent-kind",
+         "ALTER TABLE capabilities_agents ADD COLUMN kind text NOT NULL DEFAULT 'agent'"
+         " CHECK (kind IN ('agent', 'system'));"
+         " DROP INDEX capabilities_agents_slug;"
+         " CREATE UNIQUE INDEX capabilities_agents_slug ON capabilities_agents (slug)"
+         "  WHERE kind = 'agent';"
+         " CREATE FUNCTION capabilities_agents_kind() RETURNS trigger"
+         "  LANGUAGE plpgsql SET search_path FROM CURRENT AS $kind$"
+         " BEGIN"
+         "  IF TG_OP = 'UPDATE' AND OLD.kind = 'system' AND NEW.kind <> 'system' THEN"
+         "   RAISE EXCEPTION 'agent % is a system agent and stays one', OLD.id"
+         "    USING ERRCODE = 'check_violation';"
+         "  END IF;"
+         "  PERFORM pg_advisory_xact_lock(hashtext('capabilities_agents:kind'));"
+         "  IF NEW.slug IS NOT NULL AND EXISTS (SELECT 1 FROM capabilities_agents"
+         "   WHERE slug = NEW.slug AND id <> NEW.id"
+         "   AND (kind = 'agent' OR NEW.kind = 'agent')) THEN"
+         "   RAISE EXCEPTION 'slug % is already another agent''s', NEW.slug"
+         "    USING ERRCODE = 'unique_violation';"
+         "  END IF;"
+         "  IF NEW.kind = 'system' AND (TG_OP = 'INSERT' OR OLD.kind <> 'system') THEN"
+         "   IF (SELECT count(*) FROM capabilities_agent_nodes WHERE agent_id = NEW.id) > 1 THEN"
+         "    RAISE EXCEPTION 'agent % lives on more than one node, and a system agent"
+         " lives on one', NEW.id USING ERRCODE = 'check_violation';"
+         "   END IF;"
+         "   IF EXISTS (SELECT 1 FROM capabilities_agent_nodes l"
+         "    JOIN capabilities_agent_nodes o ON o.node = l.node AND o.agent_id <> l.agent_id"
+         "    JOIN capabilities_agents a ON a.id = o.agent_id AND a.kind = 'system'"
+         "    WHERE l.agent_id = NEW.id) THEN"
+         "    RAISE EXCEPTION 'the node of agent % already holds a system agent', NEW.id"
+         "     USING ERRCODE = 'unique_violation';"
+         "   END IF;"
+         "  END IF;"
+         "  RETURN NEW;"
+         " END $kind$;"
+         " CREATE TRIGGER capabilities_agents_kind"
+         "  BEFORE INSERT OR UPDATE OF kind, slug ON capabilities_agents"
+         "  FOR EACH ROW EXECUTE FUNCTION capabilities_agents_kind();"
+         " CREATE FUNCTION capabilities_agent_nodes_system() RETURNS trigger"
+         "  LANGUAGE plpgsql SET search_path FROM CURRENT AS $system$"
+         " BEGIN"
+         "  IF NOT EXISTS (SELECT 1 FROM capabilities_agents"
+         "   WHERE id = NEW.agent_id AND kind = 'system') THEN"
+         "   RETURN NEW;"
+         "  END IF;"
+         "  PERFORM pg_advisory_xact_lock(hashtext('capabilities_agents:kind'));"
+         "  IF EXISTS (SELECT 1 FROM capabilities_agent_nodes"
+         "   WHERE agent_id = NEW.agent_id AND node <> NEW.node"
+         "   AND (TG_OP = 'INSERT' OR node <> OLD.node)) THEN"
+         "   RAISE EXCEPTION 'agent % is a system agent, which lives on one node',"
+         "    NEW.agent_id USING ERRCODE = 'check_violation';"
+         "  END IF;"
+         "  IF EXISTS (SELECT 1 FROM capabilities_agent_nodes l"
+         "   JOIN capabilities_agents a ON a.id = l.agent_id AND a.kind = 'system'"
+         "   WHERE l.node = NEW.node AND l.agent_id <> NEW.agent_id) THEN"
+         "   RAISE EXCEPTION 'node % already holds a system agent', NEW.node"
+         "    USING ERRCODE = 'unique_violation';"
+         "  END IF;"
+         "  RETURN NEW;"
+         " END $system$;"
+         " CREATE TRIGGER capabilities_agent_nodes_system"
+         "  BEFORE INSERT OR UPDATE OF agent_id, node ON capabilities_agent_nodes"
+         "  FOR EACH ROW EXECUTE FUNCTION capabilities_agent_nodes_system();"
+         " COMMENT ON COLUMN capabilities_agents.kind IS"
+         " 'agent: an ordinary agent; system: an agent an app keeps on one machine for"
+         " itself (capabilities init --system), whose name, identity and doctrine the"
+         " manager refuses to change and which agent lists for people leave out. A"
+         " system agent stays one, lives on one node, and a node holds at most one.';"
+         " COMMENT ON COLUMN capabilities_agents.slug IS"
+         " 'The agent''s short technical name: lowercase letters, digits and hyphens. No"
+         " two ordinary agents share one, and no ordinary agent shares one with a system"
+         " agent; system agents on different nodes may share one. It names the agent''s"
+         " state directories, service log lines and --project shorthand; null while it"
+         " has none, where the id stands in.'"),
     ]
 
 
@@ -5327,6 +5406,22 @@ def agent_slug(conn: Any, agent_id: str) -> str | None:
         conn.rollback()
         return None
     return row[0] if row and row[0] else None
+
+
+def agent_kind(conn: Any, agent_id: str) -> str | None:
+    """The agent's kind as its registry row holds it, `agent` or `system`:
+    None where the store holds no such row, and `agent` where its registry
+    predates kinds."""
+    import psycopg
+    try:
+        row = conn.execute(f"SELECT to_jsonb(a) ->> 'kind' FROM {STORE_AGENTS_TABLE} a"
+                           " WHERE id = %s", (agent_id,)).fetchone()
+    except psycopg.errors.UndefinedTable:
+        conn.rollback()
+        return None
+    if row is None:
+        return None
+    return row[0] or "agent"
 
 
 def open_records(envelope: Path | str, global_dir: Path | str,

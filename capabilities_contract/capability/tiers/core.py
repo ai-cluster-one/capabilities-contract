@@ -789,6 +789,41 @@ def _read_only_gate(action: str) -> None:
              f"run in a process without {READ_ONLY_ENV}.")
 
 
+def _system_agent_gate(action: str) -> None:
+    """Refuse `action` where this project's agent is a system agent: one an
+    app keeps on its machine for itself, whose identity and doctrine no edit
+    changes (`capabilities_agents.kind`). A project with no store, or whose
+    store holds no row for it, is no system agent; a store that does not
+    answer is refused as the read would be."""
+    root = _project_root()
+    ident = _project_id_state_at(root)["id"] if root is not None else None
+    if not ident:
+        return
+    try:
+        conn, _schema = _store_connect(root, NAME, _PROBE_TIMEOUT)
+    except StoreError as e:
+        if e.slug == "store_not_configured":
+            return
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+    import psycopg
+    try:
+        kind = agent_kind(conn, ident)
+    except psycopg.Error as exc:
+        _die(5, "store_unreachable", f"cannot read the agent registry: {exc}",
+             "check the database setting with `capabilities store doctor`")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if kind == "system":
+        _die(4, "system_agent",
+             f"{action} is refused: agent {ident} is a system agent, whose identity "
+             "and doctrine no edit changes",
+             "A system agent's name and doctrine come from the app that keeps it; "
+             "change them there, not here.")
+
+
 _MACHINE_SCHEMA = "capabilities.machine.v1"
 
 
