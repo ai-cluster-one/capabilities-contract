@@ -25,6 +25,12 @@ transaction pooler (Supabase's, a host under its pooler domain on port 6543): su
 store is transaction-only, reached by transaction connections alone, and has no session
 address until one is named apart - the session pooler as its address, the transaction
 pooler as its transaction address.
+
+A level may instead declare its one address a transaction pooler of any provider -
+`AGENTKIT_DB_TRANSACTION_POOLER` set to `true`, or `"transaction_pooler": true` in the
+machine file, applying beside a URL too - which makes the store transaction-only as
+Supabase's is. The declaration names no address of its own, so a level declaring it
+names no transaction address apart.
 """
 
 from __future__ import annotations
@@ -48,8 +54,10 @@ SSLMODES_REFUSED = ("disable", "allow", "prefer")
 SSLMODE_LOCAL = "disable"
 SETTING_FIELDS = ("host", "port", "database", "user", "sslmode", "sslrootcert")
 TRANSACTION_FIELDS = ("transaction_host", "transaction_port")
+POOLER_FIELD = "transaction_pooler"
 SCHEMA_FIELD = "db_schema"
-FORMAT_FIELDS = ("schema", *SETTING_FIELDS, *TRANSACTION_FIELDS, "password", SCHEMA_FIELD)
+FORMAT_FIELDS = ("schema", *SETTING_FIELDS, *TRANSACTION_FIELDS, POOLER_FIELD, "password",
+                 SCHEMA_FIELD)
 DEFAULT_SCHEMA = "agentkit"
 DEFAULT_PORT = 5432
 DEFAULT_SSLMODE = "require"
@@ -71,6 +79,9 @@ TRANSACTION_KEYS = {
     "AGENTKIT_DB_TRANSACTION_HOST": "transaction_host",
     "AGENTKIT_DB_TRANSACTION_PORT": "transaction_port",
 }
+# The declaration that the one address is a transaction pooler, and the values it takes.
+POOLER_KEY = "AGENTKIT_DB_TRANSACTION_POOLER"
+POOLER_VALUES = {"true": True, "1": True, "false": False, "0": False}
 # The separate fields, each key with the setting field it fills.
 FIELD_KEYS = {
     "AGENTKIT_DB_HOST": "host",
@@ -80,7 +91,7 @@ FIELD_KEYS = {
     "AGENTKIT_DB_SSLMODE": "sslmode",
     "AGENTKIT_DB_SSLROOTCERT": "sslrootcert",
 }
-KEYS = (URL_KEY, *FIELD_KEYS, PASSWORD_KEY, SCHEMA_KEY, *TRANSACTION_KEYS)
+KEYS = (URL_KEY, *FIELD_KEYS, PASSWORD_KEY, SCHEMA_KEY, *TRANSACTION_KEYS, POOLER_KEY)
 
 LEVELS = ("project", "environment", "machine")
 PROJECT_FILES = (".env.local", ".env")
@@ -206,10 +217,12 @@ class Setting:
     `transaction_host` and `transaction_port` name the store's transaction address
     when the level set one (either may be None, standing for the session address's
     own host or port); `has_transaction_address` says whether it did, that is whether
-    the store's two addresses are named apart. `has_session_address` says whether the
-    store has a session address: its address, when a transaction address is named apart
-    or when that one address is not a known transaction pooler. A store whose one address
-    is a known transaction pooler is transaction-only."""
+    the store's two addresses are named apart. `transaction_pooler` says whether the
+    level declared its one address a transaction pooler. `has_session_address` says
+    whether the store has a session address: its address, when a transaction address is
+    named apart or when that one address is neither declared nor known a transaction
+    pooler. A store whose one address is declared or known a transaction pooler is
+    transaction-only."""
 
     schema: str = DEFAULT_SCHEMA
     level: str = ""
@@ -224,6 +237,7 @@ class Setting:
     password: str | None = field(default=None, repr=False)
     transaction_host: str | None = None
     transaction_port: int | None = None
+    transaction_pooler: bool = False
 
     @property
     def has_transaction_address(self) -> bool:
@@ -233,8 +247,9 @@ class Setting:
     def has_session_address(self) -> bool:
         """Whether the store has a session address: a transaction address is named
         apart, the address being then the session address, or the store's one address
-        is not a known transaction pooler."""
-        return self.has_transaction_address or self._transaction_pooler_endpoint() is None
+        is neither declared nor known a transaction pooler."""
+        return self.has_transaction_address or (
+            not self.transaction_pooler and self._transaction_pooler_endpoint() is None)
 
     def _transaction_pooler_endpoint(self) -> tuple[str, int] | None:
         """The first host and port of the setting's address, as libpq reads it, that is
@@ -279,10 +294,13 @@ class Setting:
         `addresses` gives the address each kind of connection dials, as libpq resolves
         it: `transaction` the transaction address, or the one address when none is
         named apart, and `session` the session address, or None for a
-        transaction-only store."""
+        transaction-only store. `transaction_pooler` is true where the level declared
+        its one address a transaction pooler, and absent otherwise."""
         out = {"level": self.level, "sources": list(self.sources), "schema": self.schema}
         if self.has_transaction_address:
             out["transaction"] = {"host": self.transaction_host, "port": self.transaction_port}
+        if self.transaction_pooler:
+            out[POOLER_FIELD] = True
         out["addresses"] = {
             "transaction": _address_report(self.transaction_kwargs),
             "session": (_address_report(self.connect_kwargs)
@@ -361,14 +379,35 @@ def check_transaction_address(values: dict, sslmode: object, host: object) -> di
     return out
 
 
+def check_transaction_pooler(value: object, transaction: dict) -> dict:
+    """The declaration that the store's one address is a transaction pooler, checked,
+    or DbError: true or false, on a level whose `transaction` address fields name none
+    apart. False is the same as no declaration."""
+    if value is None or value is False:
+        return {}
+    if value is not True:
+        raise DbError("bad_store_setting",
+                      "the store setting's transaction_pooler must be true or false")
+    if transaction:
+        raise DbError("bad_store_setting",
+                      "the store setting declares its one address a transaction pooler "
+                      "and also names a transaction address apart",
+                      "declare it only for a store with one address; a store with a "
+                      "session address names its transaction pooler as its transaction "
+                      "address")
+    return {POOLER_FIELD: True}
+
+
 def check_setting(values: dict) -> dict:
     """The setting's non-secret values, checked and normalised, or DbError: no unknown
     field, host/database/user without whitespace, port 1-65535, sslmode at least
     `require`, or `disable` for a local host. A transaction address is checked as
-    `check_transaction_address` checks it."""
+    `check_transaction_address` checks it, and the transaction pooler declaration as
+    `check_transaction_pooler` does."""
     if not isinstance(values, dict):
         raise DbError("bad_store_setting", "the store setting is not an object")
-    unknown = sorted(set(values) - set(SETTING_FIELDS) - set(TRANSACTION_FIELDS))
+    unknown = sorted(set(values) - set(SETTING_FIELDS) - set(TRANSACTION_FIELDS)
+                     - {POOLER_FIELD})
     if unknown:
         raise DbError("bad_store_setting",
                       f"the store setting carries unknown fields: {', '.join(unknown)}")
@@ -390,7 +429,9 @@ def check_setting(values: dict) -> dict:
             raise DbError("bad_store_setting",
                           "sslrootcert must be a certificate file path or `system`")
         out["sslrootcert"] = root
-    out.update(check_transaction_address(values, sslmode, out["host"]))
+    transaction = check_transaction_address(values, sslmode, out["host"])
+    out.update(transaction)
+    out.update(check_transaction_pooler(values.get(POOLER_FIELD), transaction))
     return out
 
 
@@ -464,18 +505,24 @@ def _from_keys(level: str, found: dict[str, tuple[str, str]]) -> Setting:
                       f"the {level} level sets keys the database setting does not have: "
                       f"{', '.join(unknown)} ({_where(found, unknown)})",
                       f"use only {', '.join(KEYS)}")
-    used = [URL_KEY, SCHEMA_KEY, *TRANSACTION_KEYS] if URL_KEY in found else list(found)
+    used = [URL_KEY, SCHEMA_KEY, *TRANSACTION_KEYS, POOLER_KEY] if URL_KEY in found \
+        else list(found)
     used = [key for key in used if key in found]
     transaction = {name: found[key][0] for key, name in TRANSACTION_KEYS.items()
                    if key in found}
+    if POOLER_KEY in found:
+        declared = found[POOLER_KEY][0]
+        transaction[POOLER_FIELD] = POOLER_VALUES.get(declared.strip().lower(), declared)
     try:
         schema = check_schema_name(found[SCHEMA_KEY][0]) if SCHEMA_KEY in found \
             else DEFAULT_SCHEMA
         if URL_KEY in found:
             url = check_url(found[URL_KEY][0])
+            address = check_transaction_address(transaction, _url_sslmode(url),
+                                                _url_host(url))
             return Setting(schema=schema, level=level, sources=_sources(found, used),
-                           url=url, **check_transaction_address(
-                               transaction, _url_sslmode(url), _url_host(url)))
+                           url=url, **address, **check_transaction_pooler(
+                               transaction.get(POOLER_FIELD), address))
         values = {name: found[key][0] for key, name in FIELD_KEYS.items() if key in found}
         values.update(transaction)
         values.setdefault("sslmode", DEFAULT_SSLMODE)
@@ -551,7 +598,8 @@ def _read_machine_file(path: Path, raw: str) -> Setting:
                       f"{', '.join(unknown)}",
                       "rewrite it with `capabilities store set`")
     values = check_setting({k: v for k, v in data.items()
-                            if k in SETTING_FIELDS or k in TRANSACTION_FIELDS})
+                            if k in SETTING_FIELDS or k in TRANSACTION_FIELDS
+                            or k == POOLER_FIELD})
     schema = DEFAULT_SCHEMA
     if data.get(SCHEMA_FIELD) is not None:
         schema = check_schema_name(data[SCHEMA_FIELD])

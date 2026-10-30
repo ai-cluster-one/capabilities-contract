@@ -47,6 +47,7 @@ from capabilities_contract.db._setting import (
     SUPABASE_POOLER_DOMAIN,  # noqa: F401 - kept importable here, where it was defined
     TRANSACTION_POOLER_PORT,
     Setting,
+    _address_report,
     check_schema_name,
     resolve_setting,
 )
@@ -779,9 +780,22 @@ def _refuse_transaction_pooler(setting: Setting) -> None:
     """Refuse, before anything is sent, a session connection to a known transaction
     pooler, which keeps no session between transactions: the store's session address
     is one, or the store's only address is, so it has no session address at all. A
+    store whose one address is declared a transaction pooler has none either. A
     transaction connection may reach one."""
     found = setting._transaction_pooler_endpoint()
     if found is None:
+        if setting.transaction_pooler:
+            address = _address_report(setting.connect_kwargs)
+            raise DbError(
+                "transaction_pooler",
+                f"the store's only address, {address['host'] or 'the local socket'}:"
+                f"{address['port']}, is declared a transaction pooler, which keeps no "
+                "session between transactions, so a session connection - LISTEN, a "
+                "session lock, a session setting - cannot be served there; the store "
+                "serves transaction connections only",
+                "give the store a session address apart: an address of the same store "
+                "that keeps a session, named with `capabilities store set ... "
+                "--session-host H --session-port P` in place of --transaction-pooler")
         return
     host, port = found
     if not setting.has_transaction_address:
@@ -882,7 +896,8 @@ def connect(*, application_name: str, project_root: Path | str | None = None,
     notice: the statement fails as a lost connection, and a plain read that may
     run again does so on a new one.
     A session connection to Supabase's transaction pooler - the store's session
-    address, or its only address, when the store is transaction-only - is refused as
+    address, or its only address, when the store is transaction-only - or to a store
+    whose one address is declared a transaction pooler is refused as
     `transaction_pooler` before anything is sent to it. A transaction connection to
     a transaction-only store is proven to answer as at a transaction address of its
     own."""

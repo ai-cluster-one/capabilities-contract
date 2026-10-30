@@ -15,6 +15,7 @@ import uuid
 
 import psycopg
 import pytest
+from conftest import write_family_setting
 
 from capabilities_contract.db import (
     DbError,
@@ -26,6 +27,7 @@ from capabilities_contract.db import (
     connect,
     disconnect,
     migrate,
+    resolve_setting,
 )
 
 POOLER = "aws-0-region.pooler.supabase.com"
@@ -118,6 +120,103 @@ def test_the_report_names_the_address_each_kind_of_connection_dials():
     assert only.report()["addresses"] == {"transaction": {"host": POOLER, "port": 6543},
                                           "session": None}
 
+
+
+# --- a store declared a transaction pooler ----------------------------------------
+
+BOUNCER = "bouncer.example.test"
+
+
+@pytest.mark.parametrize("setting", [
+    _fields(BOUNCER, 6432, transaction_pooler=True),
+    Setting(level="environment", transaction_pooler=True,
+            url=f"postgresql://agent:{PASSWORD}@{BOUNCER}:6432/postgres"),
+], ids=["fields", "url"])
+def test_a_store_declared_a_transaction_pooler_is_transaction_only(opened, setting):
+    assert not setting.has_transaction_address and not setting.has_session_address
+    report = setting.report()
+    assert report["transaction_pooler"] is True
+    assert report["addresses"] == {"transaction": {"host": BOUNCER, "port": 6432},
+                                   "session": None}
+    with pytest.raises(DbError) as caught:
+        connect(application_name="test", setting=setting, transaction=True)
+    assert caught.value.slug == "store_unreachable"
+    [(_, proven)] = opened
+    assert proven is True
+
+    with pytest.raises(DbError) as caught:
+        connect(application_name="test", setting=setting)
+    error = caught.value
+    assert error.slug == "transaction_pooler"
+    assert f"only address, {BOUNCER}:6432, is declared a transaction pooler" in error.message
+    assert "--session-host" in error.hint and "--transaction-pooler" in error.hint
+    assert PASSWORD not in error.message + error.hint
+    assert len(opened) == 1
+
+
+def test_a_store_not_declared_one_reports_as_before():
+    for setting in (_fields(BOUNCER, 6432), _fields(POOLER, 6543),
+                    _fields(BOUNCER, 6432, transaction_pooler=False)):
+        assert "transaction_pooler" not in setting.report()
+    assert _fields(BOUNCER, 6432).has_session_address
+    assert not _fields(POOLER, 6543).has_session_address
+
+
+@pytest.mark.parametrize("value,declared", [("true", True), ("TRUE", True), ("1", True),
+                                            ("false", False), ("0", False)])
+def test_the_declaration_is_read_from_a_level_s_keys(clean_env, monkeypatch, value,
+                                                     declared):
+    for key, found in (("AGENTKIT_DB_HOST", BOUNCER), ("AGENTKIT_DB_PORT", "6432"),
+                       ("AGENTKIT_DB_NAME", "app"), ("AGENTKIT_DB_USER", "agent"),
+                       ("AGENTKIT_DB_TRANSACTION_POOLER", value)):
+        monkeypatch.setenv(key, found)
+    setting = resolve_setting(None)
+    assert setting.transaction_pooler is declared
+    assert setting.has_session_address is not declared
+    assert "AGENTKIT_DB_TRANSACTION_POOLER" in setting.sources
+
+
+def test_the_declaration_applies_beside_a_url(clean_env, monkeypatch):
+    monkeypatch.setenv("AGENTKIT_DB_URL", f"postgresql://agent@{BOUNCER}:6432/app")
+    monkeypatch.setenv("AGENTKIT_DB_HOST", "ignored.example.test")
+    monkeypatch.setenv("AGENTKIT_DB_TRANSACTION_POOLER", "true")
+    setting = resolve_setting(None)
+    assert setting.transaction_pooler and not setting.has_session_address
+
+
+def test_the_declaration_is_read_from_the_machine_file(clean_env):
+    document = {"schema": "agentkit.store.v1", "host": BOUNCER, "port": 6432,
+                "database": "app", "user": "agent", "sslmode": "require"}
+    write_family_setting(clean_env, {**document, "transaction_pooler": True})
+    assert not resolve_setting(None).has_session_address
+    write_family_setting(clean_env, {**document, "transaction_pooler": False})
+    assert resolve_setting(None).has_session_address
+
+
+@pytest.mark.parametrize("more", [{"transaction_pooler": "true"},
+                                  {"transaction_pooler": 1},
+                                  {"transaction_pooler": True, "transaction_port": 6543},
+                                  {"transaction_pooler": True, "transaction_host": BOUNCER}])
+def test_a_bad_declaration_in_the_machine_file_is_refused(clean_env, more):
+    write_family_setting(clean_env, {"schema": "agentkit.store.v1", "host": BOUNCER,
+                                     "database": "app", "user": "agent",
+                                     "sslmode": "require", **more})
+    with pytest.raises(DbError) as caught:
+        resolve_setting(None)
+    assert caught.value.slug == "bad_store_setting"
+
+
+@pytest.mark.parametrize("keys", [{"AGENTKIT_DB_TRANSACTION_POOLER": "yes please"},
+                                  {"AGENTKIT_DB_TRANSACTION_POOLER": "true",
+                                   "AGENTKIT_DB_TRANSACTION_PORT": "6543"}])
+def test_a_bad_declaration_in_a_level_s_keys_is_refused(clean_env, monkeypatch, keys):
+    for key, found in {"AGENTKIT_DB_URL": f"postgresql://agent@{BOUNCER}/app",
+                       **keys}.items():
+        monkeypatch.setenv(key, found)
+    with pytest.raises(DbError) as caught:
+        resolve_setting(None)
+    assert caught.value.slug == "bad_store_setting"
+    assert "environment level" in caught.value.message
 
 # --- a follower that wakes at once ------------------------------------------------
 
