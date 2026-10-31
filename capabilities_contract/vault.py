@@ -260,6 +260,94 @@ def sealed_under_other(conn: Any, agent_id: str, key_fingerprint: str) -> int:
         "AND key_fingerprint <> %s", (agent_id, key_fingerprint)).fetchone()[0]
 
 
+# --- Writing from a process ------------------------------------------------------
+
+
+def _in_store(project_root: Path | str | None, application_name: str, work: Any) -> Any:
+    """`work(conn)` in one transaction against the store `project_root` resolves,
+    the store's own failures raised as VaultError `vault_unwritable`."""
+    from capabilities_contract import db
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise VaultError("vault_unwritable", f"the vault could not be written: {exc}") from None
+    try:
+        with db.connect(application_name=application_name, project_root=project_root,
+                        transaction=True) as conn, conn.transaction():
+            return work(conn)
+    except VaultError:
+        raise
+    except (DbError, psycopg.Error) as exc:
+        message = getattr(exc, "message", None) or str(exc).strip()
+        raise VaultError("vault_unwritable", f"the vault could not be written: {message}",
+                         "check the database setting with `capabilities store doctor`") \
+            from None
+
+
+def _forget(agent_id: str) -> None:
+    """Make this process's readers of `agent_id` read the vault again on their
+    next question, so what it just wrote is what it reads back."""
+    for slot, found in _READERS.items():
+        if slot[1] == agent_id:
+            found._sealed = None
+            found._opened.clear()
+
+
+def write(project_root: Path | str | None, agent_id: str, values: Mapping[str, str], *,
+          application_name: str = "capabilities",
+          updated_by: str | None = None) -> dict[str, str]:
+    """Seal each of `values` into `agent_id`'s vault under the key `project_root`
+    resolves, in one transaction, recording the key's fingerprint where the
+    agent has none yet: {name: "created" | "replaced"}. Nothing is written where
+    it refuses: VaultError `key_missing` with no key here, `bad_key`,
+    `agent_unregistered` where the store has no row for the agent, `key_mismatch`
+    where the agent's vault is kept under another key, `vault_unwritable` where
+    the store cannot be written."""
+    names = [check_name(name) for name in values]
+    key = agent_key(project_root)
+    if key is None:
+        raise VaultError("key_missing", f"this agent has no {KEY_ENV} here",
+                         "`capabilities key generate` makes the agent's first one")
+    current = fingerprint(key)
+
+    def seal_all(conn: Any) -> dict[str, str]:
+        found, recorded = recorded_key(conn, agent_id)
+        if not found:
+            raise VaultError("agent_unregistered",
+                             f"the store registers no agent {agent_id}",
+                             "run `capabilities init` in the agent's folder")
+        if recorded is None:
+            record_key(conn, agent_id, current)
+        elif recorded != current:
+            raise VaultError("key_mismatch",
+                             f"the {KEY_ENV} here is not the key agent {agent_id}'s vault "
+                             "is kept under",
+                             "bring the agent's key with `capabilities key set`")
+        held = {row[0] for row in conn.execute(
+            "SELECT name FROM capabilities_vault WHERE agent_id = %s AND name = ANY(%s)",
+            (agent_id, names)).fetchall()}
+        for name in names:
+            put(conn, key, agent_id, name, values[name], updated_by=updated_by)
+        return {name: "replaced" if name in held else "created" for name in names}
+
+    done = _in_store(project_root, application_name, seal_all)
+    _forget(agent_id)
+    return done
+
+
+def delete(project_root: Path | str | None, agent_id: str, names: Iterable[str], *,
+           application_name: str = "capabilities") -> list[str]:
+    """Remove the named rows of `agent_id`'s vault, which needs no key; the
+    names that were there. VaultError `vault_unwritable` where the store cannot
+    be written."""
+    wanted = [check_name(name) for name in names]
+    if not wanted:
+        return []
+    done = _in_store(project_root, application_name, lambda conn: remove(conn, agent_id, wanted))
+    _forget(agent_id)
+    return done
+
+
 # --- Reading in a process --------------------------------------------------------
 
 

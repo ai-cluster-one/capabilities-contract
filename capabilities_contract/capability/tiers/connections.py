@@ -502,9 +502,83 @@ def _record_identity(cid: str, ident, display_name: str | None = None) -> bool:
 # `connection add|remove` and `setup` are the one way every capability takes a
 # connection or a machine prerequisite from a person: the fields are the ones
 # the script declares (CONN_FIELDS, SETUP_FIELDS), a secret arrives on standard
-# input and never on argv, and it is written to the credentials file of the
-# scope the record lands in - the project's .env.local, or the capability's
-# credentials.env in the user's config home - never into a record.
+# input and never on argv, and it is sealed into the agent's vault, never into
+# a record. A file takes it only when asked (--file), at the machine's scope,
+# whose secret every agent on the machine shares, or where no vault here takes
+# it: the project's .env.local, or the capability's credentials.env in the
+# user's config home.
+
+def _vault_agent() -> tuple[str | None, str | None]:
+    """(the agent whose vault a secret written here goes into, None), or (None,
+    why there is none)."""
+    root = _project_root()
+    if root is None:
+        return None, "there is no project here, and a vault is an agent's"
+    agent = _project_id(write=True, refuse=False)
+    if not agent:
+        return None, "this project has no settled agent id"
+    return agent, None
+
+
+def _vault_writer() -> str:
+    try:
+        return f"{_user_name()}@{node_name()}"
+    except Exception:
+        return NAME
+
+
+def _vault_seal(secrets: dict) -> tuple[str | None, str | None]:
+    """Seal `secrets` into the agent's vault: ("vault:<agent>", None) once they
+    are, or (None, why not) with nothing sealed. A key a file of the cascade or
+    the process environment already sets is not sealed, since the cascade reads
+    those before the vault and the sealed value would not be the one used."""
+    agent, why = _vault_agent()
+    if agent is None:
+        return None, why
+    for key in sorted(secrets):
+        held = [str(path) for path, _val, _tier in _file_values(key)]
+        if not held and os.environ.get(key):
+            held = ["the process environment"]
+        if held:
+            return None, (f"{key} is already set in {held[0]}, which the cascade reads "
+                          "before the vault")
+    try:
+        from capabilities_contract import vault as _vault
+    except ImportError:
+        return None, "this capability's library carries no vault"
+    if not hasattr(_vault, "write"):
+        return None, "this capability's library cannot write the vault"
+    try:
+        _vault.write(_project_root(), agent, secrets, application_name=NAME,
+                     updated_by=_vault_writer())
+    except _vault.VaultError as e:
+        return None, e.message
+    for key in secrets:
+        _VAULT_UNREAD.pop(key, None)
+    return f"vault:{agent}", None
+
+
+def _vault_unseal(keys: list) -> tuple[list, str | None]:
+    """Take `keys` out of the agent's vault where this folder has the agent's
+    key: (the keys that were there, None), or ([], why it was not asked)."""
+    if not keys:
+        return [], None
+    agent, why = _vault_agent()
+    if agent is None:
+        return [], why
+    try:
+        from capabilities_contract import vault as _vault
+    except ImportError:
+        return [], "this capability's library carries no vault"
+    if not hasattr(_vault, "delete"):
+        return [], "this capability's library cannot write the vault"
+    if not _vault.key_source(_project_root())[0]:
+        return [], f"this agent has no {_vault.KEY_ENV} here"
+    try:
+        return _vault.delete(_project_root(), agent, keys, application_name=NAME), None
+    except _vault.VaultError as e:
+        return [], e.message
+
 
 def _env_file_key(line: str) -> str | None:
     stripped = line.strip()
@@ -686,10 +760,11 @@ def _scope_credentials(scope: str) -> Path:
 
 def _cmd_connection(argv: list[str]) -> None:
     """`connection add <id>` writes one connection from its declared fields,
-    its secrets into the scope's credentials file; `connection remove <id>`
-    takes it out again with the secrets it wrote."""
+    its secrets into the agent's vault, or the scope's credentials file at the
+    machine's scope, with --file, or where no vault here takes them;
+    `connection remove <id>` takes it out again with the secrets it wrote."""
     usage = (f"{NAME} connection add <id> [--project|--global|--machine] [--default] "
-             "[--replace] [--field KEY=VALUE ...] [--env KEY=ENV_KEY ...] [--stdin] "
+             "[--replace] [--file] [--field KEY=VALUE ...] [--env KEY=ENV_KEY ...] [--stdin] "
              "[--identity ID [--display-name TEXT]] | "
              f"{NAME} connection remove <id> [--project|--global|--machine] | "
              f"{NAME} connection rename <id> <label>")
@@ -745,9 +820,12 @@ def _cmd_connection(argv: list[str]) -> None:
     argv_values, words, stdin = _field_args(rest_argv, usage)
     default = "--default" in words
     replace = "--replace" in words
+    to_file = "--file" in words
     if replace and sub != "add":
         _die(6, "input", "--replace is an option of connection add", usage)
-    words = [w for w in words if w not in ("--default", "--replace")]
+    if to_file and sub != "add":
+        _die(6, "input", "--file is an option of connection add", usage)
+    words = [w for w in words if w not in ("--default", "--replace", "--file")]
     scope, rest = _connection_scope(words, usage)
     flags = [w for w in rest if w.startswith("--")]
     if flags:
@@ -813,23 +891,31 @@ def _cmd_connection(argv: list[str]) -> None:
             source = adapter.scope_source(NAME, "connection", scope)
         except StoreError as e:
             _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
-        removed, kept = [], []
+        own, kept = [], []
         for field in declared:
             env_key = existing.get(field["key"]) if field.get("secret") else None
             if not isinstance(env_key, str) or not env_key:
                 continue
             shared = any(entry.get(field["key"]) == env_key for entry in others.values())
-            if env_key == _connection_env_name(field, cid) and not shared \
-                    and env_key in _parse_env_file(credentials):
-                removed.append(env_key)
+            if env_key == _connection_env_name(field, cid) and not shared:
+                own.append(env_key)
             else:
                 kept.append(env_key)
+        held_in_file = _parse_env_file(credentials)
+        removed = [key for key in own if key in held_in_file]
         if removed:
             _env_file_write(credentials, {key: None for key in removed})
-        _emit({"ok": True, "action": "remove", "connection": cid, "scope": scope,
+        # The machine's scope writes no vault; a project's own secret may be in either.
+        unsealed, unread = _vault_unseal(own) if scope == "project" else ([], None)
+        kept += [key for key in own if key not in removed and key not in unsealed]
+        out = {"ok": True, "action": "remove", "connection": cid, "scope": scope,
                "registry": source, "default_cleared": was_default,
                "credentials": str(credentials) if removed else None,
-               "secrets_removed": removed, "secrets_kept": kept})
+               "secrets_removed": removed, "vault_removed": unsealed,
+               "secrets_kept": kept}
+        if unread and kept:
+            out["vault_not_read"] = unread
+        _emit(out)
         return
 
     if held is not None and not replace:
@@ -856,7 +942,8 @@ def _cmd_connection(argv: list[str]) -> None:
         if not _resolve_env_key(env_key)[0]:
             _die(6, "env_key_unset",
                  f"the env key --env names for {key} is set in none of the project's "
-                 f".env.local or .env, {CREDENTIALS_ENV}, or the environment",
+                 f".env.local or .env, {CREDENTIALS_ENV}, the environment, or the "
+                 "agent's vault",
                  "set it there first, or give the secret itself in the JSON object "
                  "on stdin")
     entry = dict(existing)
@@ -908,8 +995,12 @@ def _cmd_connection(argv: list[str]) -> None:
     if missing:
         _die(6, "fields_required", f"connection {cid!r} needs: {', '.join(missing)}",
              f"`{NAME} manifest` lists the fields; secrets go in the JSON object on stdin")
-    if secrets:
+    secrets_in, vault_skipped = None, None
+    if secrets and scope == "project" and not to_file:
+        secrets_in, vault_skipped = _vault_seal(secrets)
+    if secrets and secrets_in is None:
         _env_file_write(credentials, secrets)
+        secrets_in = str(credentials)
     try:
         if scope == "project" and adapter.mode_of("connection") == "store":
             # A connection added in a project in store mode is the project's
@@ -937,10 +1028,12 @@ def _cmd_connection(argv: list[str]) -> None:
         report.append(row)
     out = {"ok": True, "action": "add" if held is None else "update",
            "connection": cid, "scope": scope, "registry": source,
-           "credentials": str(credentials) if secrets else None,
-           "default": default, "fields": report,
+           "credentials": secrets_in if secrets and secrets_in == str(credentials) else None,
+           "secrets_in": secrets_in, "default": default, "fields": report,
            "identity": _connection_identity(entry),
            "next": f"`{NAME} doctor --connection {cid}` proves it"}
+    if vault_skipped:
+        out["vault_skipped"] = vault_skipped
     methods = globals().get("LINK_METHODS") or []
     if methods:
         out["link"] = [m.get("id") for m in methods]
@@ -1077,15 +1170,17 @@ def _setup_presentation() -> dict:
 def _cmd_setup(argv: list[str]) -> None:
     """`setup` reports the machine prerequisites the capability declares and
     where each resolves from; `setup show --reveal <KEY>` prints the one value
-    that report masks for KEY, in the clear; `setup set` writes them to the
-    capability's credentials.env, secrets from stdin; `setup unset` takes them out.
+    that report masks for KEY, in the clear; `setup set` writes them, secrets
+    from stdin: a secret into the agent's vault, every other field - and a
+    secret with --machine, with --file, or where no vault here takes it - into
+    the capability's credentials.env; `setup unset` takes them out of both.
     A field that declares `shared` is listed under `shared`, apart from
     `fields`, and is written to and removed from the machine's shared.env
     under its shared name, so one value serves every capability that declares
     it; unset also takes the key out of the capability's own credentials.env.
     `--machine` names a write as administration of the machine
     (`_machine_administration`)."""
-    usage = (f"{NAME} setup [show] [--reveal <KEY>] | setup set [--machine] "
+    usage = (f"{NAME} setup [show] [--reveal <KEY>] | setup set [--machine] [--file] "
              "[--field KEY=VALUE ...] [--stdin] | setup unset [--machine] <KEY> ...")
     declared = list(globals().get("SETUP_FIELDS") or [])
     reveal, argv = _reveal_args(argv, usage)
@@ -1106,9 +1201,12 @@ def _cmd_setup(argv: list[str]) -> None:
                  f"`{NAME} setup` says where each field resolves from")
         _emit(value)
         return
+    machine = sub != "show" and "--machine" in rest
+    to_file = sub == "set" and "--file" in rest
     if sub != "show":
-        rest = [w for w in rest if w != "--machine"]
+        rest = [w for w in rest if w not in ("--machine", "--file")]
     changed: list = []
+    secrets_in, vault_skipped, unsealed = None, None, None
     if sub == "set":
         argv_values, words, stdin = _field_args(rest, usage)
         if words:
@@ -1125,6 +1223,18 @@ def _cmd_setup(argv: list[str]) -> None:
         own = {key: value for key, value in written.items() if _shared_name(key) is None}
         shared = {_shared_name(key): value for key, value in written.items()
                   if _shared_name(key) is not None}
+        secret = {f["key"] for f in declared if f.get("secret")}
+        sealed = {key: value for key, value in own.items()
+                  if key in secret and value is not None}
+        if sealed and not (machine or to_file):
+            secrets_in, vault_skipped = _vault_seal(sealed)
+            if secrets_in is not None:
+                own = {key: value for key, value in own.items() if key not in sealed}
+        if sealed and secrets_in is None:
+            secrets_in = str(CREDENTIALS_ENV)
+        cleared = [key for key, value in own.items() if key in secret and value is None]
+        if cleared and not machine:
+            unsealed, _why = _vault_unseal(cleared)
         if own:
             _env_file_write(CREDENTIALS_ENV, own)
         if shared:
@@ -1140,6 +1250,10 @@ def _cmd_setup(argv: list[str]) -> None:
                  else "setup unset names the keys to remove", usage)
         _read_only_gate(f"`{NAME} setup unset`")
         _env_file_write(CREDENTIALS_ENV, {key: None for key in keys})
+        if not machine:
+            secret = {f["key"] for f in declared if f.get("secret")}
+            unsealed, _why = _vault_unseal(
+                [key for key in keys if key in secret and _shared_name(key) is None])
         shared = {_shared_name(key): None for key in keys if _shared_name(key) is not None}
         if shared:
             _env_file_write(_shared_credentials_env(), shared)
@@ -1160,5 +1274,11 @@ def _cmd_setup(argv: list[str]) -> None:
                     "shared_credentials": str(_shared_credentials_env())})
     if sub != "show":
         out.update({"ok": True, "action": sub, "changed": changed})
+    if sub == "set":
+        out["secrets_in"] = secrets_in
+        if vault_skipped:
+            out["vault_skipped"] = vault_skipped
+    if sub == "unset" or unsealed:
+        out["vault_removed"] = unsealed or []
     _emit(out)
 

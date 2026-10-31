@@ -1436,6 +1436,24 @@ def _field_line(field: dict, scoped: bool = False) -> str:
     return f"    {field['key']} ({', '.join(traits)}) - {field.get('help', '')}\n"
 
 
+def _secret_resolution_section() -> str:
+    """Where a value this capability's connections and setup name resolves
+    from: the credential cascade, rendered once here for every capability that
+    carries the connections tier, so no help lists the tiers by hand."""
+    return ("\n## Where a secret resolves\n\n"
+            "  A key a connection or a setup field names resolves from the first of:\n"
+            "    1. the project's .env.local, then its .env\n"
+            "    2. the machine's shared.env, for a field declared shared, then\n"
+            f"       {CREDENTIALS_ENV}\n"
+            "    3. the process environment\n"
+            "    4. the agent's vault (`capabilities secrets help`)\n"
+            "  The vault is a secret's first home: `connection add` and `setup set`\n"
+            "  seal a secret there unless asked for a file, and `capabilities secrets\n"
+            "  set <NAME>` keeps any other. A file is read before it, so a key a file\n"
+            "  also holds resolves from the file, and `doctor` names a file whose value\n"
+            "  differs from the vault's. A secret never comes on argv.\n")
+
+
 def _declared_section() -> str:
     """The verbs the contract answers from this capability's declarations -
     `connection`, `setup`, `settings` and the linking methods - rendered from
@@ -1446,7 +1464,7 @@ def _declared_section() -> str:
     if conns and conns.get("fields") is not None:
         out += (f"\n## Connections, written through the contract\n\n"
                 f"  {NAME} connection add <id> [--project|--global|--machine] [--default] "
-                "[--replace] [--field KEY=VALUE ...] [--env KEY=ENV_KEY ...] [--stdin]\n"
+                "[--replace] [--file] [--field KEY=VALUE ...] [--env KEY=ENV_KEY ...] [--stdin]\n"
                 "      [--identity ID [--display-name TEXT]]\n"
                 "      Write one connection from the fields below. --project (the default)\n"
                 "      writes this project's record, --global the machine's, and --machine\n"
@@ -1458,9 +1476,15 @@ def _declared_section() -> str:
                 "      connections_in_store), and so is a global write while the store does\n"
                 "      not answer (exit 5). A secret field is\n"
                 "      taken only from the JSON object on stdin (--stdin), never from argv, and\n"
-                "      written to that scope's credentials file - the project's .env.local, or\n"
-                f"      {CREDENTIALS_ENV} - under its own env key, which the\n"
-                "      entry names. --env KEY=ENV_KEY instead names, for a secret field, a\n"
+                "      kept under its own env key, which the entry names: sealed into the\n"
+                "      agent's vault, the first home of a secret. It goes to a file instead\n"
+                "      with --file (the project's .env.local), at --global or --machine\n"
+                f"      ({CREDENTIALS_ENV}, which every agent on the machine\n"
+                "      reads), or where no vault here takes it - no agent key here, a store\n"
+                "      that cannot be written, or the key already set in a file or the\n"
+                "      environment, which the cascade reads first - and the answer then says\n"
+                "      why (vault_skipped). secrets_in names where it went. --env\n"
+                "      KEY=ENV_KEY instead names, for a secret field, a\n"
                 "      key already set in the cascade, and writes no value for it (exit 6\n"
                 "      env_key_unset where it resolves nowhere). A connection that exists\n"
                 "      is refused (exit 6 connection_exists) unless --replace is given; it\n"
@@ -1474,8 +1498,9 @@ def _declared_section() -> str:
                 "      recorded, else the value of the field marked main identifier below.\n"
                 "      Answers the fields as they now resolve, secrets masked.\n"
                 f"  {NAME} connection remove <id> [--project|--global|--machine]\n"
-                "      Remove it, its default pointer, and the secret lines `connection add`\n"
-                "      wrote for it; a key another connection names is kept. Refused (exit 6\n"
+                "      Remove it, its default pointer, and the secrets `connection add` wrote\n"
+                "      for it, from its file and from the agent's vault (vault_removed); a key\n"
+                "      another connection names is kept. Refused (exit 6\n"
                 "      connection_granted) while a project is granted it, naming each one.\n"
                 f"  {NAME} connection rename <id> <label>\n"
                 "      Change what a connection is called and nothing else. Its id - the name\n"
@@ -1496,10 +1521,15 @@ def _declared_section() -> str:
                                 or "    none - an entry carries no fields of its own\n")
     if conns and conns.get("setup"):
         out += (f"\n## Machine setup, written through the contract\n\n"
-                f"  {NAME} setup [show] [--reveal <KEY>] | setup set [--machine] "
+                f"  {NAME} setup [show] [--reveal <KEY>] | setup set [--machine] [--file] "
                 "[--field KEY=VALUE ...] [--stdin] | setup unset [--machine] <KEY> ...\n"
                 "      What this machine is given once, before any connection, kept in\n"
-                f"      {CREDENTIALS_ENV}; `show` says where each resolves\n"
+                f"      {CREDENTIALS_ENV}, except a secret, which `setup set`\n"
+                "      seals into the agent's vault: into that file instead with --machine or\n"
+                "      --file, or where no vault here takes it, and the answer then says why\n"
+                "      (vault_skipped); secrets_in names where it went. A shared field is\n"
+                "      kept in the machine's shared.env. `unset` takes a key out of the file\n"
+                "      and the vault. `show` says where each resolves\n"
                 "      from, secrets masked, and outside any project reads no policy.\n"
                 "      --reveal <KEY> prints that one value instead, raw and in the clear, and\n"
                 "      nothing else; an undeclared key exits 6 unknown_field and one that\n"
@@ -1507,6 +1537,8 @@ def _declared_section() -> str:
                 "      is taken only from the JSON object on stdin. --machine writes as\n"
                 "      administration of the machine: from anywhere, with no policy read.\n")
         out += "".join(_field_line(f) for f in conns["setup"])
+    if conns is not None:
+        out += _secret_resolution_section()
     if conns and conns.get("link"):
         out += ("\n## Linking a connection\n\n"
                 "  Each method runs with --connection <id> added, speaks JSON lines on stdout -\n"

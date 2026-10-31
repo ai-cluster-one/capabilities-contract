@@ -217,3 +217,64 @@ def test_a_reader_keeps_what_it_read_through_a_store_that_goes_away(
     monkeypatch.setattr(vault, "CHECK_SECONDS", 0.0)
     assert reader.get("API_TOKEN") == "tok-1"
     assert reader.problem.startswith("the vault could not be read")
+
+
+def _agent_root(tmp_path, text: str, store):
+    root = tmp_path / "agent"
+    root.mkdir(exist_ok=True)
+    (root / ".env.local").write_text(f"{vault.KEY_ENV}={text}\n")
+    return root
+
+
+def test_write_seals_values_records_the_key_and_a_reader_reads_them_back_at_once(
+        vaulted, tmp_path):
+    text = vault.generate_key()
+    root = _agent_root(tmp_path, text, vaulted)
+    reader = vault.reader(root, AGENT)
+    assert reader.get("API_TOKEN") is None
+    assert vault.write(root, AGENT, {"API_TOKEN": "tok-1", "OTHER": "x"},
+                       updated_by="me@node") == {"API_TOKEN": "created", "OTHER": "created"}
+    assert reader.get("API_TOKEN") == "tok-1"  # not held for CHECK_SECONDS
+    assert vault.write(root, AGENT, {"API_TOKEN": "tok-2"}) == {"API_TOKEN": "replaced"}
+    assert reader.get("API_TOKEN") == "tok-2"
+    with connect(application_name="reader", transaction=True) as conn:
+        assert vault.recorded_key(conn, AGENT) == (True, vault.fingerprint(vault.parse_key(text)))
+    assert vault.delete(root, AGENT, ["API_TOKEN", "MISSING"]) == ["API_TOKEN"]
+    assert reader.get("API_TOKEN") is None and reader.get("OTHER") == "x"
+
+
+def test_write_refuses_and_writes_nothing_without_the_agents_key(vaulted, tmp_path,
+                                                                  monkeypatch):
+    monkeypatch.delenv(vault.KEY_ENV, raising=False)
+    root = tmp_path / "agent"
+    root.mkdir()
+    with pytest.raises(vault.VaultError) as raised:
+        vault.write(root, AGENT, {"API_TOKEN": "tok-1"})
+    assert raised.value.slug == "key_missing"
+    first = vault.generate_key()
+    _agent_root(tmp_path, first, vaulted)
+    vault.write(root, AGENT, {"API_TOKEN": "tok-1"})
+    _agent_root(tmp_path, vault.generate_key(), vaulted)
+    with pytest.raises(vault.VaultError) as raised:
+        vault.write(root, AGENT, {"API_TOKEN": "tok-2"})
+    assert raised.value.slug == "key_mismatch"
+    with pytest.raises(vault.VaultError) as raised:
+        vault.write(root, "prj_0000000000ff", {"API_TOKEN": "tok-2"})
+    assert raised.value.slug == "agent_unregistered"
+    _agent_root(tmp_path, first, vaulted)
+    assert vault.reader(root, AGENT).get("API_TOKEN") == "tok-1"
+
+
+def test_write_to_a_store_it_cannot_reach_is_refused_as_unwritable(tmp_path, clean_env,
+                                                                   monkeypatch):
+    monkeypatch.delenv(vault.KEY_ENV, raising=False)
+    root = tmp_path / "agent"
+    root.mkdir()
+    (root / ".env.local").write_text(
+        f"{vault.KEY_ENV}={vault.generate_key()}\n"
+        "AGENTKIT_DB_HOST=127.0.0.1\nAGENTKIT_DB_PORT=1\nAGENTKIT_DB_NAME=x\n"
+        "AGENTKIT_DB_USER=x\nAGENTKIT_DB_SSLMODE=disable\n")
+    with pytest.raises(vault.VaultError) as raised:
+        vault.write(root, AGENT, {"API_TOKEN": "tok-1"})
+    assert raised.value.slug == "vault_unwritable"
+    assert "tok-1" not in raised.value.message
