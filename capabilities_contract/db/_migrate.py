@@ -2,7 +2,9 @@
 
 An owner is the tool that owns a set of tables, named for it: every relation, index,
 sequence, type and function its steps create is named `<owner>` or `<owner>_*`, in
-the configured schema. Two platform tables in the same schema keep the books:
+the configured schema. One owner, `core`, is named for no tool: its tables are the
+plain nouns of `CORE_TABLES`, reserved against every other owner, and its steps run
+before any other owner's. Two platform tables in the same schema keep the books:
 `schema_ledger` (one row per applied step) and `schema_version` (one row per owner).
 A third, `schema_channel`, holds the change versions processes follow by polling.
 """
@@ -27,6 +29,20 @@ VERSION_TABLE = "schema_version"
 RESERVED_NAMES = (LEDGER_TABLE, VERSION_TABLE, CHANNEL_TABLE)
 RESERVED_OWNERS = ("schema", "pg")
 
+# The store's core: the tables any owner's steps may reference, owned by `core` and
+# named as plain nouns. `core` names everything its steps create `<table>` or
+# `<table>_*` for a table on this list, or `core_premig_*` for a pre-image it keeps;
+# those names are reserved against every other owner.
+CORE_OWNER = "core"
+CORE_TABLES = (
+    "agents", "agent_nodes", "nodes", "node_states", "node_updates", "node_logins",
+    "node_login_expectations", "node_logs", "node_sessions", "node_session_expectations",
+    "connections", "grants", "policies", "settings", "settings_changes",
+    "settings_documents", "identifiers", "secrets", "service_instances", "service_leases",
+    "store_state", "reference_documents", "reference_versions", "people",
+)
+CORE_PREIMAGE_PREFIX = "core_premig_"
+
 # A lock is waited for this long at most, without queueing for it, and a session
 # holding one that goes this long without a statement is ended by the server.
 LOCK_WAIT_SECONDS = 10.0
@@ -41,10 +57,13 @@ _STEP_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 @dataclass(frozen=True)
 class Step:
     """One migration step: a stable id and the SQL it runs. The checksum is the
-    SHA-256 of the SQL text exactly as given."""
+    SHA-256 of the SQL text exactly as given. `core`, for a step that references
+    core tables, is the `(major, minor)` of the core it needs; the step is refused
+    until the store records the core at that version or later."""
 
     id: str
     sql: str
+    core: tuple[int, int] | None = None
 
     @property
     def checksum(self) -> str:
@@ -63,6 +82,14 @@ class MigrateResult:
     warnings: list[str] = field(default_factory=list)
     major: int | None = None
     minor: int | None = None
+    core: MigrateResult | None = None
+
+
+# The core's own steps and the version they bring it to, which `migrate` runs for
+# every other owner first. While empty, nothing runs for the core and nothing is
+# written for it.
+CORE_STEPS: tuple[Step, ...] = ()
+CORE_VERSION = (0, 0)
 
 
 @dataclass
@@ -118,6 +145,14 @@ def _normalise_steps(steps: Iterable[Step | Sequence[str]]) -> list[Step]:
             raise DbError("bad_step", f"step {step.id!r} has no SQL")
         if step.id in seen:
             raise DbError("bad_step", f"step id {step.id!r} appears twice")
+        if step.core is not None:
+            core = step.core
+            if not (isinstance(core, (tuple, list)) and len(core) == 2
+                    and all(isinstance(v, int) and not isinstance(v, bool) and v >= 0
+                            for v in core)):
+                raise DbError("bad_step", f"step {step.id!r} declares core {core!r}",
+                              "declare the core version a step needs as (major, minor)")
+            step = Step(step.id, step.sql, (core[0], core[1]))
         seen.add(step.id)
         out.append(step)
     return out
@@ -156,6 +191,20 @@ def _snapshot(conn: Any) -> set[tuple]:
     return set(conn.execute(_SNAPSHOT).fetchall())
 
 
+def _core_name(name: str) -> bool:
+    """Whether `name` is the core's: a core table, `<table>_*`, or a pre-image."""
+    return name.startswith(CORE_PREIMAGE_PREFIX) or any(
+        name == table or name.startswith(table + "_") for table in CORE_TABLES)
+
+
+def _law(owner: str) -> tuple[str, str]:
+    """How `owner` names what its steps create: briefly, and in full."""
+    if owner == CORE_OWNER:
+        core = f"a core table, <table>_* or {CORE_PREIMAGE_PREFIX}*"
+        return core, core
+    return f"{owner}_*", f"{owner} or {owner}_*"
+
+
 def _violations(before: set[tuple], after: set[tuple], owner: str, schema: str) -> list[str]:
     bad = []
     for kind, _oid, nspname, name in sorted(after - before, key=lambda r: (r[2], r[3])):
@@ -165,9 +214,28 @@ def _violations(before: set[tuple], after: set[tuple], owner: str, schema: str) 
             bad.append(f"{kind} {nspname}.{name} (outside schema {schema})")
         elif name in RESERVED_NAMES:
             bad.append(f"{kind} {name} (reserved)")
+        elif owner == CORE_OWNER:
+            if not _core_name(name):
+                bad.append(f"{kind} {name}")
+        elif _core_name(name):
+            bad.append(f"{kind} {name} (reserved for {CORE_OWNER})")
         elif not (name == owner or name.startswith(owner + "_")):
             bad.append(f"{kind} {name}")
     return bad
+
+
+def _check_core(conn: Any, schema: str, owner: str, step: Step) -> None:
+    """Refuse `step` while the store's core is older than the version it declares."""
+    stored = _stored_version(conn, schema, CORE_OWNER)
+    if stored is None or stored < step.core:
+        major, minor = step.core
+        held = ("has no core tables" if stored is None
+                else f"records the core at {stored[0]}.{stored[1]}")
+        raise DbError("core_too_old",
+                      f"step {step.id} of {owner} needs the store's core at schema version "
+                      f"{major}.{minor} or later, and the store {held}",
+                      "migrate the core first with the release that owns the core tables "
+                      f"at version {major}.{minor} or later, then migrate again")
 
 
 def _lock(conn: Any, key: str) -> None:
@@ -367,12 +435,15 @@ def migrate(conn: Any, owner: str, steps: Iterable[Step | Sequence[str]], *,
     its ledger row, so concurrent callers apply it exactly once. Refuses (DbError):
     a stored major newer than `major` (`schema_too_new`), an applied step whose SQL
     changed (`checksum_mismatch`), a step that creates an object not named
-    `<owner>`/`<owner>_*` in the schema (`naming_law`, rolled back), and a failing
-    step (`step_failed`, rolled back). A newer stored minor proceeds with a warning
-    in the result. Afterwards the caller's version is recorded unless the store's is
-    newer. When every step is applied and the version recorded, it takes no lock at
-    all; otherwise a lock held elsewhere is waited for at most LOCK_WAIT_SECONDS
-    and then refused (`store_busy`)."""
+    `<owner>`/`<owner>_*` in the schema or named for the core (`naming_law`, rolled
+    back), a step declaring a core version the store's core has not reached
+    (`core_too_old`), and a failing step (`step_failed`, rolled back). A newer
+    stored minor proceeds with a warning in the result. For any owner but `core`,
+    the core's own steps (`CORE_STEPS`) are migrated first, and a refusal of
+    theirs refuses the call before any of `owner`'s steps. Afterwards the caller's
+    version is recorded unless the store's is newer. When every step is applied and
+    the version recorded, it takes no lock at all; otherwise a lock held elsewhere
+    is waited for at most LOCK_WAIT_SECONDS and then refused (`store_busy`)."""
     psycopg, sql = _psycopg()
     owner = check_owner(owner)
     major, minor = _check_version_numbers(major, minor)
@@ -382,6 +453,9 @@ def migrate(conn: Any, owner: str, steps: Iterable[Step | Sequence[str]], *,
         raise DbError("connection_busy", "migrate needs an idle connection",
                       "commit or roll back before migrating")
     result = MigrateResult(owner=owner, schema=schema)
+    if owner != CORE_OWNER and CORE_STEPS:
+        result.core = migrate(conn, CORE_OWNER, CORE_STEPS, major=CORE_VERSION[0],
+                              minor=CORE_VERSION[1], schema=schema)
     lock_key = f"capabilities_contract:{schema}:{owner}"
     ledger = sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(LEDGER_TABLE))
     versions = sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(VERSION_TABLE))
@@ -407,6 +481,8 @@ def migrate(conn: Any, owner: str, steps: Iterable[Step | Sequence[str]], *,
                                   "never edit an applied step; add a new step instead")
                 result.skipped.append(step.id)
                 continue
+            if step.core is not None:
+                _check_core(conn, schema, owner, step)
             before = _snapshot(conn)
             try:
                 with conn.transaction():
@@ -421,10 +497,11 @@ def migrate(conn: Any, owner: str, steps: Iterable[Step | Sequence[str]], *,
             bind_search_path(conn, schema)
             bad = _violations(before, _snapshot(conn), owner, schema)
             if bad:
+                brief, full = _law(owner)
                 raise DbError("naming_law",
                               f"step {step.id} of {owner} creates objects not named "
-                              f"{owner}_*: {', '.join(bad)}",
-                              f"name everything the step creates {owner} or {owner}_* "
+                              f"{brief}: {', '.join(bad)}",
+                              f"name everything the step creates {full} "
                               f"inside schema {schema}; the step was rolled back")
             conn.execute(sql.SQL("INSERT INTO {} (owner, step, checksum, library_version) "
                                  "VALUES (%s, %s, %s, %s)").format(ledger),

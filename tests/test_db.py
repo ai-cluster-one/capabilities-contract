@@ -12,7 +12,7 @@ import psycopg
 import pytest
 from conftest import child_env
 
-from capabilities_contract.db import DbError, Step, connect, migrate, resolve_setting
+from capabilities_contract.db import DbError, Step, _migrate, connect, migrate, resolve_setting
 from capabilities_contract.version import __version__
 
 
@@ -340,6 +340,117 @@ def test_the_owners_own_name_and_prefix_are_allowed(store):
                                                  "CREATE TABLE demo_more (id int)")],
                          major=1, minor=0)
         assert result.applied == ["0001"]
+
+
+# --- the core owner --------------------------------------------------------------------
+
+def test_the_core_owner_creates_its_plain_noun_tables_and_its_pre_images(store):
+    with _connect() as conn:
+        result = migrate(conn, "core", [("0001", "CREATE TABLE agents (id text PRIMARY KEY); "
+                                                 "CREATE INDEX agents_slug ON agents (id); "
+                                                 "CREATE TABLE node_states (id int); "
+                                                 "CREATE TABLE core_premig_0001 (id int)")],
+                         major=1, minor=0)
+        assert result.applied == ["0001"]
+        for name in ("agents", "agents_pkey", "agents_slug", "node_states", "core_premig_0001"):
+            assert _exists(conn, f"{store.schema}.{name}")
+
+
+@pytest.mark.parametrize("sql, named", [
+    ("CREATE TABLE core_things (id int)", "relation core_things"),
+    ("CREATE TABLE core (id int)", "relation core"),
+    ("CREATE TABLE stray (id int)", "relation stray"),
+])
+def test_the_core_owner_may_create_nothing_off_its_list(store, sql, named):
+    with _connect() as conn:
+        with pytest.raises(DbError) as caught:
+            migrate(conn, "core", [("0001", sql)], major=1, minor=0)
+        assert caught.value.slug == "naming_law" and named in caught.value.message
+        assert _ledger(conn, store.schema, "core") == []
+
+
+@pytest.mark.parametrize("owner, sql, named", [
+    ("agents", "CREATE TABLE agents (id int)", "relation agents (reserved for core)"),
+    ("settings", "CREATE TABLE settings (id int)", "relation settings (reserved for core)"),
+    ("settings", "CREATE TABLE settings_changes (id int)", "settings_changes (reserved"),
+    ("node", "CREATE TABLE node_states (id int)", "relation node_states (reserved"),
+    ("demo", "CREATE TABLE demo_t (id int); ALTER TABLE demo_t RENAME TO people",
+     "relation people (reserved"),
+])
+def test_no_other_owner_may_claim_a_core_name(store, owner, sql, named):
+    with _connect() as conn:
+        with pytest.raises(DbError) as caught:
+            migrate(conn, owner, [("0001", sql)], major=1, minor=0)
+        assert caught.value.slug == "naming_law" and named in caught.value.message
+        assert _ledger(conn, store.schema, owner) == []
+
+
+def test_without_core_steps_another_owner_migrates_and_nothing_is_written_for_core(store):
+    with _connect() as conn:
+        result = migrate(conn, "demo", STEPS, major=1, minor=0)
+        assert result.applied == ["0001", "0002", "0003"] and result.core is None
+        assert _rows(conn, f'SELECT owner FROM "{store.schema}".schema_version') == [("demo",)]
+        assert _ledger(conn, store.schema, "core") == []
+
+
+CORE = (Step("0001-agents", "CREATE TABLE agents (id text PRIMARY KEY)"),)
+
+
+def test_another_owner_brings_the_core_current_first(store, monkeypatch):
+    monkeypatch.setattr(_migrate, "CORE_STEPS", CORE)
+    monkeypatch.setattr(_migrate, "CORE_VERSION", (1, 0))
+    with _connect() as conn:
+        result = migrate(conn, "demo", [Step("0001", "CREATE TABLE demo_t (agent text "
+                                                     "REFERENCES agents (id))", core=(1, 0))],
+                         major=1, minor=0)
+        assert result.core.applied == ["0001-agents"] and result.applied == ["0001"]
+        assert _rows(conn, f'SELECT owner, step FROM "{store.schema}".schema_ledger '
+                           "ORDER BY applied_at, owner") == [("core", "0001-agents"),
+                                                              ("demo", "0001")]
+        assert _rows(conn, f'SELECT owner, major, minor FROM "{store.schema}".schema_version '
+                           "ORDER BY owner") == [("core", 1, 0), ("demo", 1, 0)]
+        again = migrate(conn, "demo", [Step("0001", "CREATE TABLE demo_t (agent text "
+                                                    "REFERENCES agents (id))", core=(1, 0))],
+                        major=1, minor=0)
+        assert again.core.skipped == ["0001-agents"] and again.skipped == ["0001"]
+
+
+def test_a_core_that_cannot_be_brought_current_refuses_the_other_owner(store, monkeypatch):
+    with _connect() as conn:
+        migrate(conn, "core", CORE, major=2, minor=0)
+    monkeypatch.setattr(_migrate, "CORE_STEPS", CORE)
+    monkeypatch.setattr(_migrate, "CORE_VERSION", (1, 0))
+    with _connect() as conn:
+        with pytest.raises(DbError) as caught:
+            migrate(conn, "demo", STEPS, major=1, minor=0)
+        assert caught.value.slug == "schema_too_new" and "core" in caught.value.message
+        assert _ledger(conn, store.schema, "demo") == []
+        assert not _exists(conn, f"{store.schema}.demo_items")
+
+
+def test_a_step_needing_a_core_version_waits_until_the_core_reaches_it(store):
+    needs = [("0001", "CREATE TABLE demo_a (id int)"),
+             Step("0002", "CREATE TABLE demo_b (id int)", core=(1, 2))]
+    with _connect() as conn:
+        with pytest.raises(DbError) as caught:
+            migrate(conn, "demo", needs, major=1, minor=0)
+        assert caught.value.slug == "core_too_old" and "no core tables" in caught.value.message
+        assert _ledger(conn, store.schema, "demo") == [("0001",)]
+        assert not _exists(conn, f"{store.schema}.demo_b")
+        migrate(conn, "core", CORE, major=1, minor=1)
+        with pytest.raises(DbError) as caught:
+            migrate(conn, "demo", needs, major=1, minor=0)
+        assert caught.value.slug == "core_too_old" and "1.1" in caught.value.message \
+            and "1.2" in caught.value.message
+        migrate(conn, "core", CORE, major=1, minor=2)
+        assert migrate(conn, "demo", needs, major=1, minor=0).applied == ["0002"]
+
+
+@pytest.mark.parametrize("core", [(1,), (1, -1), ("1", 0), (True, 0), 3])
+def test_a_bad_core_declaration_is_refused(store, core):
+    with _connect() as conn, pytest.raises(DbError) as caught:
+        migrate(conn, "demo", [Step("0001", "SELECT 1", core=core)], major=1, minor=0)
+    assert caught.value.slug == "bad_step"
 
 
 # --- version rule and skew (C8) ------------------------------------------------------
