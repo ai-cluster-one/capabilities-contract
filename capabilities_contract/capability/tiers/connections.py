@@ -1270,19 +1270,32 @@ def _connection_rewrite(cid: str, fields: dict) -> bool:
     return False
 
 
+def _connection_own_keys(cid: str) -> set:
+    """The env keys that are connection `cid`'s alone: the one each declared
+    secret field is written under for it (`_connection_env_name`)."""
+    return {_connection_env_name(field, cid)
+            for field in globals().get("CONN_FIELDS") or [] if field.get("secret")}
+
+
 def _cmd_connection_seal(argv: list[str], usage: str) -> None:
     """`connection seal [<id>] [--share]` writes into each connection this
     project may use (or the one named) the values it resolves today from the
-    project's .env files, the machine's files or the process environment,
-    sealed into the agent's vault, so it resolves them the same on a node that
-    has none of those; what the capability's `_connection_prefill` hook asks of
-    a connection naming none of its own (an app of its own) is written into
-    its record first. With --share a connection the store shares is sealed
-    for every other agent granted it too, for its public sealing key, from
-    what it resolves here, vault included. Nothing a vault already holds is
-    written over, so running it again changes nothing; a grantee whose public
-    key is not published is named, never skipped in silence. A file is never
-    changed: once the vault holds a value the cascade reads it first."""
+    project's .env files and the machine's files, sealed into the agent's
+    vault, so it resolves them the same on a node that has none of those; a
+    value only the process environment holds is the invoking shell's, not the
+    connection's, and is left there (`not_sealed`). What the capability's
+    `_connection_prefill` hook asks of a connection naming none of its own (an
+    app of its own) is written into its record first. With --share a
+    connection the store shares is sealed for every other agent granted it
+    too, for its public sealing key, from what it resolves here, vault
+    included - but only under a key that is the connection's own
+    (`_connection_env_name`): a vault answers for every connection of its
+    agent, so a name another connection or a setup field may read is never
+    written into another agent's vault (`not_shared`). Nothing a vault
+    already holds is written over, so running it again changes nothing; a
+    grantee whose public key is not published is named, never skipped in
+    silence. A file is never changed: once the vault holds a value the
+    cascade reads it first."""
     share = "--share" in argv
     words = [w for w in argv if w != "--share"]
     flags = [w for w in words if w.startswith("--")]
@@ -1357,6 +1370,7 @@ def _cmd_connection_seal(argv: list[str], usage: str) -> None:
         report = _own_report()
         for cid, res in results.items():
             own, everyone = {}, {}
+            res["not_sealed"], res["not_shared"] = [], []
             for row in (report.get(cid) or {}).get("keys") or []:
                 if not _sealable(row):
                     continue
@@ -1369,16 +1383,23 @@ def _cmd_connection_seal(argv: list[str], usage: str) -> None:
                 if tier == "vault":
                     everyone[key] = value
                     res["from"].setdefault(key, str(source))
-                elif tier in ("project", "user", "env"):
+                elif tier in ("project", "user"):
                     own[key] = everyone[key] = value
                     res["from"][key] = str(source) if source else tier
+                elif tier == "env":
+                    res["not_sealed"].append(key)
             if own:
                 sealed_into(res, _vault_share(agent, own, [agent], replace=False))
             grantees = _shared_grantees(cid)
             others = sorted(set(grantees or []) - {agent}) if share else []
             if everyone and others:
+                mine = _connection_own_keys(cid)
+                res["not_shared"] = sorted(key for key in everyone if key not in mine)
+                everyone = {k: v for k, v in everyone.items() if k in mine}
+            if everyone and others:
                 sealed_into(res, _vault_share(agent, everyone, others, replace=False))
             res["unresolved"] = sorted(set(res["unresolved"]))
+            res["not_sealed"] = sorted(set(res["not_sealed"]))
     except _vault.VaultError as e:
         _die(5 if e.slug == "vault_unwritable" else 6, e.slug, e.message, e.hint)
     except StoreError as e:
