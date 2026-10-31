@@ -296,7 +296,8 @@ STORE_REFERENCES_TABLE = "capabilities_references"
 # What each node actually runs: a row per service it supervises, keyed by
 # project, capability and node, in one of a closed set of states.
 STORE_SERVICE_INSTANCES_TABLE = "capabilities_service_instances"
-# Each agent's secrets, sealed with the agent's own key (capabilities_contract.vault).
+# Each agent's secrets, sealed with the agent's own key or for the public sealing
+# key it gives (capabilities_contract.vault).
 STORE_VAULT_TABLE = "capabilities_vault"
 SERVICE_INSTANCE_STATES = ("starting", "ready", "unusable", "degraded", "failing",
                            "held", "waiting", "stopping")
@@ -334,7 +335,7 @@ NODE_LOG_MANAGER = "manager"
 NODE_LOG_LINES = 100
 NODE_LOG_LINE_CHARS = 500
 NODE_LOG_MASK = "***"
-STORE_TABLES_VERSION = (1, 22)
+STORE_TABLES_VERSION = (1, 23)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -1698,6 +1699,49 @@ def record_table_steps() -> list[tuple[str, str]]:
          " agent; system agents on different nodes may share one. It names the agent''s"
          " state directories, service log lines and --project shorthand; null while it"
          " has none, where the id stands in.'"),
+        # Each agent's public sealing key, derived from its key and published
+        # beside the key's fingerprint, so a writer that holds no key of the
+        # agent's - another agent writing a shared connection's secret for
+        # each of its grantees - seals a value only that key opens. A key that
+        # changes leaves the public key of the one before unpublished, so no
+        # writer seals for a key the agent no longer holds.
+        ("0038-agent-public-key",
+         "ALTER TABLE capabilities_agents ADD COLUMN vault_public_key text"
+         " CHECK (vault_public_key ~ '^[A-Za-z0-9_-]{43}$'),"
+         " ADD CONSTRAINT capabilities_agents_vault_public_key"
+         "  CHECK (vault_public_key IS NULL OR vault_key IS NOT NULL);"
+         " CREATE FUNCTION capabilities_agents_vault_public_key() RETURNS trigger"
+         "  LANGUAGE plpgsql AS $public$"
+         " BEGIN"
+         "  IF NEW.vault_key IS DISTINCT FROM OLD.vault_key"
+         "   AND NEW.vault_public_key IS NOT DISTINCT FROM OLD.vault_public_key THEN"
+         "   NEW.vault_public_key := NULL;"
+         "  END IF;"
+         "  RETURN NEW;"
+         " END $public$;"
+         " CREATE TRIGGER capabilities_agents_vault_public_key"
+         "  BEFORE UPDATE OF vault_key ON capabilities_agents"
+         "  FOR EACH ROW EXECUTE FUNCTION capabilities_agents_vault_public_key();"
+         " COMMENT ON COLUMN capabilities_agents.vault_public_key IS"
+         " 'The agent''s public sealing key: the X25519 public key its encryption key"
+         " gives, URL-safe base64 of 32 bytes, never the key; null until a command"
+         " using the key publishes it, and again once vault_key changes without it.';"
+         " COMMENT ON TABLE capabilities_vault IS"
+         " 'Each agent''s vault: one row per named secret, sealed with XChaCha20-Poly1305"
+         " under the agent''s own key (AGENT_ENCRYPTION_KEY, kept in the agent''s"
+         " environment and never here), or for the agent''s public sealing key"
+         " (capabilities_agents.vault_public_key) by a writer that holds no key of the"
+         " agent''s, such as another grantee writing a shared connection''s secret; the"
+         " agent id and the name bound as associated data either way, and only the"
+         " agent''s key opens it. Written by the capabilities manager''s secrets verbs"
+         " and the capabilities'' connection verbs.';"
+         " COMMENT ON COLUMN capabilities_vault.ciphertext IS"
+         " 'A format byte, then for format 1 the 24-byte nonce, for format 2 the 32-byte"
+         " ephemeral X25519 public key and the 24-byte nonce, then the ciphertext with"
+         " its tag.';"
+         " COMMENT ON COLUMN capabilities_vault.key_fingerprint IS"
+         " 'The fingerprint of the agent key the value opens under, whoever sealed it;"
+         " a row whose fingerprint is not the agent''s vault_key is unreadable.'"),
     ]
 
 
@@ -2412,6 +2456,11 @@ class Records:
         files keep each project's grants in that project alone."""
         return []
 
+    def shared_grantees(self, capability: str, connection: str) -> list[str] | None:
+        """The agents a connection the store shares is granted to; None for a
+        connection the store does not share."""
+        return None
+
     # Whether settings documents are rows of the store rather than files: true
     # only for an agent whose records moved into the store.
     settings_in_rows = False
@@ -2516,6 +2565,12 @@ class FileRecords(Records):
         where that layer is the store's rows; none where it is files."""
         rows = self._global_rows()
         return rows.grantees(capability, connection) if rows is not None else []
+
+    def shared_grantees(self, capability: str, connection: str) -> list[str] | None:
+        """The agents a grant enables a shared connection of the global layer
+        for, where that layer is the store's rows; None where it is files."""
+        rows = self._global_rows()
+        return rows.shared_grantees(capability, connection) if rows is not None else None
 
     def _agent_now(self) -> dict | None:
         """This project's registry row as the store holds it now, or None
@@ -3502,6 +3557,23 @@ class StoreRecords(FileRecords):
             "SELECT owner FROM capabilities_connections WHERE capability = %s "
             "AND name = %s", (capability, connection))
         return rows[0][0] if rows else None
+
+    def shared_grantees(self, capability: str, connection: str) -> list[str] | None:
+        """The agents a grant enables connection `connection` for, where it is
+        a row of this store that the capability shares (its owner null), so
+        its secret is sealed into each of their vaults; None where the store
+        holds no such row - an agent's own, or none."""
+        _store_check("capability", capability, CAPABILITY_RE)
+        rows = self._read(
+            "SELECT owner IS NULL FROM capabilities_connections WHERE capability = %s "
+            "AND name = %s", (capability, connection))
+        if not rows or not rows[0][0]:
+            return None
+        found = self._read(
+            "SELECT DISTINCT agent_id FROM capabilities_connection_grants "
+            "WHERE capability = %s AND connection = %s AND enabled "
+            "AND agent_id IS NOT NULL ORDER BY agent_id", (capability, connection))
+        return [agent for (agent,) in found]
 
     def grantees(self, capability: str, connection: str) -> list[str]:
         _store_check("capability", capability, CAPABILITY_RE)

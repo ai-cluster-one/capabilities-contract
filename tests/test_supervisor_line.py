@@ -49,7 +49,7 @@ def probe(tmp_path, monkeypatch):
 def test_a_key_a_file_and_the_vault_hold_differently_is_asked_about(probe):
     (probe["root"] / ".env.local").write_text("PROBE_TOKEN=from-file\n")
     probe["vault"]["PROBE_TOKEN"] = "from-vault"
-    assert probe["_resolve_env_key"]("PROBE_TOKEN")[0] == "from-file"
+    assert probe["_resolve_env_key"]("PROBE_TOKEN")[:2] == ("from-vault", "vault")
     question = probe["_supervisor_question"]()
     assert question["conflicts"] == [{"key": "PROBE_TOKEN",
                                       "files": [str(probe["root"] / ".env.local")]}]

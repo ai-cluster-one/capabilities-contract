@@ -35,9 +35,10 @@ _VAULT_UNREAD: dict = {}
 
 
 def _vault_value(key: str) -> tuple[str | None, str | None]:
-    """The cascade's last tier: (the value the agent's vault holds for `key`,
+    """The cascade's first tier: (the value the agent's vault holds for `key`,
     where), or (None, None). The vault is the store's, sealed with the agent's
-    own key; only the names asked for are opened, and kept in memory only."""
+    own key or for the public key it gives; only the names asked for are
+    opened, and kept in memory only."""
     import re as _re
     if not _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,254}", key):
         return None, None
@@ -63,9 +64,10 @@ def _vault_value(key: str) -> tuple[str | None, str | None]:
     return value, f"vault:{agent}"
 
 
-# The keys this process resolved from a file, in the order it asked: the ones a
-# file and the agent's vault could both hold (`_vault_conflicts`).
-_FILE_KEYS: dict = {}
+# The keys this process resolved from the agent's vault, in the order it asked:
+# the ones a file may hold another value of, which the vault's shadows
+# (`_vault_conflicts`).
+_VAULT_KEYS: dict = {}
 
 
 def _file_values(key: str) -> list:
@@ -91,11 +93,12 @@ def _file_values(key: str) -> list:
 
 
 def _vault_conflicts() -> list:
-    """[{key, files}] for each key this process resolved from a file where the
-    agent's vault holds another value: the files whose value is not the
-    vault's. A key the vault does not hold, or cannot open, is no conflict."""
+    """[{key, files}] for each key this process resolved from the agent's
+    vault where a file of the cascade holds another value: the files whose
+    value is not the vault's, which the vault shadows. A key the vault does
+    not hold, or cannot open, is no conflict."""
     out = []
-    for key in _FILE_KEYS:
+    for key in _VAULT_KEYS:
         held, _where = _vault_value(key)
         if held is None:
             continue
@@ -106,19 +109,21 @@ def _vault_conflicts() -> list:
 
 
 def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
-    """Resolve one env key through cascade tiers 2-5: project .env(.local) →
-    user config → process env → the agent's vault. Returns (value, tier,
-    source). User config is the capability's credentials.env, after the
+    """Resolve one env key through cascade tiers 2-5: the agent's vault →
+    project .env(.local) → user config → process env. Returns (value, tier,
+    source). The vault is preferred, never exclusive: a key it does not hold,
+    or cannot be read for, resolves from the files and the environment as it
+    always did. User config is the capability's credentials.env, after the
     machine's shared.env for a key a setup field declares shared."""
+    val, where = _vault_value(key)
+    if val:
+        _VAULT_KEYS.setdefault(key, None)
+        return val, "vault", where
     for path, val, tier in _file_values(key):
-        _FILE_KEYS.setdefault(key, None)
         return val, tier, path
     val = os.environ.get(key)
     if val:
         return val, "env", None
-    val, where = _vault_value(key)
-    if val:
-        return val, "vault", where
     return None, None, None
 
 
@@ -404,8 +409,8 @@ def _doctor_gate(report: dict, wanted: str | None) -> None:
             detail += " (" + "; ".join(unread) + ")"
         _die(2, "credentials_missing",
              f"unresolved required config — {detail}",
-             f"set each in the project .env/.env.local, the user credentials.env, "
-             f"process env, or the agent's vault (`capabilities secrets set <KEY>`); "
+             f"set each in the agent's vault (`capabilities secrets set <KEY>`), the "
+             f"project .env/.env.local, the user credentials.env or process env; "
              f"`{NAME} connections` shows where every value resolves")
 
 
@@ -503,10 +508,12 @@ def _record_identity(cid: str, ident, display_name: str | None = None) -> bool:
 # connection or a machine prerequisite from a person: the fields are the ones
 # the script declares (CONN_FIELDS, SETUP_FIELDS), a secret arrives on standard
 # input and never on argv, and it is sealed into the agent's vault, never into
-# a record. A file takes it only when asked (--file), at the machine's scope,
-# whose secret every agent on the machine shares, or where no vault here takes
-# it: the project's .env.local, or the capability's credentials.env in the
-# user's config home.
+# a record. A connection the store shares (its owner null) carries its secret
+# in the vault of every agent granted it: the writer seals it under its own key
+# and for each other grantee's public sealing key. A file takes it only when
+# asked (--file), at the machine's scope where no grantee's vault takes it, or
+# where no vault here takes it: the project's .env.local, or the capability's
+# credentials.env in the user's config home.
 
 def _vault_agent() -> tuple[str | None, str | None]:
     """(the agent whose vault a secret written here goes into, None), or (None,
@@ -520,6 +527,15 @@ def _vault_agent() -> tuple[str | None, str | None]:
     return agent, None
 
 
+def _vault_key_here() -> bool:
+    """Whether the agent's key is set for this folder, so it keeps a vault."""
+    try:
+        from capabilities_contract import vault as _vault
+    except ImportError:
+        return False
+    return _project_root() is not None and bool(_vault.key_source(_project_root())[0])
+
+
 def _vault_writer() -> str:
     try:
         return f"{_user_name()}@{node_name()}"
@@ -527,35 +543,108 @@ def _vault_writer() -> str:
         return NAME
 
 
-def _vault_seal(secrets: dict) -> tuple[str | None, str | None]:
+def _shared_grantees(cid: str | None) -> list | None:
+    """The agents a grant enables connection `cid` for, where it is a row of
+    the store the capability shares (its owner null); None for any other
+    connection - an agent's own, one kept in files, or none yet."""
+    if not cid:
+        return None
+    try:
+        held = getattr(_records(), "shared_grantees", None)
+        return held(NAME, cid) if held is not None else None
+    except StoreError:
+        return None
+
+
+def _vault_share(agent: str | None, secrets: dict, agents: list,
+                 replace: bool = True) -> dict:
+    """Seal `secrets` into the vault of each of `agents`: the writer `agent`'s
+    under its key here, every other one's for its public sealing key. The
+    library's answer (`capabilities_contract.vault.share`); VaultError where
+    it refuses."""
+    from capabilities_contract import vault as _vault
+    done = _vault.share(_project_root(), agent, secrets, agents, replace=replace,
+                        application_name=NAME, updated_by=_vault_writer())
+    if agent in done.get("sealed", {}):
+        for key in secrets:
+            _VAULT_UNREAD.pop(key, None)
+    return done
+
+
+def _shared_report(done: dict) -> dict:
+    """What sealing a shared connection's secret answers: the agents it was
+    sealed for, and each grantee whose public sealing key is not published,
+    with how it is."""
+    out = {"sealed_for": sorted(done.get("sealed") or {}),
+           "unpublished": list(done.get("unpublished") or [])}
+    if done.get("unregistered"):
+        out["unregistered"] = list(done["unregistered"])
+    if out["unpublished"]:
+        out["hint"] = done.get("hint")
+    return out
+
+
+def _vault_seal(secrets: dict, cid: str | None = None,
+                report: dict | None = None) -> tuple[str | None, str | None]:
     """Seal `secrets` into the agent's vault: ("vault:<agent>", None) once they
-    are, or (None, why not) with nothing sealed. A key a file of the cascade or
-    the process environment already sets is not sealed, since the cascade reads
-    those before the vault and the sealed value would not be the one used."""
+    are, or (None, why not) with nothing sealed. The vault is read before every
+    file of the cascade, so a key a file also sets resolves from the vault from
+    then on. For a connection the store shares, every agent granted it gets
+    the secret in its vault too, sealed for its public key; `report`, where
+    given, takes `shared`, the agents it reached and those it could not."""
     agent, why = _vault_agent()
     if agent is None:
         return None, why
-    for key in sorted(secrets):
-        held = [str(path) for path, _val, _tier in _file_values(key)]
-        if not held and os.environ.get(key):
-            held = ["the process environment"]
-        if held:
-            return None, (f"{key} is already set in {held[0]}, which the cascade reads "
-                          "before the vault")
     try:
         from capabilities_contract import vault as _vault
     except ImportError:
         return None, "this capability's library carries no vault"
     if not hasattr(_vault, "write"):
         return None, "this capability's library cannot write the vault"
+    grantees = _shared_grantees(cid)
     try:
-        _vault.write(_project_root(), agent, secrets, application_name=NAME,
-                     updated_by=_vault_writer())
+        if grantees and hasattr(_vault, "share"):
+            done = _vault_share(agent, secrets, sorted({agent, *grantees}))
+            if agent not in done.get("sealed", {}):
+                return None, f"agent {agent} could not be sealed for"
+            if report is not None:
+                report["shared"] = _shared_report(done)
+        else:
+            _vault.write(_project_root(), agent, secrets, application_name=NAME,
+                         updated_by=_vault_writer())
     except _vault.VaultError as e:
         return None, e.message
     for key in secrets:
         _VAULT_UNREAD.pop(key, None)
     return f"vault:{agent}", None
+
+
+def _machine_seal(secrets: dict, cid: str, report: dict) -> str | None:
+    """At the machine's scope, seal a shared connection's secret for every
+    agent granted it, where the store shares it and grants it to any:
+    "vault:<agent>,..." once sealed, else None, and the file takes it as
+    before. `report` takes `shared`."""
+    grantees = _shared_grantees(cid)
+    if not grantees:
+        return None
+    try:
+        from capabilities_contract import vault as _vault
+    except ImportError:
+        return None
+    if not hasattr(_vault, "share"):
+        return None
+    agent = _vault_agent()[0] if _project_root() is not None else None
+    if agent is not None and not _vault.key_source(_project_root())[0]:
+        agent = None
+    try:
+        done = _vault_share(agent, secrets, sorted(grantees))
+    except _vault.VaultError as e:
+        report["vault_skipped"] = e.message
+        return None
+    report["shared"] = _shared_report(done)
+    if not done.get("sealed"):
+        return None
+    return ",".join(f"vault:{a}" for a in sorted(done["sealed"]))
 
 
 def _vault_unseal(keys: list) -> tuple[list, str | None]:
@@ -752,6 +841,55 @@ def _connection_grantees(adapter, cid: str, scope: str, root) -> list:
     return []
 
 
+# Where a machine-held value comes from, by tier: the machine's files and the
+# process environment, which another node does not have.
+_MACHINE_TIERS = ("user", "env")
+
+
+def _connection_prefilled(cid: str, entry: dict, declared: list, given: set,
+                          sealing: dict) -> list:
+    """Write into a new connection the values the machine holds for it, so it
+    carries them from then on: what the capability's `_connection_prefill(cid,
+    entry)` hook answers ({"fields": {...}, "secrets": {env key: value}}, such
+    as an app of its own copied from the machine's), and the value of each
+    secret the entry names that resolves from the machine's files or the
+    process environment. Sealed into the agent's vault, and only there: where
+    no vault takes them nothing is prefilled and the entry stays as it was
+    (`sealing["prefill_skipped"]` says why). [{key, from}] for each value."""
+    fields: dict = {}
+    values: dict = {}
+    origin: dict = {}
+    hook = globals().get("_connection_prefill")
+    if callable(hook):
+        offered = hook(cid, dict(entry)) or {}
+        fields = {k: v for k, v in (offered.get("fields") or {}).items()
+                  if k not in entry}
+        values = dict(offered.get("secrets") or {})
+        origin.update({key: "machine" for key in values})
+    named = dict(entry, **fields)
+    for field in declared:
+        env_key = named.get(field["key"]) if field.get("secret") else None
+        if not isinstance(env_key, str) or not env_key or env_key in given or env_key in values:
+            continue
+        value, tier, source = _resolve_env_key(env_key)
+        if value and tier in _MACHINE_TIERS:
+            values[env_key] = value
+            origin[env_key] = str(source) if source else tier
+    if not values and not fields:
+        return []
+    if values:
+        sealed, why = _vault_seal(values)
+        if sealed is None:
+            # A project with no agent key here keeps no vault, and sees no
+            # change: nothing is copied and nothing more is said.
+            if _vault_key_here():
+                sealing["prefill_skipped"] = why
+            return []
+    entry.update(fields)
+    return ([{"key": key, "from": "machine"} for key in sorted(fields)]
+            + [{"key": key, "from": origin.get(key)} for key in sorted(values)])
+
+
 def _scope_credentials(scope: str) -> Path:
     if scope == "global":
         return CREDENTIALS_ENV
@@ -767,11 +905,14 @@ def _cmd_connection(argv: list[str]) -> None:
              "[--replace] [--file] [--field KEY=VALUE ...] [--env KEY=ENV_KEY ...] [--stdin] "
              "[--identity ID [--display-name TEXT]] | "
              f"{NAME} connection remove <id> [--project|--global|--machine] | "
-             f"{NAME} connection rename <id> <label>")
+             f"{NAME} connection rename <id> <label> | "
+             f"{NAME} connection seal [<id>] [--share]")
     import re as _re
     sub = argv[0] if argv else ""
     if sub == "rename":
         return _cmd_connection_rename(argv[1:], usage)
+    if sub == "seal":
+        return _cmd_connection_seal(argv[1:], usage)
     if sub not in ("add", "remove"):
         _die(6, "input", f"unknown connection subcommand {sub!r}", usage)
     # `--env KEY=ENV_KEY` names, for a secret field, an env key already set,
@@ -991,13 +1132,22 @@ def _cmd_connection(argv: list[str]) -> None:
                 entry[IDENTITY_KEY] = _identity_value(ident, name)
             except ValueError as e:
                 _die(6, "bad_field", str(e))
+    sealing: dict = {}
+    prefilled = None
+    if held is None and scope == "project" and not to_file:
+        # Values the machine holds for a new connection are written into it,
+        # and are its own from then on: kept only where its vault takes them.
+        prefilled = _connection_prefilled(cid, entry, declared, set(secrets), sealing)
     missing = [f["key"] for f in declared if f.get("required") and entry.get(f["key"]) in (None, "")]
     if missing:
         _die(6, "fields_required", f"connection {cid!r} needs: {', '.join(missing)}",
              f"`{NAME} manifest` lists the fields; secrets go in the JSON object on stdin")
     secrets_in, vault_skipped = None, None
     if secrets and scope == "project" and not to_file:
-        secrets_in, vault_skipped = _vault_seal(secrets)
+        secrets_in, vault_skipped = _vault_seal(secrets, cid, sealing)
+    elif secrets and scope == "global" and not to_file:
+        secrets_in = _machine_seal(secrets, cid, sealing)
+        vault_skipped = sealing.pop("vault_skipped", None)
     if secrets and secrets_in is None:
         _env_file_write(credentials, secrets)
         secrets_in = str(credentials)
@@ -1034,6 +1184,12 @@ def _cmd_connection(argv: list[str]) -> None:
            "next": f"`{NAME} doctor --connection {cid}` proves it"}
     if vault_skipped:
         out["vault_skipped"] = vault_skipped
+    if sealing.get("shared"):
+        out["shared"] = sealing["shared"]
+    if prefilled:
+        out["prefilled"] = prefilled
+    if sealing.get("prefill_skipped"):
+        out["prefill_skipped"] = sealing["prefill_skipped"]
     methods = globals().get("LINK_METHODS") or []
     if methods:
         out["link"] = [m.get("id") for m in methods]
@@ -1053,6 +1209,186 @@ def _cmd_connection(argv: list[str]) -> None:
             out["granted"] = bool(usable.get("enabled"))
         if scope == "global" or out.get("granted") is False:
             out["hint"] = _grant_hint(cid)
+    _emit(out)
+
+
+# The names a connection never carries in the vault: the agent's key, its id
+# and the store setting are read before the vault can be.
+_SEAL_NEVER = ("AGENT_ENCRYPTION_KEY", "CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT")
+
+
+def _sealable(row: object) -> bool:
+    """Whether a row of a connection's report names an env key the vault may
+    carry: not a value the connection's record states itself (tier
+    `connection`, or a field's own lower-case name), and none read before the
+    vault can be."""
+    import re as _re
+    key = row.get("key") if isinstance(row, dict) else None
+    return (isinstance(key, str) and bool(_re.fullmatch(r"[A-Z_][A-Z0-9_]{0,254}", key))
+            and row.get("tier") != "connection"
+            and key not in _SEAL_NEVER and not key.startswith("AGENTKIT_"))
+
+
+def _own_report() -> dict:
+    """{connection: entry} of the capability's own `connections` report, each
+    entry's `keys` the per-key resolution doctor gates on; {} where it
+    refuses."""
+    import contextlib
+    import io
+    captured = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(captured):
+            _cmd_connections()
+    except SystemExit:
+        return {}
+    try:
+        report = json.loads(captured.getvalue())
+    except ValueError:
+        return {}
+    conns = report.get("connections") if isinstance(report, dict) else None
+    return conns if isinstance(conns, dict) else {}
+
+
+def _connection_rewrite(cid: str, fields: dict) -> bool:
+    """Write `fields` into connection `cid`'s own record, at the scope that
+    holds it, where they change it; whether the record holds them now."""
+    adapter = _records()
+    scopes = ["project", "global"] if _project_root() is not None else ["global"]
+    for scope in scopes:
+        held = adapter.resolve_scope(NAME, "connection", scope).get(cid)
+        if held is None:
+            continue
+        entry = dict(held.get("value") or {})
+        if all(entry.get(k) == v for k, v in fields.items()):
+            return True
+        entry.update(fields)
+        if scope == "project" and adapter.mode_of("connection") == "store":
+            adapter.set(NAME, "connection", cid, entry, scope=scope, own=True)
+        else:
+            adapter.set(NAME, "connection", cid, entry, scope=scope)
+        return True
+    return False
+
+
+def _cmd_connection_seal(argv: list[str], usage: str) -> None:
+    """`connection seal [<id>] [--share]` writes into each connection this
+    project may use (or the one named) the values it resolves today from the
+    project's .env files, the machine's files or the process environment,
+    sealed into the agent's vault, so it resolves them the same on a node that
+    has none of those; what the capability's `_connection_prefill` hook asks of
+    a connection naming none of its own (an app of its own) is written into
+    its record first. With --share a connection the store shares is sealed
+    for every other agent granted it too, for its public sealing key, from
+    what it resolves here, vault included. Nothing a vault already holds is
+    written over, so running it again changes nothing; a grantee whose public
+    key is not published is named, never skipped in silence. A file is never
+    changed: once the vault holds a value the cascade reads it first."""
+    share = "--share" in argv
+    words = [w for w in argv if w != "--share"]
+    flags = [w for w in words if w.startswith("--")]
+    if flags:
+        _die(6, "input", f"unknown connection seal option {flags[0]!r}", usage)
+    if len(words) > 1:
+        _die(6, "input", "connection seal names at most one connection", usage)
+    _read_only_gate(f"`{NAME} connection seal`")
+    agent, why = _vault_agent()
+    if agent is None:
+        _die(6, "no_vault", f"there is no vault to seal into: {why}",
+             "run it in the agent's folder")
+    try:
+        from capabilities_contract import vault as _vault
+    except ImportError:
+        _vault = None
+    if _vault is None or not hasattr(_vault, "share"):
+        _die(6, "vault_unavailable", "this capability's library cannot seal a connection",
+             f"`capabilities update {NAME}` brings the library that does")
+    if not _vault.key_source(_project_root())[0]:
+        _die(6, "key_missing", f"this agent has no {_vault.KEY_ENV} here",
+             "bring the agent's key with `capabilities key set`, or make its first one with "
+             "`capabilities key generate`")
+    inventory = _inventory_connections().get("connections") or {}
+    usable = {cid: entry for cid, entry in inventory.items() if entry.get("granted")}
+    if words:
+        cid = words[0] if words[0] in inventory else (_labelled(words[0]) or words[0])
+        if cid not in inventory:
+            _die(3, "unknown_connection", f"no {NAME} connection {words[0]!r}",
+                 f"`{NAME} connections` lists them")
+        if cid not in usable:
+            _grant_gate({"withheld": {cid: {"scope": "project"}}}, cid)
+        usable = {cid: usable[cid]}
+    unpublished: dict = {}
+    results: dict = {}
+
+    def sealed_into(res: dict, done: dict) -> None:
+        for whom, names in (done.get("sealed") or {}).items():
+            res["sealed"].setdefault(whom, [])
+            res["sealed"][whom] = sorted(set(res["sealed"][whom]) | set(names))
+        for whom, names in (done.get("unchanged") or {}).items():
+            res["unchanged"] = sorted(set(res["unchanged"]) | set(names))
+        for whom in done.get("unpublished") or []:
+            unpublished.setdefault(whom, set()).add(cid)
+            res["unpublished"] = sorted(set(res["unpublished"]) | {whom})
+
+    hook = globals().get("_connection_prefill")
+    try:
+        for cid, entry in sorted(usable.items()):
+            res = {"shared": False, "sealed": {}, "unchanged": [], "unresolved": [],
+                   "from": {}, "unpublished": []}
+            results[cid] = res
+            grantees = _shared_grantees(cid)
+            res["shared"] = grantees is not None
+            others = sorted(set(grantees or []) - {agent}) if share else []
+            spec = {k: v for k, v in entry.items() if k not in ("allow_write", "granted")}
+            offered = (hook(cid, spec) or {}) if callable(hook) else {}
+            fields = {k: v for k, v in (offered.get("fields") or {}).items() if k not in spec}
+            values = dict(offered.get("secrets") or {})
+            if (fields or values) and (grantees is None or share):
+                # A connection's record changes only once every agent it is
+                # granted to holds what the change names.
+                done = _vault_share(agent, values, [agent, *others], replace=False) \
+                    if values else {}
+                sealed_into(res, done)
+                res["from"].update({key: "machine" for key in values})
+                if not done.get("unpublished") and not done.get("unregistered"):
+                    if _connection_rewrite(cid, fields):
+                        res["spec"] = fields
+                else:
+                    res["spec_pending"] = fields
+        report = _own_report()
+        for cid, res in results.items():
+            own, everyone = {}, {}
+            for row in (report.get(cid) or {}).get("keys") or []:
+                if not _sealable(row):
+                    continue
+                key = row["key"]
+                value, tier, source = _resolve_env_key(key)
+                if not value:
+                    if row.get("required"):
+                        res["unresolved"].append(key)
+                    continue
+                if tier == "vault":
+                    everyone[key] = value
+                    res["from"].setdefault(key, str(source))
+                elif tier in ("project", "user", "env"):
+                    own[key] = everyone[key] = value
+                    res["from"][key] = str(source) if source else tier
+            if own:
+                sealed_into(res, _vault_share(agent, own, [agent], replace=False))
+            grantees = _shared_grantees(cid)
+            others = sorted(set(grantees or []) - {agent}) if share else []
+            if everyone and others:
+                sealed_into(res, _vault_share(agent, everyone, others, replace=False))
+            res["unresolved"] = sorted(set(res["unresolved"]))
+    except _vault.VaultError as e:
+        _die(5 if e.slug == "vault_unwritable" else 6, e.slug, e.message, e.hint)
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+    out = {"ok": True, "action": "seal", "capability": NAME, "agent": agent,
+           "share": share, "connections": results,
+           "unpublished": [{"agent": whom, "connections": sorted(cids)}
+                           for whom, cids in sorted(unpublished.items())]}
+    if unpublished:
+        out["hint"] = _vault.UNPUBLISHED_HINT
     _emit(out)
 
 

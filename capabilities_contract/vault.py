@@ -13,6 +13,15 @@ moved to another agent or another name does not open. A row sealed under a key o
 than the agent's present one is unreadable: it is kept and reported, and is set again
 to be read.
 
+Every key also gives the agent a public sealing key, an X25519 public key derived from
+it, which the agent's row publishes in `vault_public_key` beside the fingerprint; the
+key itself still never enters the store. A writer that does not hold an agent's key -
+another agent writing a shared connection's secret for each of its grantees - seals a
+value for that public key (`seal_for`): an ephemeral X25519 key agreed with it gives
+the XChaCha20-Poly1305 key, the agent id and the name bound as before. The row is the
+agent's like any other, recorded under the agent's key fingerprint, and only the
+agent's key opens it (`unseal` reads either format).
+
 `Reader` is how a process resolves vault values: it reads the agent's sealed rows and
 the vault's channel version in one round trip (or is handed them by the round trip that
 reads the agent's connections), opens only the names asked for, keeps what it opened in
@@ -42,8 +51,12 @@ VAULT_TABLE = "capabilities_vault"
 VAULT_CHANNEL = "capabilities_vault"
 KEY_BYTES = 32
 NONCE_BYTES = 24
-# The first byte of every sealed value: the format it is sealed in.
+# The first byte of every sealed value: the format it is sealed in - under the
+# agent's own key, or for its public sealing key by a writer without the key.
 SEALED_FORMAT = 1
+SEALED_FORMAT_PUBLIC = 2
+PUBLIC_BYTES = 32
+PUBLIC_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,254}")
 FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
 # How long a reader trusts what it read before it asks the channel again.
@@ -54,6 +67,8 @@ RETRY_SECONDS = 2.0
 
 _AAD_PREFIX = b"capabilities-vault/v1\0"
 _FINGERPRINT_PREFIX = b"capabilities-vault-key/v1\0"
+_PUBLIC_SECRET_PREFIX = b"capabilities-vault-public/v1\0"
+_PUBLIC_SEAL_PREFIX = b"capabilities-vault-public-seal/v1\0"
 
 
 class VaultError(DbError):
@@ -102,6 +117,35 @@ def parse_key(text: str) -> bytes:
 def fingerprint(key: bytes) -> str:
     """What the store keeps of a key: a SHA-256 over it, as lowercase hex."""
     return hashlib.sha256(_FINGERPRINT_PREFIX + key).hexdigest()
+
+
+def _public_secret(key: bytes) -> bytes:
+    """The X25519 secret scalar an agent's key gives: a SHA-256 over it, apart
+    from the fingerprint, so neither is learnt from the other."""
+    return hashlib.sha256(_PUBLIC_SECRET_PREFIX + key).digest()
+
+
+def public_key(key: bytes) -> bytes:
+    """The agent's public sealing key: the X25519 public key of the scalar its
+    key gives. What the store publishes of the agent beside its fingerprint."""
+    return _nacl().crypto_scalarmult_base(_public_secret(key))
+
+
+def public_text(key: bytes) -> str:
+    """The public sealing key as the store keeps it: URL-safe base64 of its 32
+    bytes, without padding."""
+    return encode_key(public_key(key))
+
+
+def parse_public(text: object) -> bytes | None:
+    """The public sealing key `text` holds, or None where it holds none."""
+    if not isinstance(text, str) or not PUBLIC_RE.fullmatch(text):
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+    except (ValueError, TypeError):
+        return None
+    return raw if len(raw) == PUBLIC_BYTES else None
 
 
 def shared_env_path() -> Path:
@@ -179,10 +223,59 @@ def seal(key: bytes, agent_id: str, name: str, value: str) -> bytes:
     return bytes([SEALED_FORMAT]) + nonce + sealed
 
 
+def _public_seal_key(shared: bytes, ephemeral: bytes, public: bytes) -> bytes:
+    return hashlib.sha256(_PUBLIC_SEAL_PREFIX + shared + ephemeral + public).digest()
+
+
+def seal_for(public: bytes, agent_id: str, name: str, value: str) -> bytes:
+    """`value` sealed for `name` of `agent_id` by a writer that holds only the
+    agent's public sealing key: the format byte, the ephemeral public key, the
+    nonce, then the ciphertext with its tag. Only the agent's key opens it."""
+    nacl = _nacl()
+    if len(public) != PUBLIC_BYTES:
+        raise VaultError("bad_public_key", f"agent {agent_id}'s public sealing key is not one")
+    ephemeral_secret = _secrets.token_bytes(PUBLIC_BYTES)
+    ephemeral = nacl.crypto_scalarmult_base(ephemeral_secret)
+    try:
+        shared = nacl.crypto_scalarmult(ephemeral_secret, public)
+    except Exception:  # a low-order point agrees on nothing
+        raise VaultError("bad_public_key",
+                         f"agent {agent_id}'s public sealing key is not one") from None
+    nonce = _secrets.token_bytes(NONCE_BYTES)
+    sealed = nacl.crypto_aead_xchacha20poly1305_ietf_encrypt(
+        value.encode("utf-8"), _aad(agent_id, check_name(name)), nonce,
+        _public_seal_key(shared, ephemeral, public))
+    return bytes([SEALED_FORMAT_PUBLIC]) + ephemeral + nonce + sealed
+
+
+def _unseal_public(key: bytes, agent_id: str, name: str, blob: bytes) -> str | None:
+    nacl = _nacl()
+    if len(blob) < 1 + PUBLIC_BYTES + NONCE_BYTES:
+        return None
+    ephemeral = blob[1:1 + PUBLIC_BYTES]
+    nonce = blob[1 + PUBLIC_BYTES:1 + PUBLIC_BYTES + NONCE_BYTES]
+    sealed = blob[1 + PUBLIC_BYTES + NONCE_BYTES:]
+    secret = _public_secret(key)
+    try:
+        shared = nacl.crypto_scalarmult(secret, ephemeral)
+        plain = nacl.crypto_aead_xchacha20poly1305_ietf_decrypt(
+            sealed, _aad(agent_id, name), nonce,
+            _public_seal_key(shared, ephemeral, nacl.crypto_scalarmult_base(secret)))
+    except Exception:  # nacl.exceptions.CryptoError, or a low-order point
+        return None
+    try:
+        return plain.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
 def unseal(key: bytes, agent_id: str, name: str, blob: bytes) -> str | None:
     """The value `blob` holds, or None where it does not open under `key` for
-    this agent and name."""
+    this agent and name: sealed under the key itself, or for the public
+    sealing key it gives."""
     blob = bytes(blob)
+    if blob[:1] == bytes([SEALED_FORMAT_PUBLIC]):
+        return _unseal_public(key, agent_id, name, blob)
     if len(blob) < 1 + NONCE_BYTES or blob[0] != SEALED_FORMAT:
         return None
     nacl = _nacl()
@@ -230,6 +323,59 @@ def recorded_key(conn: Any, agent_id: str) -> tuple[bool, str | None]:
 def record_key(conn: Any, agent_id: str, key_fingerprint: str) -> None:
     conn.execute("UPDATE capabilities_agents SET vault_key = %s, updated_at = now() "
                  "WHERE id = %s", (key_fingerprint, agent_id))
+
+
+def publish(conn: Any, agent_id: str, key: bytes) -> bool | None:
+    """Publish the agent's public sealing key on its row, where the row records
+    this key's fingerprint and does not already publish it: True where it was
+    written, False where nothing changed (already published, or the row
+    records another key or none), None where the store predates the column.
+    Run inside the caller's transaction, under a savepoint of its own."""
+    import psycopg
+    text, current = public_text(key), fingerprint(key)
+    try:
+        with conn.transaction():
+            done = conn.execute(
+                "UPDATE capabilities_agents SET vault_public_key = %s WHERE id = %s "
+                "AND vault_key = %s AND vault_public_key IS DISTINCT FROM %s",
+                (text, agent_id, current, text)).rowcount
+    except psycopg.errors.UndefinedColumn:
+        return None
+    return bool(done)
+
+
+def recipients(conn: Any, agent_ids: Iterable[str]) -> dict[str, tuple[str | None, bytes | None]]:
+    """{agent: (the fingerprint of its key, its public sealing key)} for each
+    of `agent_ids` the store registers, either None where its row records none;
+    an agent the store does not register is left out. A store that predates the
+    public column answers None for every public key."""
+    import psycopg
+    wanted = sorted(set(agent_ids))
+    if not wanted:
+        return {}
+    try:
+        with conn.transaction():
+            found = conn.execute(
+                "SELECT id, vault_key, vault_public_key FROM capabilities_agents "
+                "WHERE id = ANY(%s)", (wanted,)).fetchall()
+    except psycopg.errors.UndefinedColumn:
+        found = [(agent, fp, None) for agent, fp in conn.execute(
+            "SELECT id, vault_key FROM capabilities_agents WHERE id = ANY(%s)",
+            (wanted,)).fetchall()]
+    return {agent: (fp, parse_public(public) if fp else None) for agent, fp, public in found}
+
+
+def put_for(conn: Any, agent_id: str, key_fingerprint: str, public: bytes, name: str,
+            value: str, updated_by: str | None = None) -> None:
+    """Seal `value` for the agent's public sealing key and keep it as `name` of
+    its vault, under the fingerprint of its key, replacing what was there."""
+    conn.execute(
+        "INSERT INTO capabilities_vault (agent_id, name, ciphertext, key_fingerprint, "
+        "updated_by) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (agent_id, name) DO UPDATE "
+        "SET ciphertext = excluded.ciphertext, key_fingerprint = excluded.key_fingerprint, "
+        "updated_at = now(), updated_by = excluded.updated_by",
+        (agent_id, check_name(name), seal_for(public, agent_id, name, value),
+         key_fingerprint, updated_by))
 
 
 def put(conn: Any, key: bytes, agent_id: str, name: str, value: str,
@@ -323,6 +469,7 @@ def write(project_root: Path | str | None, agent_id: str, values: Mapping[str, s
                              f"the {KEY_ENV} here is not the key agent {agent_id}'s vault "
                              "is kept under",
                              "bring the agent's key with `capabilities key set`")
+        publish(conn, agent_id, key)
         held = {row[0] for row in conn.execute(
             "SELECT name FROM capabilities_vault WHERE agent_id = %s AND name = ANY(%s)",
             (agent_id, names)).fetchall()}
@@ -332,6 +479,84 @@ def write(project_root: Path | str | None, agent_id: str, values: Mapping[str, s
 
     done = _in_store(project_root, application_name, seal_all)
     _forget(agent_id)
+    return done
+
+
+UNPUBLISHED_HINT = ("an agent's public sealing key is published by the first command "
+                    "that uses its key against the store in its folder: "
+                    "`capabilities connections seal` there")
+
+
+def share(project_root: Path | str | None, writer: str | None, values: Mapping[str, str],
+          agents: Iterable[str], *, replace: bool = True,
+          application_name: str = "capabilities",
+          updated_by: str | None = None) -> dict[str, Any]:
+    """Seal each of `values` into the vault of every one of `agents`, in one
+    transaction: the writer's own (`writer`, where it is one of them) under the
+    key `project_root` resolves, every other agent's for its published public
+    sealing key, so no key but the writer's is needed. With `replace` false a
+    name an agent's vault already holds under its present key is left as it
+    is, so running it again changes nothing. Answers {sealed: {agent: {name:
+    "created" | "replaced"}}, unchanged: {agent: [name]}, unpublished: [agent],
+    unregistered: [agent], hint}: an agent whose row publishes no public key is
+    named, never skipped in silence. VaultError as `write` raises it, for the
+    writer's own key, and `vault_unwritable`."""
+    names = [check_name(name) for name in values]
+    targets = sorted(set(agents))
+    key = agent_key(project_root) if writer in targets else None
+    if writer in targets and key is None:
+        raise VaultError("key_missing", f"this agent has no {KEY_ENV} here",
+                         "`capabilities key generate` makes the agent's first one")
+
+    def seal_all(conn: Any) -> dict[str, Any]:
+        out: dict[str, Any] = {"sealed": {}, "unchanged": {}, "unpublished": [],
+                               "unregistered": []}
+        if key is not None:
+            found, recorded = recorded_key(conn, writer)
+            current = fingerprint(key)
+            if found and recorded is None:
+                record_key(conn, writer, current)
+            elif found and recorded != current:
+                raise VaultError("key_mismatch",
+                                 f"the {KEY_ENV} here is not the key agent {writer}'s vault "
+                                 "is kept under",
+                                 "bring the agent's key with `capabilities key set`")
+            if found:
+                publish(conn, writer, key)
+        known = recipients(conn, targets)
+        for agent in targets:
+            if agent not in known:
+                out["unregistered"].append(agent)
+                continue
+            fp, public = known[agent]
+            own = agent == writer and key is not None
+            if not own and (fp is None or public is None):
+                out["unpublished"].append(agent)
+                continue
+            fp = fingerprint(key) if own else fp
+            held = {name for name, at in conn.execute(
+                "SELECT name, key_fingerprint FROM capabilities_vault WHERE agent_id = %s "
+                "AND name = ANY(%s)", (agent, names)).fetchall() if at == fp}
+            present = {row[0] for row in conn.execute(
+                "SELECT name FROM capabilities_vault WHERE agent_id = %s AND name = ANY(%s)",
+                (agent, names)).fetchall()}
+            for name in names:
+                if not replace and name in held:
+                    out["unchanged"].setdefault(agent, []).append(name)
+                    continue
+                if own:
+                    put(conn, key, agent, name, values[name], updated_by=updated_by)
+                else:
+                    put_for(conn, agent, fp, public, name, values[name], updated_by=updated_by)
+                out["sealed"].setdefault(agent, {})[name] = (
+                    "replaced" if name in present else "created")
+        if out["unpublished"]:
+            out["hint"] = UNPUBLISHED_HINT
+        return out
+
+    done = _in_store(project_root, application_name, seal_all)
+    for agent in done["sealed"]:
+        _forget(agent)
     return done
 
 

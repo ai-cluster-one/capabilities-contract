@@ -278,3 +278,62 @@ def test_write_to_a_store_it_cannot_reach_is_refused_as_unwritable(tmp_path, cle
         vault.write(root, AGENT, {"API_TOKEN": "tok-1"})
     assert raised.value.slug == "vault_unwritable"
     assert "tok-1" not in raised.value.message
+
+
+def test_a_value_sealed_for_the_public_key_opens_only_under_the_agents_key():
+    key = vault.parse_key(vault.generate_key())
+    public = vault.parse_public(vault.public_text(key))
+    assert public == vault.public_key(key) and len(public) == 32
+    assert vault.public_text(key) != vault.encode_key(key)
+    blob = vault.seal_for(public, AGENT, "API_TOKEN", "tok-1")
+    assert blob[0] == vault.SEALED_FORMAT_PUBLIC and b"tok-1" not in blob
+    assert vault.unseal(key, AGENT, "API_TOKEN", blob) == "tok-1"
+    assert vault.unseal(key, "prj_000000000002", "API_TOKEN", blob) is None
+    assert vault.unseal(key, AGENT, "OTHER", blob) is None
+    assert vault.unseal(vault.parse_key(vault.generate_key()), AGENT, "API_TOKEN", blob) is None
+    assert vault.parse_public("short") is None
+
+
+PEER = "prj_000000000002"
+LATE = "prj_000000000003"
+
+
+def test_share_seals_for_each_grantee_its_key_opens_and_names_one_not_published(
+        vaulted, tmp_path):
+    writer_text, peer_text, late_text = (vault.generate_key() for _ in range(3))
+    peer_key, late_key = vault.parse_key(peer_text), vault.parse_key(late_text)
+    with connect(application_name="setup", transaction=True) as conn, conn.transaction():
+        conn.execute("INSERT INTO capabilities_agents (id) VALUES (%s), (%s)", (PEER, LATE))
+        vault.record_key(conn, PEER, vault.fingerprint(peer_key))
+        assert vault.publish(conn, PEER, peer_key) is True
+        assert vault.publish(conn, PEER, peer_key) is False
+        vault.record_key(conn, LATE, vault.fingerprint(late_key))
+    root = _agent_root(tmp_path, writer_text, vaulted)
+    done = vault.share(root, AGENT, {"API_TOKEN": "tok-1"}, [AGENT, PEER, LATE],
+                       replace=False, updated_by="me@node")
+    assert done["sealed"] == {AGENT: {"API_TOKEN": "created"}, PEER: {"API_TOKEN": "created"}}
+    assert done["unpublished"] == [LATE] and done["hint"]
+    peer_root = tmp_path / "peer"
+    peer_root.mkdir()
+    (peer_root / ".env.local").write_text(f"{vault.KEY_ENV}={peer_text}\n")
+    assert vault.reader(peer_root, PEER).get("API_TOKEN") == "tok-1"
+    assert vault.reader(root, AGENT).get("API_TOKEN") == "tok-1"
+    # The writer's key was published as it sealed its own.
+    with connect(application_name="reader", transaction=True) as conn:
+        found = vault.recipients(conn, [AGENT, PEER, LATE])
+    assert found[AGENT][1] == vault.public_key(vault.parse_key(writer_text))
+    assert found[LATE] == (vault.fingerprint(late_key), None)
+    again = vault.share(root, AGENT, {"API_TOKEN": "tok-2"}, [AGENT, PEER], replace=False)
+    assert again["sealed"] == {} and again["unchanged"] == {AGENT: ["API_TOKEN"],
+                                                            PEER: ["API_TOKEN"]}
+    rotated = vault.share(root, AGENT, {"API_TOKEN": "tok-2"}, [AGENT, PEER])
+    assert rotated["sealed"][PEER] == {"API_TOKEN": "replaced"}
+    deadline = time.monotonic() + vault.CHECK_SECONDS + 1.0
+    while vault.reader(peer_root, PEER).get("API_TOKEN") != "tok-2":
+        assert time.monotonic() < deadline, "the rotated value did not reach the grantee"
+        time.sleep(0.05)
+    # A key that changes takes its public key with it.
+    with connect(application_name="writer", transaction=True) as conn:
+        with conn.transaction():
+            vault.record_key(conn, PEER, vault.fingerprint(vault.parse_key(vault.generate_key())))
+        assert vault.recipients(conn, [PEER])[PEER][1] is None

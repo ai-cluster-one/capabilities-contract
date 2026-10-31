@@ -45,11 +45,10 @@ def _link(agent, node, master=True):
 
 def test_a_store_at_the_connection_label_step_takes_only_the_kind_step_and_keeps_every_agent(store):
     steps = store_tier.record_table_steps()
-    assert steps[-1][0] == "0037-agent-kind"
-    assert store_tier.STORE_TABLES_VERSION == (1, 22)
-    _migrate(steps[:-1], 1, 21)
+    at = [step[0] for step in steps].index("0037-agent-kind")
+    _migrate(steps[:at], 1, 21)
     _sql("INSERT INTO capabilities_agents (id, slug) VALUES (%s, 'work')", (AGENT,))
-    result = _migrate(steps, *store_tier.STORE_TABLES_VERSION)
+    result = _migrate(steps[:at + 1], 1, 22)
     assert result.applied == ["0037-agent-kind"]
     assert _sql("SELECT id, slug, kind FROM capabilities_agents") == [(AGENT, "work", "agent")]
     with _conn() as conn:
