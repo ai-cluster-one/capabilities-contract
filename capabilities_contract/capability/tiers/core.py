@@ -792,7 +792,7 @@ def _read_only_gate(action: str) -> None:
 def _system_agent_gate(action: str) -> None:
     """Refuse `action` where this project's agent is a system agent: one an
     app keeps on its machine for itself, whose identity and doctrine no edit
-    changes (`capabilities_agents.kind`). A project with no store, or whose
+    changes (`agents.kind`). A project with no store, or whose
     store holds no row for it, is no system agent; a store that does not
     answer is refused as the read would be."""
     root = _project_root()
@@ -1089,7 +1089,7 @@ _PROJECT_SLUG: dict = {}
 
 def _project_slug(root: Path | None = None) -> str | None:
     """The project's slug, its short technical name: the one its agent's row in
-    the store holds (`capabilities_agents.slug`, which `capabilities relabel`
+    the store holds (`agents.slug`, which `capabilities relabel`
     writes), else the one an older `project.json` still names, else the
     project's id; None outside a project, or for one with none of them.
 
@@ -1375,9 +1375,9 @@ def _connections_home_section() -> str:
     if mode == "store":
         return (header + "This project keeps its connections in its store, not in "
                 "files: each\n"
-                "connection is a row of the store's `capabilities_connections` table, "
+                "connection is a row of the store's `connections` table, "
                 "and\n"
-                "this project's grant on it a row of `capabilities_connection_grants`.\n"
+                "this project's grant on it a row of `grants`.\n"
                 "No connections.json, the project's or the machine's, is read for this "
                 "project.\n" + reported)
     return (header + "This project keeps its connections in files: its own\n"

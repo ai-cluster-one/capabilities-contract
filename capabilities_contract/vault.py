@@ -3,8 +3,8 @@
 Every agent has one encryption key, `AGENT_ENCRYPTION_KEY`, held in its environment
 and never in the store: on a Mac its folder's `.env.local`, on a node its environment
 or the node's machine file `$XDG_CONFIG_HOME/capabilities/shared.env`. Each secret is
-a row of `capabilities_vault` - the agent, the name, the sealed value and the
-fingerprint of the key that sealed it - and the agent's row in `capabilities_agents`
+a row of `secrets` - the agent, the name, the sealed value and the
+fingerprint of the key that sealed it - and the agent's row in `agents`
 keeps the fingerprint of its key in `vault_key`, never the key.
 
 A value is sealed with XChaCha20-Poly1305 (libsodium, through PyNaCl), a fresh random
@@ -47,7 +47,7 @@ from typing import Any
 from capabilities_contract.db._errors import DbError
 
 KEY_ENV = "AGENT_ENCRYPTION_KEY"
-VAULT_TABLE = "capabilities_vault"
+VAULT_TABLE = "secrets"
 VAULT_CHANNEL = "capabilities_vault"
 KEY_BYTES = 32
 NONCE_BYTES = 24
@@ -295,9 +295,9 @@ def unseal(key: bytes, agent_id: str, name: str, blob: bytes) -> str | None:
 
 
 ROWS_QUERY = ("SELECT name, ciphertext, key_fingerprint, updated_at, updated_by "
-              "FROM capabilities_vault WHERE agent_id = %s ORDER BY name")
+              "FROM secrets WHERE agent_id = %s ORDER BY name")
 VERSION_QUERY = "SELECT version FROM schema_channel WHERE channel = %s AND scope = %s"
-KEY_QUERY = "SELECT vault_key FROM capabilities_agents WHERE id = %s"
+KEY_QUERY = "SELECT vault_key FROM agents WHERE id = %s"
 
 
 def round_trip(agent_id: str) -> list[tuple[str, tuple]]:
@@ -321,7 +321,7 @@ def recorded_key(conn: Any, agent_id: str) -> tuple[bool, str | None]:
 
 
 def record_key(conn: Any, agent_id: str, key_fingerprint: str) -> None:
-    conn.execute("UPDATE capabilities_agents SET vault_key = %s, updated_at = now() "
+    conn.execute("UPDATE agents SET vault_key = %s, updated_at = now() "
                  "WHERE id = %s", (key_fingerprint, agent_id))
 
 
@@ -336,7 +336,7 @@ def publish(conn: Any, agent_id: str, key: bytes) -> bool | None:
     try:
         with conn.transaction():
             done = conn.execute(
-                "UPDATE capabilities_agents SET vault_public_key = %s WHERE id = %s "
+                "UPDATE agents SET vault_public_key = %s WHERE id = %s "
                 "AND vault_key = %s AND vault_public_key IS DISTINCT FROM %s",
                 (text, agent_id, current, text)).rowcount
     except psycopg.errors.UndefinedColumn:
@@ -356,11 +356,11 @@ def recipients(conn: Any, agent_ids: Iterable[str]) -> dict[str, tuple[str | Non
     try:
         with conn.transaction():
             found = conn.execute(
-                "SELECT id, vault_key, vault_public_key FROM capabilities_agents "
+                "SELECT id, vault_key, vault_public_key FROM agents "
                 "WHERE id = ANY(%s)", (wanted,)).fetchall()
     except psycopg.errors.UndefinedColumn:
         found = [(agent, fp, None) for agent, fp in conn.execute(
-            "SELECT id, vault_key FROM capabilities_agents WHERE id = ANY(%s)",
+            "SELECT id, vault_key FROM agents WHERE id = ANY(%s)",
             (wanted,)).fetchall()]
     return {agent: (fp, parse_public(public) if fp else None) for agent, fp, public in found}
 
@@ -370,7 +370,7 @@ def put_for(conn: Any, agent_id: str, key_fingerprint: str, public: bytes, name:
     """Seal `value` for the agent's public sealing key and keep it as `name` of
     its vault, under the fingerprint of its key, replacing what was there."""
     conn.execute(
-        "INSERT INTO capabilities_vault (agent_id, name, ciphertext, key_fingerprint, "
+        "INSERT INTO secrets (agent_id, name, ciphertext, key_fingerprint, "
         "updated_by) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (agent_id, name) DO UPDATE "
         "SET ciphertext = excluded.ciphertext, key_fingerprint = excluded.key_fingerprint, "
         "updated_at = now(), updated_by = excluded.updated_by",
@@ -382,7 +382,7 @@ def put(conn: Any, key: bytes, agent_id: str, name: str, value: str,
         updated_by: str | None = None) -> None:
     """Seal `value` under `key` and keep it as `name`, replacing what was there."""
     conn.execute(
-        "INSERT INTO capabilities_vault (agent_id, name, ciphertext, key_fingerprint, "
+        "INSERT INTO secrets (agent_id, name, ciphertext, key_fingerprint, "
         "updated_by) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (agent_id, name) DO UPDATE "
         "SET ciphertext = excluded.ciphertext, key_fingerprint = excluded.key_fingerprint, "
         "updated_at = now(), updated_by = excluded.updated_by",
@@ -394,7 +394,7 @@ def remove(conn: Any, agent_id: str, names: Iterable[str]) -> list[str]:
     """Remove the named rows, which needs no key; the names that were there."""
     wanted = [check_name(n) for n in names]
     found = conn.execute(
-        "DELETE FROM capabilities_vault WHERE agent_id = %s AND name = ANY(%s) "
+        "DELETE FROM secrets WHERE agent_id = %s AND name = ANY(%s) "
         "RETURNING name", (agent_id, wanted)).fetchall()
     return sorted(name for (name,) in found)
 
@@ -402,7 +402,7 @@ def remove(conn: Any, agent_id: str, names: Iterable[str]) -> list[str]:
 def sealed_under_other(conn: Any, agent_id: str, key_fingerprint: str) -> int:
     """How many of the agent's rows were sealed under another key."""
     return conn.execute(
-        "SELECT count(*) FROM capabilities_vault WHERE agent_id = %s "
+        "SELECT count(*) FROM secrets WHERE agent_id = %s "
         "AND key_fingerprint <> %s", (agent_id, key_fingerprint)).fetchone()[0]
 
 
@@ -471,7 +471,7 @@ def write(project_root: Path | str | None, agent_id: str, values: Mapping[str, s
                              "bring the agent's key with `capabilities key set`")
         publish(conn, agent_id, key)
         held = {row[0] for row in conn.execute(
-            "SELECT name FROM capabilities_vault WHERE agent_id = %s AND name = ANY(%s)",
+            "SELECT name FROM secrets WHERE agent_id = %s AND name = ANY(%s)",
             (agent_id, names)).fetchall()}
         for name in names:
             put(conn, key, agent_id, name, values[name], updated_by=updated_by)
@@ -535,10 +535,10 @@ def share(project_root: Path | str | None, writer: str | None, values: Mapping[s
                 continue
             fp = fingerprint(key) if own else fp
             held = {name for name, at in conn.execute(
-                "SELECT name, key_fingerprint FROM capabilities_vault WHERE agent_id = %s "
+                "SELECT name, key_fingerprint FROM secrets WHERE agent_id = %s "
                 "AND name = ANY(%s)", (agent, names)).fetchall() if at == fp}
             present = {row[0] for row in conn.execute(
-                "SELECT name FROM capabilities_vault WHERE agent_id = %s AND name = ANY(%s)",
+                "SELECT name FROM secrets WHERE agent_id = %s AND name = ANY(%s)",
                 (agent, names)).fetchall()}
             for name in names:
                 if not replace and name in held:

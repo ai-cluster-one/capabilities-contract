@@ -18,6 +18,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from capabilities_contract.db import _core
 from capabilities_contract.db._changes import CHANNEL_TABLE
 from capabilities_contract.db._connect import _psycopg, bind_search_path, bound_schema
 from capabilities_contract.db._errors import DbError
@@ -86,10 +87,12 @@ class MigrateResult:
 
 
 # The core's own steps and the version they bring it to, which `migrate` runs for
-# every other owner first. While empty, nothing runs for the core and nothing is
-# written for it.
-CORE_STEPS: tuple[Step, ...] = ()
-CORE_VERSION = (0, 0)
+# every other owner first. The first takes a store that holds the same tables as
+# owner `capabilities` (schema version 1.23 or older) to the core in place, and
+# makes them on a store that holds none (`_core`). While empty, nothing runs for
+# the core and nothing is written for it.
+CORE_STEPS: tuple[Step, ...] = (Step(_core.CORE_STEP_ID, _core.CORE_STEP_SQL),)
+CORE_VERSION = (_core.CORE_MAJOR, _core.CORE_MINOR)
 
 
 @dataclass
