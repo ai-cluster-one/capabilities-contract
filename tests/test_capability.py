@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -269,3 +270,109 @@ def test_an_id_in_project_json_is_not_the_projects_id(tmp_path, monkeypatch, exc
     for key in ("CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT"):
         monkeypatch.delenv(key, raising=False)
     assert namespace["_project_id_state_at"](root) == {"state": "undeclared", "id": None}
+
+
+def _quarantined(tmp_path, monkeypatch, **extra) -> dict:
+    """A core- and store-bound namespace whose machine quarantines it."""
+    home = tmp_path / "config"
+    (home / "capabilities").mkdir(parents=True, exist_ok=True)
+    (home / "capabilities" / "machine.json").write_text(json.dumps(
+        {"schema": "capabilities.machine.v1",
+         "capabilities": {"probe": {"state": "quarantined", "at": "", "by": ""}}}))
+    for key in ("CAPABILITIES_AUTH_CONTEXT", "CAPABILITIES_READ_ONLY",
+                "CAPABILITIES_STORE_UPGRADE"):
+        monkeypatch.delenv(key, raising=False)
+    namespace = _declarations(_CONFIG_HOME=home, __file__=str(tmp_path / "probe"), **extra)
+    bind(namespace, "core", "store")
+    return namespace
+
+
+def _gate_exit(namespace, monkeypatch, *argv) -> int | None:
+    monkeypatch.setattr(sys, "argv", ["probe", *argv])
+    try:
+        namespace["_gate"]()
+    except SystemExit as stop:
+        return stop.code
+    return None
+
+
+def test_a_quarantined_capability_migrates_its_tables_only_under_the_store_upgrade(
+        tmp_path, monkeypatch, excepthook, capsys):
+    namespace = _quarantined(tmp_path, monkeypatch, TABLES=True)
+    assert _gate_exit(namespace, monkeypatch, "migrate") == 4
+    assert "quarantined" in capsys.readouterr().err
+    monkeypatch.setenv("CAPABILITIES_STORE_UPGRADE", "1")
+    assert _gate_exit(namespace, monkeypatch, "migrate") is None
+    assert _gate_exit(namespace, monkeypatch, "migrate", "status") is None
+    for other in (["migrate", "files", "write"], ["ids", "list"], ["doctor"]):
+        assert _gate_exit(namespace, monkeypatch, *other) == 4, other
+    # A capability that keeps no tables has no migrate of its own to admit.
+    bare = _quarantined(tmp_path, monkeypatch)
+    monkeypatch.setenv("CAPABILITIES_STORE_UPGRADE", "1")
+    assert _gate_exit(bare, monkeypatch, "migrate") == 4
+
+
+def test_the_manifest_names_the_store_major_when_the_capability_keeps_tables(
+        tmp_path, monkeypatch, excepthook):
+    from capabilities_contract.db import STORE_MAJOR
+    with_tables = _quarantined(tmp_path, monkeypatch, TABLES=True)
+    assert with_tables["_manifest_core"]()["store_major"] == STORE_MAJOR
+    without = _quarantined(tmp_path, monkeypatch)
+    assert "store_major" not in without["_manifest_core"]()
+
+
+def _migrating(tmp_path, monkeypatch, **extra) -> tuple[dict, list]:
+    """A capability keeping tables in the test store, its answers caught."""
+    namespace = _quarantined(tmp_path, monkeypatch, TABLES=True, **extra)
+    namespace["_tables"] = lambda: ([("0001", "CREATE TABLE probe_t (id int)")], 1, 0)
+    seen = []
+    namespace["_emit"] = seen.append
+    return namespace, seen
+
+
+LIBRARY = [("0001", "CREATE TABLE harness_profiles (id int)")]
+
+
+def test_a_capability_migrates_the_further_owners_it_names_first_and_reports_each(
+        store, tmp_path, monkeypatch, excepthook):
+    namespace, seen = _migrating(tmp_path, monkeypatch)
+    namespace["_owner_tables"] = lambda: [("harness", LIBRARY, 1, 2)]
+    assert namespace["_manifest_core"]()["owners"] == ["harness", "probe"]
+    namespace["_cmd_migrate"](["status"])
+    status = seen.pop()
+    assert status["owner"] == "probe" and status["state"] == "pending"
+    assert [(o["owner"], o["state"], o["pending"], o["code"])
+            for o in status["other_owners"]] == [
+        ("harness", "pending", ["0001"], {"major": 1, "minor": 2})]
+    namespace["_cmd_migrate"]([])
+    done = seen.pop()
+    assert done["owner"] == "probe" and done["applied"] == ["0001"]
+    assert [(o["owner"], o["applied"], o["version"]) for o in done["other_owners"]] == [
+        ("harness", ["0001"], {"major": 1, "minor": 2})]
+    from capabilities_contract.db import connect
+    with connect(application_name="capabilities-contract-tests") as conn:
+        ledger = conn.execute(f'SELECT owner FROM "{store.schema}".schema_ledger '
+                              "ORDER BY applied_at").fetchall()
+    assert ledger == [("harness",), ("probe",)]
+    namespace["_cmd_migrate"](["status"])
+    assert [o["state"] for o in seen.pop()["other_owners"]] == ["current"]
+
+
+def test_a_capability_without_further_owners_answers_as_before(
+        store, tmp_path, monkeypatch, excepthook):
+    namespace, seen = _migrating(tmp_path, monkeypatch)
+    assert namespace["_manifest_core"]()["owners"] == ["probe"]
+    namespace["_cmd_migrate"](["status"])
+    assert set(seen.pop()) == {"owner", "schema", "state", "code", "store", "applied",
+                               "pending", "changed", "warnings"}
+    namespace["_cmd_migrate"]([])
+    assert set(seen.pop()) == {"owner", "schema", "applied", "skipped", "version",
+                               "warnings"}
+
+
+def test_a_bad_further_owner_is_refused(store, tmp_path, monkeypatch, excepthook, capsys):
+    namespace, _seen = _migrating(tmp_path, monkeypatch)
+    namespace["_owner_tables"] = lambda: [("probe", LIBRARY, 1, 0)]
+    with pytest.raises(SystemExit) as stop:
+        namespace["_cmd_migrate"]([])
+    assert stop.value.code == 6 and "bad_owner_tables" in capsys.readouterr().err

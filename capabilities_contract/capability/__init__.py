@@ -64,7 +64,10 @@ Each is absent where it does not apply.
 Optionally, beside STATE, `TABLES = True` when the capability keeps tables in
 the machine's store, with a `_tables()` builder in its own code returning
 `(steps, major, minor)` for the shared database library. Absent or false means
-none, and `migrate` is then left to the CLI's own parser.
+none, and `migrate` is then left to the CLI's own parser. Beside it, optionally,
+an `_owner_tables()` hook returning a list of `(owner, steps, major, minor)`:
+further owners whose tables `migrate` migrates first, in order - a library's
+tables the capability's own steps reference.
 Optionally, `_migrate_files_mover(action, answers, all_answers)` in its own
 code: how `migrate files` moves the capability's own configuration files of a
 project (profiles, workers, definitions) into the store for `capabilities

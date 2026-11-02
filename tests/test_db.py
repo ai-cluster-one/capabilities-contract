@@ -482,11 +482,12 @@ def test_a_newer_stored_minor_proceeds_with_a_warning_and_keeps_the_stored_versi
             == [(1, 2)]
 
 
-def test_an_older_or_equal_stored_version_records_the_callers(store):
+def test_an_older_or_equal_stored_version_records_the_callers(store, monkeypatch):
     with _connect() as conn:
         migrate(conn, "skew", HEAD[:1], major=1, minor=0)
         same = migrate(conn, "skew", HEAD[:1], major=1, minor=0)
         assert same.warnings == [] and (same.major, same.minor) == (1, 0)
+        monkeypatch.setenv("CAPABILITIES_STORE_UPGRADE", "1")  # a major crosses only here
         newer = migrate(conn, "skew", HEAD, major=2, minor=0)
         assert newer.applied == ["0002"] and newer.warnings == []
         assert _rows(conn, f'SELECT major, minor FROM "{store.schema}".schema_version') \

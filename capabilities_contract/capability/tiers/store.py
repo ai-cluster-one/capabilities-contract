@@ -360,6 +360,14 @@ GLOBAL_STORE_COLLECTIONS = frozenset({"connection", "grant", "setting", "policy"
 # the configuration's: a capability maps these to its network exit code.
 STORE_ENVIRONMENT_SLUGS = frozenset({"store_unreachable", "store_busy"})
 
+# A store at another schema major than the one the shared database library
+# reads is refused before the first read or write of a process, not read as a
+# store that holds nothing: lower is `store_upgrade_needed`, higher
+# `schema_too_new`. Checked once per process for each store setting, and not at
+# all under the store upgrade, the procedure that moves it.
+STORE_MAJOR_SLUGS = frozenset({"store_upgrade_needed", "schema_too_new"})
+_STORE_MAJOR_SEEN: dict = {}
+
 # How long one process reuses what it read from the store, and a refusal to
 # connect: long enough that one command asks once, short enough that a
 # long-running service sees a changed grant, or a store that came back, at once.
@@ -3385,10 +3393,16 @@ class StoreRecords(FileRecords):
                 "run the capability through its own script header, which pins it")) from None
         try:
             setting = db.resolve_setting(self.project_root)
-            self._conn = db.connect(application_name=self.application_name,
-                                    setting=setting, transaction=True)
+            conn = db.connect(application_name=self.application_name,
+                              setting=setting, transaction=True)
         except db.DbError as exc:
             raise self._fail(StoreError(exc.slug, exc.message, exc.hint)) from None
+        try:
+            _store_major_guard(conn, setting)
+        except StoreError as exc:
+            conn.close()
+            raise self._fail(exc) from None
+        self._conn = conn
         self._schema = setting.schema
         return self._conn
 
@@ -4156,6 +4170,30 @@ _PROBE_TIMEOUT = 2
 _ACTOR_RE = re.compile(r"migrate|[a-z][a-z0-9-]{0,62}-service")
 
 
+def _store_major_guard(conn: Any, setting: Any) -> None:
+    """Refuse a store at another schema major than the one this library reads,
+    reading it once per process for `setting`. Raises StoreError."""
+    from capabilities_contract import db
+    from capabilities_contract.db import _migrate
+    if db.upgrading():
+        return
+    key = (repr(sorted(setting.connect_kwargs().items())), setting.schema)
+    if key not in _STORE_MAJOR_SEEN:
+        import psycopg
+        try:
+            found = db.store_major(conn, setting.schema).major
+        except db.DbError as exc:
+            raise StoreError(exc.slug, exc.message, exc.hint) from None
+        except psycopg.Error as exc:
+            raise StoreError("store_unreachable", f"cannot read the store's major: {exc}",
+                             "check the database setting with `capabilities store doctor`"
+                             ) from None
+        _STORE_MAJOR_SEEN[key] = _migrate._major_refusal(found)
+    refusal = _STORE_MAJOR_SEEN[key]
+    if refusal is not None:
+        raise StoreError(refusal.slug, refusal.message, refusal.hint)
+
+
 def _store_connect(project_root: Path, application_name: str,
                    timeout: int | None = None) -> tuple[Any, str]:
     """A transaction connection to the database resolved for `project_root`,
@@ -4174,6 +4212,11 @@ def _store_connect(project_root: Path, application_name: str,
                           transaction=True, **extra)
     except db.DbError as exc:
         raise StoreError(exc.slug, exc.message, exc.hint) from None
+    try:
+        _store_major_guard(conn, setting)
+    except StoreError:
+        conn.close()
+        raise
     return conn, setting.schema
 
 
@@ -5515,7 +5558,9 @@ def open_records(envelope: Path | str, global_dir: Path | str,
     only on a node it has registered, named by AGENT_NODE_NAME. Every other
     project is read as above. Asking cannot fail a project whose records are
     files: a store that does not answer within `_PROBE_TIMEOUT` leaves it on
-    its files. A project in store mode whose store does not answer keeps the
+    its files. A store at another schema major than the one the shared
+    database library reads is refused (`STORE_MAJOR_SLUGS`) rather than read
+    as one that holds nothing. A project in store mode whose store does not answer keeps the
     refusal for its settings, rather than reading files that may be stale.
     `actor` names a writer that is not the person running the command:
     `migrate` or `<capability>-service`.
@@ -5556,6 +5601,8 @@ def open_records(envelope: Path | str, global_dir: Path | str,
         conn, schema = _store_connect(root or envelope.parent, application_name,
                                       None if in_store else _PROBE_TIMEOUT)
     except StoreError as exc:
+        if exc.slug in STORE_MAJOR_SLUGS:
+            raise
         if in_store and exc.slug != "store_not_configured":
             legacy._settings_blocked = exc
         # No store answers: the references are the files, without asking again.

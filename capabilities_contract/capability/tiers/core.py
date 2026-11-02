@@ -890,10 +890,12 @@ def _gate() -> None:
     `migrate` of a capability that declares `TABLES` acts on the machine's
     store rather than for a project, so it too reads no policy row: it answers
     to the machine ceiling, and `migrate` (not `migrate status`) to the
-    read-only switch. `migrate files` is the manager's `capabilities migrate`
-    moving this capability's files of a project into the store, whether or not
-    the project enabled it: it answers to the machine ceiling, and `migrate
-    files write` to the read-only switch.
+    read-only switch. Under the store upgrade (`CAPABILITIES_STORE_UPGRADE=1`)
+    it passes the machine ceiling as well, so a capability quarantined on this
+    machine still has its tables moved; no other verb does. `migrate files` is
+    the manager's `capabilities migrate` moving this capability's files of a
+    project into the store, whether or not the project enabled it: it answers
+    to the machine ceiling, and `migrate files write` to the read-only switch.
 
     Machine administration reads no policy row either: it answers to the
     machine ceiling, and its writes to the read-only switch
@@ -902,14 +904,19 @@ def _gate() -> None:
     _auth_gate()
     verb = sys.argv[1] if len(sys.argv) > 1 else "help"
     safe = verb in {"help", "stub", "manifest", "connections"} and not _reveals()
-    if not safe:
-        _machine_gate()
     service_action = sys.argv[2] if len(sys.argv) > 2 else None
+    tables_migrate = verb == "migrate" and service_action != "files" and _tables_declared()
+    upgrade_migrate = False
+    if tables_migrate:
+        from capabilities_contract.db import upgrading
+        upgrade_migrate = upgrading()
+    if not safe and not upgrade_migrate:
+        _machine_gate()
     if verb == "migrate" and service_action == "files":
         if sys.argv[3:4] == ["write"]:
             _read_only_gate(f"`{NAME} migrate files write`")
         return
-    if verb == "migrate" and _tables_declared():
+    if tables_migrate:
         if service_action != "status":
             _read_only_gate(f"`{NAME} migrate`")
         return
@@ -1855,15 +1862,37 @@ def _tables_declared() -> bool:
     return bool(globals().get("TABLES"))
 
 
+def _other_owners() -> list[tuple]:
+    """The further owners this capability migrates before its own, in order,
+    each `(owner, steps, major, minor)`, from its optional `_owner_tables()`
+    hook: tables of a library it carries that its own steps reference. Empty
+    without the hook."""
+    hook = globals().get("_owner_tables")
+    if not callable(hook):
+        return []
+    found = []
+    for entry in hook() or []:
+        if (not isinstance(entry, (tuple, list)) or len(entry) != 4
+                or not isinstance(entry[0], str) or entry[0] == NAME):
+            _die(6, "bad_owner_tables", f"{NAME} declares a bad further owner {entry!r}",
+                 "`_owner_tables()` returns (owner, steps, major, minor) for each "
+                 f"owner other than {NAME}")
+        found.append(tuple(entry))
+    return found
+
+
 def _cmd_migrate(argv: list[str]) -> None:
     """`migrate` applies the capability's pending steps to its tables in the
     machine's store, through the shared database library and under its lock;
     `migrate status` reports where they stand, without a lock, changing nothing.
     The manager runs `migrate` when it installs or updates the payload, and a
-    service runs it when it starts."""
+    service runs it when it starts. The further owners `_owner_tables()` names
+    are migrated first, in order, and answered under `other_owners`, each as
+    the capability's own owner is answered at the top level."""
     if argv not in ([], ["status"]):
         _die(6, "input", f"unknown migrate arguments {' '.join(argv)!r}",
              f"{NAME} migrate [status]")
+    others = _other_owners()
     steps, major, minor = _tables()
     try:
         from capabilities_contract import db
@@ -1874,21 +1903,27 @@ def _cmd_migrate(argv: list[str]) -> None:
     conn = None
     try:
         conn = db.connect(application_name=NAME, transaction=True)
-        if argv:
-            found = db.status(conn, NAME, steps, major=major, minor=minor)
-            stored = (None if found.stored_major is None
-                      else {"major": found.stored_major, "minor": found.stored_minor})
-            report = {"owner": found.owner, "schema": found.schema, "state": found.state,
-                      "code": {"major": found.major, "minor": found.minor},
-                      "store": stored, "applied": found.applied,
-                      "pending": found.pending, "changed": found.changed,
-                      "warnings": found.warnings}
-        else:
-            done = db.migrate(conn, NAME, steps, major=major, minor=minor)
-            report = {"owner": done.owner, "schema": done.schema,
-                      "applied": done.applied, "skipped": done.skipped,
-                      "version": {"major": done.major, "minor": done.minor},
-                      "warnings": done.warnings}
+
+        def answer(owner, steps, major, minor) -> dict:
+            if argv:
+                found = db.status(conn, owner, steps, major=major, minor=minor)
+                stored = (None if found.stored_major is None
+                          else {"major": found.stored_major, "minor": found.stored_minor})
+                return {"owner": found.owner, "schema": found.schema, "state": found.state,
+                        "code": {"major": found.major, "minor": found.minor},
+                        "store": stored, "applied": found.applied,
+                        "pending": found.pending, "changed": found.changed,
+                        "warnings": found.warnings}
+            done = db.migrate(conn, owner, steps, major=major, minor=minor)
+            return {"owner": done.owner, "schema": done.schema,
+                    "applied": done.applied, "skipped": done.skipped,
+                    "version": {"major": done.major, "minor": done.minor},
+                    "warnings": done.warnings}
+
+        further = [answer(*entry) for entry in others]
+        report = answer(NAME, steps, major, minor)
+        if others:
+            report["other_owners"] = further
     except db.DbError as exc:
         _die(6 if exc.slug in _STORE_SETTING_SLUGS else 5, exc.slug, exc.message, exc.hint)
     finally:
@@ -2228,7 +2263,10 @@ def _settings_declaration() -> dict | None:
 def _manifest_core() -> dict:
     """The declaration every capability's manifest carries. A capability that
     adds to its manifest - a service, a contribution - starts from this, so the
-    shared part has one home."""
+    shared part has one home. A capability that keeps tables also names the
+    store major its shared database library reads and every owner its
+    `migrate` migrates, in order, its own last."""
+    from capabilities_contract.db import STORE_MAJOR
     return {"name": NAME, "summary": SUMMARY,
             "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
             "docs": {"base": DOCS_BASE,
@@ -2238,6 +2276,9 @@ def _manifest_core() -> dict:
             "connections": _connections_declaration(),
             "settings": _settings_declaration(),
             "migrate_files": callable(globals().get("_migrate_files_mover")),
+            **({"store_major": STORE_MAJOR,
+                "owners": [entry[0] for entry in _other_owners()] + [NAME]}
+               if _tables_declared() else {}),
             **({"setup": _setup_presentation()}
                if "_setup_presentation" in globals() and globals().get("SETUP") else {})}
 
