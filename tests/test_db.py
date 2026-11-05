@@ -16,6 +16,14 @@ from capabilities_contract.db import DbError, Step, _migrate, connect, migrate, 
 from capabilities_contract.version import __version__
 
 
+@pytest.fixture(autouse=True)
+def no_core_steps(monkeypatch):
+    """The ledger's own rules, proven with owners of these tests' own: the core's
+    real steps, which every other owner's migrate runs first, are proven in
+    test_core.py, and a test here that needs a core brings its own."""
+    monkeypatch.setattr(_migrate, "CORE_STEPS", ())
+
+
 def _connect():
     return connect(application_name="capabilities-contract-tests")
 

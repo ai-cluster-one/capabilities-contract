@@ -9,7 +9,8 @@ import time
 import pytest
 
 from capabilities_contract.capability import store as store_tier
-from capabilities_contract.db import connect, disconnect, migrate
+from capabilities_contract.db import _legacy, connect, disconnect, migrate
+from capabilities_contract.db import _migrate as _migrate_module
 
 NODE = "0a0b0c0d0e0f"
 OTHER = "0f0e0d0c0b0a"
@@ -32,26 +33,38 @@ def nodes(store):
     _migrate(store_tier.record_table_steps(), major, minor)
     with connect(application_name="setup", transaction=True) as conn, conn.transaction():
         for node in (NODE, OTHER):
-            conn.execute("INSERT INTO capabilities_nodes (id, label, kind)"
+            conn.execute("INSERT INTO nodes (id, label, kind)"
                          " VALUES (%s, %s, 'server')", (node, node))
         for agent in (AGENT, PEER, GONE):
-            conn.execute("INSERT INTO capabilities_agents (id) VALUES (%s)", (agent,))
+            conn.execute("INSERT INTO agents (id) VALUES (%s)", (agent,))
         for agent in (AGENT, PEER):
-            conn.execute("INSERT INTO capabilities_agent_nodes (agent_id, node)"
+            conn.execute("INSERT INTO agent_nodes (agent_id, node)"
                          " VALUES (%s, %s)", (agent, NODE))
     disconnect()
     return store
+
+
+def _legacy_migrate(monkeypatch, steps, major, minor):
+    """Migrate owner `capabilities` with its steps of history, as a release
+    without core steps did (`_legacy`)."""
+    with monkeypatch.context() as patched:
+        patched.setattr(_migrate_module, "CORE_STEPS", ())
+        with connect(application_name="setup", transaction=True) as conn:
+            result = migrate(conn, _legacy.LEGACY_OWNER, steps, major=major, minor=minor)
+            conn.commit()
+    disconnect()
+    return result
 
 
 def _conn():
     return connect(application_name="test", transaction=True)
 
 
-def test_a_store_at_the_step_before_takes_the_node_states_step(store):
-    steps = store_tier.record_table_steps()
+def test_a_store_at_the_step_before_takes_the_node_states_step(store, monkeypatch):
+    steps = list(_legacy.LIBRARY_STEPS)
     at = [step[0] for step in steps].index("0030-node-states")
-    _migrate(steps[:at], 1, 14)
-    result = _migrate(steps[:at + 1], 1, 15)
+    _legacy_migrate(monkeypatch, steps[:at], 1, 14)
+    result = _legacy_migrate(monkeypatch, steps[:at + 1], 1, 15)
     assert result.applied == ["0030-node-states"]
     with _conn() as conn:
         for table in ("capabilities_node_states", "capabilities_node_logins",
@@ -90,7 +103,7 @@ def test_a_node_writes_its_whole_row_and_reads_reachable_until_it_goes_stale(nod
             store_tier.node_state_put(conn, NODE, cpu_count=2, fresh_seconds=0.5)
         time.sleep(1.0)
         [row] = store_tier.node_states(conn, [NODE])
-        count = conn.execute("SELECT count(*) FROM capabilities_node_states").fetchone()[0]
+        count = conn.execute("SELECT count(*) FROM node_states").fetchone()[0]
     assert count == 1
     assert (row["cpu_count"], row["load_1"], row["boot_line"]) == (2, None, None)
     assert row["reachable"] is False
@@ -135,21 +148,21 @@ def test_the_helper_and_the_store_refuse_what_the_row_cannot_say(nodes):
     for column, value in (("load_1", -1), ("cpu_count", 0), ("memory_limit_bytes", 0),
                           ("boot_line", ""), ("image_version", "")):
         with _conn() as conn, pytest.raises(psycopg.errors.CheckViolation):
-            conn.execute(f"INSERT INTO capabilities_node_states (node, fresh_until, {column})"
+            conn.execute(f"INSERT INTO node_states (node, fresh_until, {column})"
                          " VALUES (%s, now() + interval '1 minute', %s)", (NODE, value))
     for column, value in (("claude_login", "logged_in"), ("gh_login", ""),
                           ("codex_account", "x")):
         with _conn() as conn, pytest.raises(psycopg.errors.CheckViolation):
-            conn.execute(f"INSERT INTO capabilities_node_logins (project_id, node, {column})"
+            conn.execute(f"INSERT INTO node_logins (agent_id, node, {column})"
                          " VALUES (%s, %s, %s)", (AGENT, NODE, value))
     with _conn() as conn, pytest.raises(psycopg.errors.CheckViolation):
-        conn.execute("INSERT INTO capabilities_node_states (node, fresh_until)"
+        conn.execute("INSERT INTO node_states (node, fresh_until)"
                      " VALUES (%s, now() - interval '1 second')", (NODE,))
     with _conn() as conn, pytest.raises(psycopg.errors.ForeignKeyViolation):
-        conn.execute("INSERT INTO capabilities_node_states (node, fresh_until)"
+        conn.execute("INSERT INTO node_states (node, fresh_until)"
                      " VALUES ('nowhere', now() + interval '1 minute')")
     with _conn() as conn, pytest.raises(psycopg.errors.CheckViolation):
-        conn.execute("INSERT INTO capabilities_node_sessions (project_id, node, capability,"
+        conn.execute("INSERT INTO node_sessions (agent_id, node, capability,"
                      " connection, live) VALUES ('', %s, 'whatsapp', 'main', true)", (NODE,))
 
 
@@ -190,7 +203,7 @@ def test_both_tables_follow_the_registry_id_and_go_with_the_node(nodes):
             store_tier.node_state_put(conn, NODE, cpu_count=1)
             store_tier.node_logins_put(conn, AGENT, NODE, {})
             store_tier.node_sessions_put(conn, AGENT, NODE, "whatsapp", [("main", True, None)])
-            conn.execute("UPDATE capabilities_nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
+            conn.execute("UPDATE nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
                          (NODE,))
         assert [r["node"] for r in store_tier.node_states(conn, ["aaaaaaaaaaaa"])] == [
             "aaaaaaaaaaaa"]
@@ -199,18 +212,18 @@ def test_both_tables_follow_the_registry_id_and_go_with_the_node(nodes):
         assert [r["node"] for r in store_tier.node_sessions(conn, AGENT, ["aaaaaaaaaaaa"])] \
             == ["aaaaaaaaaaaa"]
         with conn.transaction():
-            conn.execute("DELETE FROM capabilities_nodes WHERE id = 'aaaaaaaaaaaa'")
-        assert conn.execute("SELECT (SELECT count(*) FROM capabilities_node_states)"
-                            " + (SELECT count(*) FROM capabilities_node_logins)"
-                            " + (SELECT count(*) FROM capabilities_node_sessions)"
+            conn.execute("DELETE FROM nodes WHERE id = 'aaaaaaaaaaaa'")
+        assert conn.execute("SELECT (SELECT count(*) FROM node_states)"
+                            " + (SELECT count(*) FROM node_logins)"
+                            " + (SELECT count(*) FROM node_sessions)"
                             ).fetchone()[0] == 0
 
 
-def test_a_store_at_the_node_states_step_takes_only_the_expectations_step(store):
-    steps = store_tier.record_table_steps()
+def test_a_store_at_the_node_states_step_takes_only_the_expectations_step(store, monkeypatch):
+    steps = list(_legacy.LIBRARY_STEPS)
     at = [step[0] for step in steps].index("0031-node-expectations")
-    _migrate(steps[:at], 1, 15)
-    result = _migrate(steps[:at + 1], 1, 16)
+    _legacy_migrate(monkeypatch, steps[:at], 1, 15)
+    result = _legacy_migrate(monkeypatch, steps[:at + 1], 1, 16)
     assert result.applied == ["0031-node-expectations"]
     with _conn() as conn:
         uncommented = conn.execute(
@@ -279,23 +292,23 @@ def test_the_owners_words_follow_the_registry_id_and_go_with_the_node(nodes):
             store_tier.node_expectation_set(conn, AGENT, NODE, tool="gh", expected=True)
             store_tier.node_expectation_set(conn, AGENT, NODE, capability="telegram",
                                             connection="main", expected=True)
-            conn.execute("UPDATE capabilities_nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
+            conn.execute("UPDATE nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
                          (NODE,))
         moved = store_tier.node_expectations(conn, AGENT, ["aaaaaaaaaaaa"])
         assert [len(moved["sign_ins"]), len(moved["sessions"])] == [1, 1]
         with conn.transaction():
-            conn.execute("DELETE FROM capabilities_nodes WHERE id = 'aaaaaaaaaaaa'")
+            conn.execute("DELETE FROM nodes WHERE id = 'aaaaaaaaaaaa'")
         assert conn.execute(
-            "SELECT (SELECT count(*) FROM capabilities_node_login_expectations)"
-            " + (SELECT count(*) FROM capabilities_node_session_expectations)"
+            "SELECT (SELECT count(*) FROM node_login_expectations)"
+            " + (SELECT count(*) FROM node_session_expectations)"
             ).fetchone()[0] == 0
 
 
-def test_a_store_at_the_expectations_step_takes_only_the_updates_step(store):
-    steps = store_tier.record_table_steps()
+def test_a_store_at_the_expectations_step_takes_only_the_updates_step(store, monkeypatch):
+    steps = list(_legacy.LIBRARY_STEPS)
     at = [step[0] for step in steps].index("0032-node-updates")
-    _migrate(steps[:at], 1, 16)
-    result = _migrate(steps[:at + 1], 1, 17)
+    _legacy_migrate(monkeypatch, steps[:at], 1, 16)
+    result = _legacy_migrate(monkeypatch, steps[:at + 1], 1, 17)
     assert result.applied == ["0032-node-updates"]
     with _conn() as conn:
         [(comment,)] = conn.execute("SELECT obj_description("
@@ -350,7 +363,7 @@ def test_an_update_run_is_asked_taken_up_and_ended_one_at_a_time_per_node(nodes)
             store_tier.node_update_request(conn, NODE)
         assert refused.value.slug == "update_pending"
         with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
-            conn.execute("INSERT INTO capabilities_node_updates (node) VALUES (%s)", (NODE,))
+            conn.execute("INSERT INTO node_updates (node) VALUES (%s)", (NODE,))
         with conn.transaction():
             store_tier.node_update_request(conn, OTHER)
         with conn.transaction():
@@ -383,28 +396,28 @@ def test_an_update_run_is_asked_taken_up_and_ended_one_at_a_time_per_node(nodes)
         [last] = store_tier.node_updates(conn, [NODE])
         assert last["id"] == later["run"]["id"] and last["state"] == "running"
         [(state, reason)] = conn.execute(
-            "SELECT state, reason FROM capabilities_node_updates WHERE id = %s",
+            "SELECT state, reason FROM node_updates WHERE id = %s",
             (mine["id"],)).fetchall()
         assert state == "failed" and reason.startswith("interrupted")
         assert {r["node"] for r in store_tier.node_updates(conn, [NODE, OTHER])} == {
             NODE, OTHER}
         # The runs follow the registry's id and go with the node.
         with conn.transaction():
-            conn.execute("UPDATE capabilities_nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
+            conn.execute("UPDATE nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
                          (NODE,))
         assert [r["state"] for r in store_tier.node_updates(conn, ["aaaaaaaaaaaa"])] == [
             "running"]
         with conn.transaction():
-            conn.execute("DELETE FROM capabilities_nodes WHERE id = 'aaaaaaaaaaaa'")
-        assert conn.execute("SELECT count(*) FROM capabilities_node_updates"
+            conn.execute("DELETE FROM nodes WHERE id = 'aaaaaaaaaaaa'")
+        assert conn.execute("SELECT count(*) FROM node_updates"
                             " WHERE node <> %s", (OTHER,)).fetchone()[0] == 0
 
 
-def test_a_store_at_the_updates_step_takes_only_the_logs_step(store):
-    steps = store_tier.record_table_steps()
+def test_a_store_at_the_updates_step_takes_only_the_logs_step(store, monkeypatch):
+    steps = list(_legacy.LIBRARY_STEPS)
     at = [step[0] for step in steps].index("0033-node-logs")
-    _migrate(steps[:at], 1, 17)
-    result = _migrate(steps[:at + 1], 1, 18)
+    _legacy_migrate(monkeypatch, steps[:at], 1, 17)
+    result = _legacy_migrate(monkeypatch, steps[:at + 1], 1, 18)
     assert result.applied == ["0033-node-logs"]
     with _conn() as conn:
         [(comment,)] = conn.execute("SELECT obj_description("
@@ -473,20 +486,20 @@ def test_log_lines_go_with_their_service_their_agents_link_and_their_node(nodes)
         assert store_tier.node_logs(conn, GONE, [NODE]) == []
         assert len(store_tier.node_logs(conn, PEER, [NODE])) == 3
         with conn.transaction():
-            conn.execute("UPDATE capabilities_nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
+            conn.execute("UPDATE nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
                          (OTHER,))
         assert [r["node"] for r in store_tier.node_logs(conn, AGENT, ["aaaaaaaaaaaa"])] == [
             "aaaaaaaaaaaa"]
         with conn.transaction():
-            conn.execute("DELETE FROM capabilities_nodes WHERE id = 'aaaaaaaaaaaa'")
+            conn.execute("DELETE FROM nodes WHERE id = 'aaaaaaaaaaaa'")
         assert store_tier.node_logs(conn, AGENT, ["aaaaaaaaaaaa"]) == []
 
 
-def test_a_store_at_the_logs_step_takes_only_the_session_reasons_step(store):
-    steps = store_tier.record_table_steps()
+def test_a_store_at_the_logs_step_takes_only_the_session_reasons_step(store, monkeypatch):
+    steps = list(_legacy.LIBRARY_STEPS)
     at = [step[0] for step in steps].index("0034-node-session-reasons")
-    _migrate(steps[:at], 1, 18)
-    result = _migrate(steps[:at + 1], 1, 19)
+    _legacy_migrate(monkeypatch, steps[:at], 1, 18)
+    result = _legacy_migrate(monkeypatch, steps[:at + 1], 1, 19)
     assert result.applied == ["0034-node-session-reasons"]
     with _conn() as conn:
         uncommented = conn.execute(
@@ -527,17 +540,17 @@ def test_a_session_that_is_down_says_why_and_a_row_without_a_reason_reads_as_bef
                                (False, "key_missing", [""]),
                                (False, "not_signed_in", ["TELEGRAM_API_HASH"])):
         with _conn() as conn, pytest.raises(psycopg.errors.CheckViolation):
-            conn.execute("INSERT INTO capabilities_node_sessions (project_id, node,"
+            conn.execute("INSERT INTO node_sessions (agent_id, node,"
                          " capability, connection, live, reason, reason_keys)"
                          " VALUES (%s, %s, 'telegram', 'main', %s, %s, %s)",
                          (AGENT, NODE, live, reason, keys))
 
 
-def test_a_store_at_the_session_reasons_step_takes_only_the_node_disabled_step(store):
-    steps = store_tier.record_table_steps()
+def test_a_store_at_the_session_reasons_step_takes_only_the_node_disabled_step(store, monkeypatch):
+    steps = list(_legacy.LIBRARY_STEPS)
     at = [step[0] for step in steps].index("0035-node-disabled")
-    _migrate(steps[:at], 1, 19)
-    result = _migrate(steps[:at + 1], 1, 20)
+    _legacy_migrate(monkeypatch, steps[:at], 1, 19)
+    result = _legacy_migrate(monkeypatch, steps[:at + 1], 1, 20)
     assert result.applied == ["0035-node-disabled"]
     with _conn() as conn:
         [(comment,)] = conn.execute(
@@ -552,7 +565,7 @@ def test_nothing_is_placed_on_a_disabled_node_and_what_is_there_can_be_taken_off
         store_tier._upsert_policy(conn, AGENT, "tasks", node, enabled)
 
     with _conn() as conn, conn.transaction():
-        conn.execute("UPDATE capabilities_nodes SET disabled_at = now() WHERE id = %s",
+        conn.execute("UPDATE nodes SET disabled_at = now() WHERE id = %s",
                      (NODE,))
     refused = pytest.raises(store_tier.StoreError)
     with _conn() as conn, refused as raised, conn.transaction():
@@ -563,11 +576,11 @@ def test_nothing_is_placed_on_a_disabled_node_and_what_is_there_can_be_taken_off
         with conn.transaction():
             policy(conn, NODE, False)
             policy(conn, OTHER, True)
-        rows = conn.execute("SELECT node, enabled, service FROM capabilities_policy"
+        rows = conn.execute("SELECT node, enabled, service FROM policies"
                             " WHERE agent_id = %s ORDER BY node", (AGENT,)).fetchall()
     assert rows == [(NODE, False, False), (OTHER, True, True)]
     with _conn() as conn, conn.transaction():
-        conn.execute("UPDATE capabilities_nodes SET disabled_at = NULL WHERE id = %s",
+        conn.execute("UPDATE nodes SET disabled_at = NULL WHERE id = %s",
                      (NODE,))
     with _conn() as conn, conn.transaction():
         policy(conn, NODE, True)

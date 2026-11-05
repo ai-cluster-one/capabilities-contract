@@ -8,7 +8,8 @@ from __future__ import annotations
 import pytest
 
 from capabilities_contract.capability import store as store_tier
-from capabilities_contract.db import connect, disconnect, migrate
+from capabilities_contract.db import _legacy, connect, disconnect, migrate
+from capabilities_contract.db import _migrate as _migrate_module
 
 AGENT = "000000000001"
 KEEPER = "000000000002"
@@ -19,6 +20,18 @@ def _migrate(steps, major, minor):
     with connect(application_name="setup", transaction=True) as conn:
         result = migrate(conn, store_tier.STORE_OWNER, steps, major=major, minor=minor)
         conn.commit()
+    disconnect()
+    return result
+
+
+def _legacy_migrate(monkeypatch, steps, major, minor):
+    """Migrate owner `capabilities` with its steps of history, as a release
+    without core steps did (`_legacy`)."""
+    with monkeypatch.context() as patched:
+        patched.setattr(_migrate_module, "CORE_STEPS", ())
+        with connect(application_name="setup", transaction=True) as conn:
+            result = migrate(conn, _legacy.LEGACY_OWNER, steps, major=major, minor=minor)
+            conn.commit()
     disconnect()
     return result
 
@@ -34,73 +47,78 @@ def _sql(query, params=()):
 
 
 def _node(node):
-    _sql("INSERT INTO capabilities_nodes (id, label, kind) VALUES (%s, %s, 'mac')",
+    _sql("INSERT INTO nodes (id, label, kind) VALUES (%s, %s, 'mac')",
          (node, node))
 
 
 def _link(agent, node, master=True):
-    _sql("INSERT INTO capabilities_agent_nodes (agent_id, node, is_master)"
+    _sql("INSERT INTO agent_nodes (agent_id, node, is_master)"
          " VALUES (%s, %s, %s)", (agent, node, master))
 
 
-def test_a_store_at_the_connection_label_step_takes_only_the_kind_step_and_keeps_every_agent(store):
-    steps = store_tier.record_table_steps()
+def test_a_store_at_the_connection_label_step_takes_only_the_kind_step_and_keeps_every_agent(
+        store, monkeypatch):
+    steps = list(_legacy.LIBRARY_STEPS)
     at = [step[0] for step in steps].index("0037-agent-kind")
-    _migrate(steps[:at], 1, 21)
+    _legacy_migrate(monkeypatch, steps[:at], 1, 21)
     _sql("INSERT INTO capabilities_agents (id, slug) VALUES (%s, 'work')", (AGENT,))
-    result = _migrate(steps[:at + 1], 1, 22)
+    result = _legacy_migrate(monkeypatch, steps[:at + 1], 1, 22)
     assert result.applied == ["0037-agent-kind"]
     assert _sql("SELECT id, slug, kind FROM capabilities_agents") == [(AGENT, "work", "agent")]
-    with _conn() as conn:
-        assert store_tier.agent_kind(conn, AGENT) == "agent"
-        assert store_tier.agent_kind(conn, KEEPER) is None
     [(comment,)] = _sql(
         "SELECT col_description(to_regclass('capabilities_agents'), a.attnum)"
         " FROM pg_attribute a WHERE a.attrelid = to_regclass('capabilities_agents')"
         " AND a.attname = 'kind'")
     assert comment
+    # The tier reads the core, which the store upgrade moves it to with every agent.
+    monkeypatch.setenv("CAPABILITIES_STORE_UPGRADE", "1")
+    _migrate(store_tier.record_table_steps(), *store_tier.STORE_TABLES_VERSION)
+    with _conn() as conn:
+        assert store_tier.agent_kind(conn, AGENT) == "agent"
+        assert store_tier.agent_kind(conn, KEEPER) is None
 
 
-def test_a_system_agent_stays_one_on_its_one_node_and_shares_its_slug_only_with_system_agents(store):
+def test_a_system_agent_stays_one_on_its_one_node_and_shares_its_slug_only_with_system_agents(
+        store):
     import psycopg
     _migrate(store_tier.record_table_steps(), *store_tier.STORE_TABLES_VERSION)
     _node("mac-a")
     _node("mac-b")
-    _sql("INSERT INTO capabilities_agents (id, slug) VALUES (%s, 'work')", (AGENT,))
-    _sql("INSERT INTO capabilities_agents (id, slug, kind) VALUES (%s, 'keeper', 'system')",
+    _sql("INSERT INTO agents (id, slug) VALUES (%s, 'work')", (AGENT,))
+    _sql("INSERT INTO agents (id, slug, kind) VALUES (%s, 'keeper', 'system')",
          (KEEPER,))
     _link(KEEPER, "mac-a")
     _link(AGENT, "mac-a")
     with _conn() as conn:
         assert store_tier.agent_kind(conn, KEEPER) == "system"
     # A system agent on another Mac may carry the same slug; an ordinary one may not.
-    _sql("INSERT INTO capabilities_agents (id, slug) VALUES (%s, NULL)", (KEEPER_ELSEWHERE,))
+    _sql("INSERT INTO agents (id, slug) VALUES (%s, NULL)", (KEEPER_ELSEWHERE,))
     _link(KEEPER_ELSEWHERE, "mac-b")
-    _sql("UPDATE capabilities_agents SET kind = 'system', slug = 'keeper' WHERE id = %s",
+    _sql("UPDATE agents SET kind = 'system', slug = 'keeper' WHERE id = %s",
          (KEEPER_ELSEWHERE,))
     for query, params in (
-            ("UPDATE capabilities_agents SET slug = 'keeper' WHERE id = %s", (AGENT,)),
-            ("UPDATE capabilities_agents SET slug = 'work' WHERE id = %s", (KEEPER,)),
-            ("INSERT INTO capabilities_agents (id, slug) VALUES ('000000000009', 'work')", ())):
+            ("UPDATE agents SET slug = 'keeper' WHERE id = %s", (AGENT,)),
+            ("UPDATE agents SET slug = 'work' WHERE id = %s", (KEEPER,)),
+            ("INSERT INTO agents (id, slug) VALUES ('000000000009', 'work')", ())):
         with pytest.raises(psycopg.errors.UniqueViolation):
             _sql(query, params)
     # It stays a system agent, on its one node, the only one there.
     with pytest.raises(psycopg.errors.CheckViolation):
-        _sql("UPDATE capabilities_agents SET kind = 'agent' WHERE id = %s", (KEEPER,))
+        _sql("UPDATE agents SET kind = 'agent' WHERE id = %s", (KEEPER,))
     with pytest.raises(psycopg.errors.CheckViolation):
         _link(KEEPER, "mac-b", master=False)
     with pytest.raises(psycopg.errors.UniqueViolation):
-        _sql("UPDATE capabilities_agent_nodes SET node = 'mac-a' WHERE agent_id = %s",
+        _sql("UPDATE agent_nodes SET node = 'mac-a' WHERE agent_id = %s",
              (KEEPER_ELSEWHERE,))
-    _sql("DELETE FROM capabilities_agent_nodes WHERE agent_id = %s", (KEEPER_ELSEWHERE,))
+    _sql("DELETE FROM agent_nodes WHERE agent_id = %s", (KEEPER_ELSEWHERE,))
     _link(AGENT, "mac-b", master=False)
     # An agent on two nodes, or on a node that already holds one, is not made one.
     with pytest.raises(psycopg.errors.CheckViolation):
-        _sql("UPDATE capabilities_agents SET kind = 'system' WHERE id = %s", (AGENT,))
-    _sql("DELETE FROM capabilities_agent_nodes WHERE agent_id = %s AND node = 'mac-b'",
+        _sql("UPDATE agents SET kind = 'system' WHERE id = %s", (AGENT,))
+    _sql("DELETE FROM agent_nodes WHERE agent_id = %s AND node = 'mac-b'",
          (AGENT,))
     with pytest.raises(psycopg.errors.UniqueViolation):
-        _sql("UPDATE capabilities_agents SET kind = 'system', slug = NULL WHERE id = %s",
+        _sql("UPDATE agents SET kind = 'system', slug = NULL WHERE id = %s",
              (AGENT,))
-    assert _sql("SELECT id, kind FROM capabilities_agents ORDER BY id") == [
+    assert _sql("SELECT id, kind FROM agents ORDER BY id") == [
         (AGENT, "agent"), (KEEPER, "system"), (KEEPER_ELSEWHERE, "system")]

@@ -271,50 +271,53 @@ RECORDS_MODES = ("files", "store")
 CONNECTIONS_MODE_KEY = "connections"
 CONNECTIONS_MODES = ("files", "store")
 
-# The contract's own tables in the store, migrated under the contract's own
-# ledger owner, and the schema version this code writes them at.
-STORE_OWNER = "capabilities"
-STORE_CONNECTIONS_TABLE = "capabilities_connections"
-STORE_GRANTS_TABLE = "capabilities_connection_grants"
-STORE_IDENTIFIERS_TABLE = "capabilities_identifiers"
-STORE_POLICY_TABLE = "capabilities_policy"
+# The contract's own tables in the store: the store's core, migrated under the
+# ledger owner `core`, and the schema version this code writes them at. The
+# name this tier's connections give themselves in the store stays the
+# contract's own.
+STORE_OWNER = "core"
+STORE_APPLICATION = "capabilities"
+STORE_CONNECTIONS_TABLE = "connections"
+STORE_GRANTS_TABLE = "grants"
+STORE_IDENTIFIERS_TABLE = "identifiers"
+STORE_POLICY_TABLE = "policies"
 # The kernel's own tables, migrated in the same ledger: the agent registry, the
 # nodes, which agent lives on which node, and the one row of facts about the
 # store as a whole. The manager alone writes them.
-STORE_AGENTS_TABLE = "capabilities_agents"
-STORE_NODES_TABLE = "capabilities_nodes"
-STORE_AGENT_NODES_TABLE = "capabilities_agent_nodes"
-STORE_GLOBAL_TABLE = "capabilities_global"
+STORE_AGENTS_TABLE = "agents"
+STORE_NODES_TABLE = "nodes"
+STORE_AGENT_NODES_TABLE = "agent_nodes"
+STORE_GLOBAL_TABLE = "store_state"
 # Settings of an agent whose records moved into the store: one row per leaf,
 # the documents that exist, and the append-only trail of every change.
-STORE_SETTINGS_TABLE = "capabilities_settings"
-STORE_SETTINGS_DOCUMENTS_TABLE = "capabilities_settings_documents"
-STORE_SETTINGS_CHANGES_TABLE = "capabilities_settings_changes"
+STORE_SETTINGS_TABLE = "settings"
+STORE_SETTINGS_DOCUMENTS_TABLE = "settings_documents"
+STORE_SETTINGS_CHANGES_TABLE = "settings_changes"
 # Every capability's references for each project, versioned: one row per
 # version, the active one read before the project's files.
-STORE_REFERENCES_TABLE = "capabilities_references"
+STORE_REFERENCES_TABLE = "reference_versions"
 # What each node actually runs: a row per service it supervises, keyed by
 # project, capability and node, in one of a closed set of states.
-STORE_SERVICE_INSTANCES_TABLE = "capabilities_service_instances"
+STORE_SERVICE_INSTANCES_TABLE = "service_instances"
 # Each agent's secrets, sealed with the agent's own key or for the public sealing
 # key it gives (capabilities_contract.vault).
-STORE_VAULT_TABLE = "capabilities_vault"
+STORE_VAULT_TABLE = "secrets"
 SERVICE_INSTANCE_STATES = ("starting", "ready", "unusable", "degraded", "failing",
                            "held", "waiting", "stopping")
 SERVICE_INSTANCE_TEXT_CHARS = 2000
 # What each node says of itself on a short beat: one row per node, shared by
 # every agent on it, and per agent the sign-ins its tools hold there and the
 # device-bound sessions it holds there.
-STORE_NODE_STATES_TABLE = "capabilities_node_states"
-STORE_NODE_LOGINS_TABLE = "capabilities_node_logins"
-STORE_NODE_SESSIONS_TABLE = "capabilities_node_sessions"
+STORE_NODE_STATES_TABLE = "node_states"
+STORE_NODE_LOGINS_TABLE = "node_logins"
+STORE_NODE_SESSIONS_TABLE = "node_sessions"
 # The owner's word, per agent and node, on whether a sign-in or a device
 # session is expected there, over what the node's placed services need.
-STORE_NODE_LOGIN_EXPECTATIONS_TABLE = "capabilities_node_login_expectations"
-STORE_NODE_SESSION_EXPECTATIONS_TABLE = "capabilities_node_session_expectations"
+STORE_NODE_LOGIN_EXPECTATIONS_TABLE = "node_login_expectations"
+STORE_NODE_SESSION_EXPECTATIONS_TABLE = "node_session_expectations"
 # Each update run of a node, and the closed set of the states it goes through;
 # a change raises NODE_UPDATE_CHANNEL for the node, so its manager wakes.
-STORE_NODE_UPDATES_TABLE = "capabilities_node_updates"
+STORE_NODE_UPDATES_TABLE = "node_updates"
 NODE_UPDATE_STATES = ("requested", "running", "updated", "current", "rolled_back", "failed")
 NODE_UPDATE_OPEN_STATES = ("requested", "running")
 NODE_UPDATE_CHANNEL = "capabilities_node_update"
@@ -330,12 +333,12 @@ NODE_STATE_TEXT_CHARS = 500
 # itself, and each placed service's supervisor with what its service wrote to
 # stderr - per agent: at most NODE_LOG_LINES of a source, each cut to
 # NODE_LOG_LINE_CHARS, with what reads as a secret masked before it is written.
-STORE_NODE_LOGS_TABLE = "capabilities_node_logs"
+STORE_NODE_LOGS_TABLE = "node_logs"
 NODE_LOG_MANAGER = "manager"
 NODE_LOG_LINES = 100
 NODE_LOG_LINE_CHARS = 500
 NODE_LOG_MASK = "***"
-STORE_TABLES_VERSION = (1, 23)
+STORE_TABLES_VERSION = (2, 0)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -383,1374 +386,14 @@ _HOLD_RECORDS_CONNECTION = False
 _REFERENCE_NAME = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
 
 
-def record_table_steps() -> list[tuple[str, str]]:
-    """The migration steps of the contract's tables. `enabled` and
-    `allow_write` left null decide nothing, as a field absent from a file's
-    grant does; `node` null is the grant, or the policy row, for every node;
-    `agent_id` null is an identifier or a policy row for every project."""
-    return [
-        ("0001-connections",
-         "CREATE TABLE capabilities_connections ("
-         " capability text NOT NULL,"
-         " name text NOT NULL,"
-         " spec jsonb NOT NULL,"
-         " PRIMARY KEY (capability, name),"
-         " CHECK (jsonb_typeof(spec) = 'object'))"),
-        ("0002-connection-grants",
-         "CREATE TABLE capabilities_connection_grants ("
-         " agent_id text NOT NULL,"
-         " capability text NOT NULL,"
-         " connection text NOT NULL,"
-         " node text CHECK (node <> ''),"
-         " enabled boolean,"
-         " allow_write boolean,"
-         " is_default boolean NOT NULL DEFAULT false,"
-         " FOREIGN KEY (capability, connection)"
-         "  REFERENCES capabilities_connections (capability, name)"
-         "  ON DELETE CASCADE ON UPDATE CASCADE)"),
-        ("0003-connection-grants-key",
-         "CREATE UNIQUE INDEX capabilities_connection_grants_key"
-         " ON capabilities_connection_grants"
-         " (agent_id, capability, connection, (coalesce(node, '')))"),
-        ("0004-connection-grants-default",
-         "CREATE UNIQUE INDEX capabilities_connection_grants_default"
-         " ON capabilities_connection_grants"
-         " (agent_id, capability, (coalesce(node, ''))) WHERE is_default"),
-        ("0005-identifiers",
-         "CREATE TABLE capabilities_identifiers ("
-         " agent_id text CHECK (agent_id <> ''),"
-         " capability text NOT NULL,"
-         " label text NOT NULL,"
-         " value jsonb NOT NULL,"
-         " note text NOT NULL DEFAULT '',"
-         " updated_at timestamptz NOT NULL DEFAULT now())"),
-        ("0006-identifiers-key",
-         "CREATE UNIQUE INDEX capabilities_identifiers_key"
-         " ON capabilities_identifiers"
-         " ((coalesce(agent_id, '')), capability, label)"),
-        ("0007-policy",
-         "CREATE TABLE capabilities_policy ("
-         " agent_id text CHECK (agent_id <> ''),"
-         " capability text NOT NULL,"
-         " node text CHECK (node <> ''),"
-         " enabled boolean NOT NULL,"
-         " updated_at timestamptz NOT NULL DEFAULT now())"),
-        ("0008-policy-key",
-         "CREATE UNIQUE INDEX capabilities_policy_key"
-         " ON capabilities_policy"
-         " ((coalesce(agent_id, '')), capability, (coalesce(node, '')))"),
-        # The agent registry. `id` is the project id `project.json` declares;
-        # the registry never mints or changes one. An icon and its SHA-256 are
-        # present together or absent together.
-        ("0009-agents",
-         "CREATE TABLE capabilities_agents ("
-         " id text PRIMARY KEY CHECK (id <> ''),"
-         " name text CHECK (name <> ''),"
-         " description text CHECK (description <> ''),"
-         " icon bytea,"
-         " icon_sha text CHECK (icon_sha ~ '^[0-9a-f]{64}$'),"
-         " onboarding_status text CHECK (onboarding_status IN ('pending', 'complete')),"
-         " onboarding_routine text CHECK (onboarding_routine <> ''),"
-         " migrating_since timestamptz,"
-         " migrated_at timestamptz,"
-         " created_at timestamptz NOT NULL DEFAULT now(),"
-         " updated_at timestamptz NOT NULL DEFAULT now(),"
-         " CHECK ((icon IS NULL) = (icon_sha IS NULL)));"
-         " COMMENT ON TABLE capabilities_agents IS"
-         " 'The agent registry: one row per agent, keyed by the project id its"
-         " capabilities/project.json declares. Written by the capabilities manager alone.';"
-         " COMMENT ON COLUMN capabilities_agents.id IS"
-         " 'The project id from capabilities/project.json (prj_<12 hex>, or an older UUID).';"
-         " COMMENT ON COLUMN capabilities_agents.name IS"
-         " 'Display name; null while the agent has none of its own.';"
-         " COMMENT ON COLUMN capabilities_agents.icon IS"
-         " 'The agent''s icon as PNG bytes; null with icon_sha when it has none.';"
-         " COMMENT ON COLUMN capabilities_agents.icon_sha IS"
-         " 'Lowercase hex SHA-256 of icon.';"
-         " COMMENT ON COLUMN capabilities_agents.onboarding_status IS"
-         " 'pending while the agent still runs its onboarding routine, complete once"
-         " it finished; null when no onboarding is tracked.';"
-         " COMMENT ON COLUMN capabilities_agents.onboarding_routine IS"
-         " 'The routine the agent runs while onboarding is pending.';"
-         " COMMENT ON COLUMN capabilities_agents.migrating_since IS"
-         " 'Set while a move of this agent''s records from files into the store is open.';"
-         " COMMENT ON COLUMN capabilities_agents.migrated_at IS"
-         " 'When this agent''s records and settings moved into the store; null while"
-         " they are still read from files.'"),
-        # ContextKit's registry rows, taken over once where that table exists in
-        # the same schema. An empty name or description meant none there.
-        ("0010-agents-from-contextkit",
-         "DO $copy$ BEGIN"
-         " IF to_regclass('contextkit_agents') IS NOT NULL THEN"
-         "  INSERT INTO capabilities_agents"
-         "   (id, name, description, icon, icon_sha, created_at, updated_at)"
-         "  SELECT id, nullif(name, ''), nullif(description, ''),"
-         "   CASE WHEN icon IS NOT NULL AND icon_sha ~ '^[0-9a-f]{64}$' THEN icon END,"
-         "   CASE WHEN icon IS NOT NULL AND icon_sha ~ '^[0-9a-f]{64}$' THEN icon_sha END,"
-         "   created_at, updated_at"
-         "  FROM contextkit_agents WHERE id <> ''"
-         "  ON CONFLICT (id) DO NOTHING;"
-         " END IF;"
-         " END $copy$"),
-        # The machines an agent runs on. Exactly one may be its master, which
-        # the partial index below enforces; a node is removed with its agent.
-        ("0011-agent-nodes",
-         "CREATE TABLE capabilities_agent_nodes ("
-         " agent_id text NOT NULL REFERENCES capabilities_agents (id)"
-         "  ON DELETE CASCADE ON UPDATE CASCADE,"
-         " node text NOT NULL CHECK (node <> ''),"
-         " kind text NOT NULL CHECK (kind IN ('mac', 'server')),"
-         " address text CHECK (address <> ''),"
-         " is_master boolean NOT NULL DEFAULT false,"
-         " may_write boolean NOT NULL DEFAULT false,"
-         " target text CHECK (target <> ''),"
-         " last_seen_at timestamptz,"
-         " PRIMARY KEY (agent_id, node));"
-         " COMMENT ON TABLE capabilities_agent_nodes IS"
-         " 'The nodes an agent runs on, one row per (agent, node). Written by the"
-         " capabilities manager alone. agent_id references capabilities_agents"
-         " because a node exists only as a node of a registered agent.';"
-         " COMMENT ON COLUMN capabilities_agent_nodes.node IS"
-         " 'The name the node gives itself in AGENT_NODE_NAME.';"
-         " COMMENT ON COLUMN capabilities_agent_nodes.address IS"
-         " 'Host name or IP address the node is reached at, where it is fixed.';"
-         " COMMENT ON COLUMN capabilities_agent_nodes.is_master IS"
-         " 'The node that writes the rows every node of the agent inherits; at"
-         " most one per agent.';"
-         " COMMENT ON COLUMN capabilities_agent_nodes.may_write IS"
-         " 'Whether a node that is not the master may write rows of its own, marked"
-         " with its node.';"
-         " COMMENT ON COLUMN capabilities_agent_nodes.target IS"
-         " 'The deployment target this node is deployed by; null for a node that"
-         " is not deployed, such as a Mac.';"
-         " COMMENT ON COLUMN capabilities_agent_nodes.last_seen_at IS"
-         " 'When the node last reported itself.'"),
-        ("0012-agent-nodes-master",
-         "CREATE UNIQUE INDEX capabilities_agent_nodes_master"
-         " ON capabilities_agent_nodes (agent_id) WHERE is_master"),
-        # Facts about the store as a whole, in its one row.
-        ("0013-global",
-         "CREATE TABLE capabilities_global ("
-         " singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),"
-         " global_migrated_at timestamptz);"
-         " INSERT INTO capabilities_global DEFAULT VALUES;"
-         " COMMENT ON TABLE capabilities_global IS"
-         " 'One row of facts about this store as a whole.';"
-         " COMMENT ON COLUMN capabilities_global.singleton IS"
-         " 'Always true; keeps the table at one row.';"
-         " COMMENT ON COLUMN capabilities_global.global_migrated_at IS"
-         " 'When the global records were written into the store; null until then.'"),
-        # A grant for every agent: `agent_id` null, beneath each agent's own
-        # grant, and a default pointer for every agent the same way. The keys
-        # of 0003 and 0004 stay as they are, so code that names them in its
-        # ON CONFLICT keeps writing an agent's grants; the keys below coalesce
-        # the agent as well, so two global rows can never stand for one grant.
-        ("0014-connection-grants-global",
-         "ALTER TABLE capabilities_connection_grants ALTER COLUMN agent_id DROP NOT NULL;"
-         " ALTER TABLE capabilities_connection_grants"
-         "  ADD CONSTRAINT capabilities_connection_grants_agent_id_check"
-         "  CHECK (agent_id <> '');"
-         " CREATE UNIQUE INDEX capabilities_connection_grants_scope_key"
-         "  ON capabilities_connection_grants"
-         "  ((coalesce(agent_id, '')), capability, connection, (coalesce(node, '')));"
-         " CREATE UNIQUE INDEX capabilities_connection_grants_scope_default"
-         "  ON capabilities_connection_grants"
-         "  ((coalesce(agent_id, '')), capability, (coalesce(node, ''))) WHERE is_default;"
-         " COMMENT ON TABLE capabilities_connection_grants IS"
-         " 'What an agent may do with a connection: one row per (agent, capability,"
-         " connection, node). A row whose agent_id is null is the grant for every"
-         " agent, beneath each agent''s own; it never enables a connection by itself.';"
-         " COMMENT ON COLUMN capabilities_connection_grants.agent_id IS"
-         " 'The agent the grant is for; null for the grant every agent inherits.';"
-         " COMMENT ON COLUMN capabilities_connection_grants.node IS"
-         " 'The node the grant is for; null for every node. A node row is read before"
-         " the row for every node.';"
-         " COMMENT ON COLUMN capabilities_connection_grants.is_default IS"
-         " 'Whether this connection is the default pointer at this grant''s scope and"
-         " node; at most one per scope and node.'"),
-        # An identifier for one node, read before the row for every node.
-        ("0015-identifiers-node",
-         "ALTER TABLE capabilities_identifiers ADD COLUMN node text CHECK (node <> '');"
-         " DROP INDEX capabilities_identifiers_key;"
-         " CREATE UNIQUE INDEX capabilities_identifiers_key ON capabilities_identifiers"
-         "  ((coalesce(agent_id, '')), capability, label, (coalesce(node, '')));"
-         " COMMENT ON TABLE capabilities_identifiers IS"
-         " 'Durable non-secret lookups a capability discovered, one row per (agent,"
-         " capability, label, node); agent_id null for every agent.';"
-         " COMMENT ON COLUMN capabilities_identifiers.node IS"
-         " 'The node the identifier is for; null for every node. A node row is read"
-         " before the row for every node.'"),
-        # Settings: one row per leaf of a capability's settings document, for
-        # one agent (or every agent, agent_id null) and one node (or every
-        # node). A writer takes, for the whole transaction, the advisory lock
-        #   pg_advisory_xact_lock(hashtext(concat_ws(chr(31), schema,
-        #     coalesce(agent_id, ''), capability, coalesce(node, ''))))
-        # of the document it writes, so two writers of one document queue.
-        # agent_id keeps the name the contract's other tables give it.
-        ("0016-settings",
-         "CREATE TABLE capabilities_settings ("
-         " agent_id text CHECK (agent_id <> ''),"
-         " capability text NOT NULL CHECK (capability <> ''),"
-         " node text CHECK (node <> ''),"
-         " path text[] NOT NULL"
-         "  CHECK (cardinality(path) > 0 AND array_position(path, NULL) IS NULL),"
-         " value jsonb NOT NULL,"
-         " updated_at timestamptz NOT NULL DEFAULT now(),"
-         " updated_by text NOT NULL CHECK (updated_by <> ''));"
-         " CREATE UNIQUE INDEX capabilities_settings_key ON capabilities_settings"
-         "  ((coalesce(agent_id, '')), capability, (coalesce(node, '')), path);"
-         " CREATE FUNCTION capabilities_settings_guard() RETURNS trigger"
-         "  LANGUAGE plpgsql SET search_path FROM CURRENT AS $guard$"
-         " BEGIN"
-         "  IF jsonb_typeof(NEW.value) = 'object' AND NEW.value <> '{}'::jsonb THEN"
-         "   RAISE EXCEPTION 'setting % holds an object with keys; a row holds a scalar,"
-         " an array or {}', array_to_string(NEW.path, '.')"
-         "    USING ERRCODE = 'check_violation';"
-         "  END IF;"
-         "  IF EXISTS (SELECT 1 FROM capabilities_settings s"
-         "   WHERE coalesce(s.agent_id, '') = coalesce(NEW.agent_id, '')"
-         "   AND s.capability = NEW.capability"
-         "   AND coalesce(s.node, '') = coalesce(NEW.node, '')"
-         "   AND s.path <> NEW.path"
-         "   AND (s.path[1:cardinality(NEW.path)] = NEW.path"
-         "    OR NEW.path[1:cardinality(s.path)] = s.path)) THEN"
-         "   RAISE EXCEPTION 'setting % overlaps another row of its document: a path"
-         " never prefixes another', array_to_string(NEW.path, '.')"
-         "    USING ERRCODE = 'check_violation';"
-         "  END IF;"
-         "  RETURN NEW;"
-         " END $guard$;"
-         " CREATE TRIGGER capabilities_settings_guard"
-         "  BEFORE INSERT OR UPDATE ON capabilities_settings"
-         "  FOR EACH ROW EXECUTE FUNCTION capabilities_settings_guard();"
-         " COMMENT ON TABLE capabilities_settings IS"
-         " 'Capability settings, one row per leaf path of a document. A document is"
-         " (agent_id, capability, node); agent_id null is every agent''s, node null"
-         " every node''s. Writers lock the document with pg_advisory_xact_lock(hashtext("
-         "concat_ws(chr(31), schema, coalesce(agent_id, ''''), capability,"
-         " coalesce(node, ''''))));"
-         " a trigger refuses an object with keys as a value and a path that prefixes"
-         " or is prefixed by another row of the same document.';"
-         " COMMENT ON COLUMN capabilities_settings.agent_id IS"
-         " 'The agent the setting is for; null for the setting every agent inherits.';"
-         " COMMENT ON COLUMN capabilities_settings.node IS"
-         " 'The node the setting is for; null for every node. A node row is read over"
-         " the row for every node.';"
-         " COMMENT ON COLUMN capabilities_settings.path IS"
-         " 'The keys from the document root to this leaf; a key may contain dots.';"
-         " COMMENT ON COLUMN capabilities_settings.value IS"
-         " 'The leaf: a JSON scalar (null included), a whole array, or {} for an"
-         " object left empty.';"
-         " COMMENT ON COLUMN capabilities_settings.updated_by IS"
-         " 'Who wrote the row: user@node, migrate@node or <capability>-service@node.'"),
-        ("0017-settings-documents",
-         "CREATE TABLE capabilities_settings_documents ("
-         " agent_id text CHECK (agent_id <> ''),"
-         " capability text NOT NULL CHECK (capability <> ''),"
-         " node text CHECK (node <> ''),"
-         " generation bigint NOT NULL,"
-         " created_at timestamptz NOT NULL DEFAULT now());"
-         " CREATE UNIQUE INDEX capabilities_settings_documents_key"
-         "  ON capabilities_settings_documents"
-         "  ((coalesce(agent_id, '')), capability, (coalesce(node, '')));"
-         " COMMENT ON TABLE capabilities_settings_documents IS"
-         " 'The settings documents that exist: a document without a row here reads as"
-         " the capability''s seed; one with a row reads from its rows, even none.';"
-         " COMMENT ON COLUMN capabilities_settings_documents.generation IS"
-         " 'The id of the last capabilities_settings_changes row applied to the"
-         " document; 0 before any.'"),
-        ("0018-settings-changes",
-         "CREATE TABLE capabilities_settings_changes ("
-         " id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
-         " agent_id text CHECK (agent_id <> ''),"
-         " capability text NOT NULL CHECK (capability <> ''),"
-         " node text CHECK (node <> ''),"
-         " action text NOT NULL CHECK (action IN ('set', 'unset')),"
-         " path text[] NOT NULL CHECK (cardinality(path) > 0),"
-         " old_value jsonb,"
-         " new_value jsonb,"
-         " changed_at timestamptz NOT NULL DEFAULT now(),"
-         " changed_by text NOT NULL CHECK (changed_by <> ''));"
-         " CREATE FUNCTION capabilities_settings_changes_append_only() RETURNS trigger"
-         "  LANGUAGE plpgsql AS $trail$"
-         " BEGIN"
-         "  RAISE EXCEPTION 'capabilities_settings_changes is append-only'"
-         "   USING ERRCODE = 'restrict_violation';"
-         " END $trail$;"
-         " CREATE TRIGGER capabilities_settings_changes_append_only"
-         "  BEFORE UPDATE OR DELETE ON capabilities_settings_changes"
-         "  FOR EACH ROW EXECUTE FUNCTION capabilities_settings_changes_append_only();"
-         " CREATE TRIGGER capabilities_settings_changes_no_truncate"
-         "  BEFORE TRUNCATE ON capabilities_settings_changes"
-         "  FOR EACH STATEMENT EXECUTE FUNCTION capabilities_settings_changes_append_only();"
-         " COMMENT ON TABLE capabilities_settings_changes IS"
-         " 'The append-only trail of settings: one row per path a write set or unset."
-         " A document''s generation is the id of its last row here.';"
-         " COMMENT ON COLUMN capabilities_settings_changes.action IS"
-         " 'set: the path took new_value (old_value null where it was absent);"
-         " unset: the path was removed (new_value null).';"
-         " COMMENT ON COLUMN capabilities_settings_changes.changed_by IS"
-         " 'Who wrote it: user@node, migrate@node or <capability>-service@node.'"),
-        ("0019-references",
-         "CREATE TABLE capabilities_references ("
-         " id uuid PRIMARY KEY DEFAULT gen_random_uuid(),"
-         " project_id text NOT NULL CHECK (project_id <> ''),"
-         " capability text NOT NULL CHECK (capability ~ '^[a-z][a-z0-9-]*$'),"
-         f" name text NOT NULL CHECK (name ~ '{_REFERENCE_NAME}' AND name !~* '[.]md$'),"
-         " body text NOT NULL,"
-         " active boolean NOT NULL DEFAULT true,"
-         " created_at timestamptz NOT NULL DEFAULT now(),"
-         " created_by text NOT NULL CHECK (created_by <> ''),"
-         " note text);"
-         " CREATE UNIQUE INDEX capabilities_references_active ON capabilities_references"
-         "  (project_id, capability, (lower(replace(name, '_', '-')))) WHERE active;"
-         " CREATE INDEX capabilities_references_history ON capabilities_references"
-         "  (project_id, capability, (lower(replace(name, '_', '-'))), created_at DESC);"
-         " CREATE FUNCTION capabilities_references_guard() RETURNS trigger"
-         "  LANGUAGE plpgsql AS $guard$"
-         " BEGIN"
-         "  IF tg_op IN ('DELETE', 'TRUNCATE') THEN"
-         "   RAISE EXCEPTION 'reference versions are never deleted: retire the reference'"
-         "    USING ERRCODE = 'check_violation';"
-         "  END IF;"
-         "  IF (to_jsonb(NEW) - 'active') IS DISTINCT FROM (to_jsonb(OLD) - 'active') THEN"
-         "   RAISE EXCEPTION 'a reference version is immutable: save a new version'"
-         "    USING ERRCODE = 'check_violation';"
-         "  END IF;"
-         "  IF NEW.active AND NOT OLD.active THEN"
-         "   RAISE EXCEPTION 'a reference version is not made active again: save its"
-         " body as a new version' USING ERRCODE = 'check_violation';"
-         "  END IF;"
-         "  RETURN NEW;"
-         " END $guard$;"
-         " CREATE TRIGGER capabilities_references_guard"
-         "  BEFORE UPDATE OR DELETE ON capabilities_references"
-         "  FOR EACH ROW EXECUTE FUNCTION capabilities_references_guard();"
-         " CREATE TRIGGER capabilities_references_truncate"
-         "  BEFORE TRUNCATE ON capabilities_references"
-         "  FOR EACH STATEMENT EXECUTE FUNCTION capabilities_references_guard();"
-         " COMMENT ON TABLE capabilities_references IS"
-         " 'Every version of each capability''s references for a project: the file"
-         " capabilities/<capability>/reference/<name>.md as a row. A reference with an"
-         " active version is read from here before the project''s files; one with none"
-         " is retired. Immutable but for active, which a save clears as it adds the next.';"
-         " COMMENT ON COLUMN capabilities_references.project_id IS"
-         " 'The project''s declared id.';"
-         " COMMENT ON COLUMN capabilities_references.name IS"
-         " 'The file''s name without .md, as it was imported; the reference''s key is"
-         " reference.<name> with underscores as hyphens and in lower case, unique among"
-         " active versions.';"
-         " COMMENT ON COLUMN capabilities_references.body IS"
-         " 'Every byte of the file, front matter included, kept exactly.';"
-         " COMMENT ON COLUMN capabilities_references.active IS"
-         " 'The version in force; at most one per reference, none once it is retired.';"
-         " COMMENT ON COLUMN capabilities_references.created_by IS"
-         " 'Who saved the version: user@node.';"
-         " COMMENT ON COLUMN capabilities_references.note IS"
-         " 'Why the version was saved.'"),
-        # A connection's owner: null for one shared by the capability and
-        # grantable to any agent, an agent's id for that agent's own account,
-        # which no other agent is granted. A store made before owners gives a
-        # row its owner once, by the rule the owner set: a connection whose
-        # grants name exactly one agent, and none is for every agent, is that
-        # agent's own where it is named for it - the first word of the
-        # agent's registered name (lowercase letters and digits) is a word of
-        # the connection's name or of its spec's display `name`. Every other
-        # row is shared.
-        ("0020-connection-owner",
-         "ALTER TABLE capabilities_connections ADD COLUMN owner text CHECK (owner <> '');"
-         " UPDATE capabilities_connections c SET owner = s.agent_id"
-         "  FROM (SELECT capability, connection, min(agent_id) AS agent_id"
-         "   FROM capabilities_connection_grants GROUP BY capability, connection"
-         "   HAVING count(*) FILTER (WHERE agent_id IS NULL) = 0"
-         "    AND count(DISTINCT agent_id) = 1) s,"
-         "   capabilities_agents a"
-         "  WHERE c.capability = s.capability AND c.name = s.connection AND a.id = s.agent_id"
-         "   AND substring(lower(a.name) FROM '[a-z0-9]+') = ANY (regexp_split_to_array("
-         "    lower(c.name || ' ' || coalesce(c.spec->>'name', '')), '[^a-z0-9]+'));"
-         " CREATE FUNCTION capabilities_connection_grants_owner() RETURNS trigger"
-         "  LANGUAGE plpgsql SET search_path FROM CURRENT AS $owner$"
-         " DECLARE held text;"
-         " BEGIN"
-         "  SELECT owner INTO held FROM capabilities_connections"
-         "   WHERE capability = NEW.capability AND name = NEW.connection;"
-         "  IF held IS NOT NULL AND NEW.agent_id IS DISTINCT FROM held THEN"
-         "   RAISE EXCEPTION '% connection % is agent %''s own and is granted to no other"
-         " agent', NEW.capability, NEW.connection, held USING ERRCODE = 'check_violation';"
-         "  END IF;"
-         "  RETURN NEW;"
-         " END $owner$;"
-         " CREATE TRIGGER capabilities_connection_grants_owner"
-         "  BEFORE INSERT OR UPDATE ON capabilities_connection_grants"
-         "  FOR EACH ROW EXECUTE FUNCTION capabilities_connection_grants_owner();"
-         " CREATE FUNCTION capabilities_connections_owner() RETURNS trigger"
-         "  LANGUAGE plpgsql SET search_path FROM CURRENT AS $owner$"
-         " BEGIN"
-         "  IF NEW.owner IS NOT NULL AND EXISTS (SELECT 1 FROM capabilities_connection_grants"
-         "   WHERE capability = OLD.capability AND connection = OLD.name"
-         "   AND agent_id IS DISTINCT FROM NEW.owner) THEN"
-         "   RAISE EXCEPTION '% connection % is granted to agents other than %, so it"
-         " cannot be that agent''s own', OLD.capability, OLD.name, NEW.owner"
-         "    USING ERRCODE = 'check_violation';"
-         "  END IF;"
-         "  RETURN NEW;"
-         " END $owner$;"
-         " CREATE TRIGGER capabilities_connections_owner"
-         "  BEFORE UPDATE OF owner ON capabilities_connections"
-         "  FOR EACH ROW EXECUTE FUNCTION capabilities_connections_owner();"
-         " COMMENT ON TABLE capabilities_connections IS"
-         " 'What a connection is: one row per (capability, name), its spec the entry"
-         " interior with secret references only. A row is shared by the capability"
-         " (owner null) or one agent''s own.';"
-         " COMMENT ON COLUMN capabilities_connections.owner IS"
-         " 'The agent whose own connection this is - its own account, granted to no"
-         " other agent; null for a connection shared by the capability, which any agent"
-         " may be granted.'"),
-        # An agent's slug: its short technical name, which names its state
-        # directories, its service log lines and its `--project` shorthand.
-        # Unique within the store and path-safe; null while the agent has none,
-        # where its id stands in. The id is CAPABILITIES_PROJECT_ID, no longer
-        # a file's.
-        ("0021-agent-slug",
-         "ALTER TABLE capabilities_agents ADD COLUMN slug text"
-         " CHECK (slug ~ '^[a-z0-9-]+$');"
-         " CREATE UNIQUE INDEX capabilities_agents_slug ON capabilities_agents (slug);"
-         " COMMENT ON TABLE capabilities_agents IS"
-         " 'The agent registry: one row per agent, keyed by its project id"
-         " (CAPABILITIES_PROJECT_ID). Written by the capabilities manager alone.';"
-         " COMMENT ON COLUMN capabilities_agents.id IS"
-         " 'The project id, CAPABILITIES_PROJECT_ID (prj_<12 hex>, or an older UUID).';"
-         " COMMENT ON COLUMN capabilities_agents.slug IS"
-         " 'The agent''s short technical name: lowercase letters, digits and hyphens,"
-         " unique within the store. It names the agent''s state directories, service log"
-         " lines and --project shorthand; null while it has none, where the id stands in.'"),
-        # A node created as a Coolify resource names the coolify connection it
-        # was created through, the server and the resource, so it is reached
-        # and removed through that connection, whose token stays there. The
-        # three are set together or not at all. A node's public key is the
-        # X25519 key whose private half the node made and keeps.
-        ("0022-agent-node-coolify",
-         "ALTER TABLE capabilities_agent_nodes"
-         " ADD COLUMN coolify_connection text CHECK (coolify_connection <> ''),"
-         " ADD COLUMN coolify_server text CHECK (coolify_server <> ''),"
-         " ADD COLUMN coolify_resource text CHECK (coolify_resource <> ''),"
-         " ADD COLUMN public_key text CHECK (public_key ~ '^[A-Za-z0-9+/]{43}=$'),"
-         " ADD CONSTRAINT capabilities_agent_nodes_coolify CHECK"
-         "  (num_nonnulls(coolify_connection, coolify_server, coolify_resource) IN (0, 3));"
-         " COMMENT ON COLUMN capabilities_agent_nodes.coolify_connection IS"
-         " 'The coolify capability connection the node was created through; its token"
-         " stays in that connection. Null for a node that is not a Coolify resource.';"
-         " COMMENT ON COLUMN capabilities_agent_nodes.coolify_server IS"
-         " 'The uuid of the Coolify server the node''s resource runs on.';"
-         " COMMENT ON COLUMN capabilities_agent_nodes.coolify_resource IS"
-         " 'The uuid of the Coolify resource that is the node.';"
-         " COMMENT ON COLUMN capabilities_agent_nodes.public_key IS"
-         " 'The node''s X25519 public key, its 32 bytes in base64; the private key"
-         " never leaves the node.'"),
-        # What binds an agent beyond its id, kept in its row rather than in a
-        # file of its folder: where its body sits inside the project and how
-        # it collaborates. A body root is a relative, visible folder, as the
-        # manager reads one: not empty, not absolute, no `..` part, and a
-        # first part that does not start with `.`; null is the project root.
-        ("0023-agent-binding",
-         "ALTER TABLE capabilities_agents"
-         " ADD COLUMN body_root text CHECK (body_root <> '' AND body_root = btrim(body_root)"
-         "  AND left(body_root, 1) NOT IN ('/', '.')"
-         "  AND body_root !~ '(^|/)[.][.](/|$)'),"
-         " ADD COLUMN collaboration_mode text"
-         "  CHECK (collaboration_mode IN ('ask', 'direct'));"
-         " COMMENT ON COLUMN capabilities_agents.body_root IS"
-         " 'The folder inside the project that holds the agent''s body - its context,"
-         " assets, routines and capabilities layers - as a relative path such as agent;"
-         " null where the body sits at the project root.';"
-         " COMMENT ON COLUMN capabilities_agents.collaboration_mode IS"
-         " 'ask: the agent offers Direct or Agent Team mode before non-trivial work;"
-         " direct: it does not offer. Null is ask.'"),
-        # The folder an agent lives in on a node: its project root on that
-        # machine, an absolute path. One folder on a node is one agent's, which
-        # the unique index enforces; null where the node's folder is not
-        # recorded, as for a node created elsewhere.
-        ("0024-agent-node-folder",
-         "ALTER TABLE capabilities_agent_nodes"
-         " ADD COLUMN folder text CHECK (folder <> '' AND left(folder, 1) = '/');"
-         " CREATE UNIQUE INDEX capabilities_agent_nodes_folder"
-         "  ON capabilities_agent_nodes (node, folder);"
-         " COMMENT ON COLUMN capabilities_agent_nodes.folder IS"
-         " 'The folder the agent lives in on this node, its project root there, as an"
-         " absolute path such as /app; null where it is not recorded. One folder on a"
-         " node is one agent''s.'"),
-        # Whether the agent's bundled service of the capability is placed on
-        # the node its row names, apart from whether the capability is usable
-        # there (`enabled`). Only an agent's row naming a node places a service.
-        # A row written before this column placed a service exactly where it
-        # enabled the capability on a node of its own, so that is its value.
-        # A writer that predates the column still means that: a trigger gives
-        # `service` the value of `enabled` on an agent's row naming a node
-        # where an insert leaves it out, or an update changes `enabled` and
-        # leaves `service` as it was.
-        ("0025-policy-service",
-         "ALTER TABLE capabilities_policy"
-         " ADD COLUMN service boolean NOT NULL DEFAULT false;"
-         " UPDATE capabilities_policy SET service = enabled"
-         "  WHERE agent_id IS NOT NULL AND node IS NOT NULL;"
-         " ALTER TABLE capabilities_policy ALTER COLUMN service DROP DEFAULT;"
-         " ALTER TABLE capabilities_policy ADD CONSTRAINT capabilities_policy_service"
-         "  CHECK (NOT service OR (agent_id IS NOT NULL AND node IS NOT NULL));"
-         " CREATE FUNCTION capabilities_policy_service_follows() RETURNS trigger"
-         "  LANGUAGE plpgsql AS $follows$"
-         " BEGIN"
-         "  IF NEW.agent_id IS NULL OR NEW.node IS NULL THEN"
-         "   NEW.service := coalesce(NEW.service, false);"
-         "  ELSIF tg_op = 'INSERT' THEN"
-         "   NEW.service := coalesce(NEW.service, NEW.enabled);"
-         "  ELSIF NEW.enabled IS DISTINCT FROM OLD.enabled"
-         "   AND NEW.service IS NOT DISTINCT FROM OLD.service THEN"
-         "   NEW.service := NEW.enabled;"
-         "  END IF;"
-         "  RETURN NEW;"
-         " END $follows$;"
-         " CREATE TRIGGER capabilities_policy_service_follows"
-         "  BEFORE INSERT OR UPDATE ON capabilities_policy"
-         "  FOR EACH ROW EXECUTE FUNCTION capabilities_policy_service_follows();"
-         " COMMENT ON COLUMN capabilities_policy.service IS"
-         " 'Whether the agent''s bundled service of this capability is placed on the node"
-         " the row names: the service runs there. Apart from enabled, which says whether"
-         " the capability is usable there. Only an agent''s row naming a node places."
-         " A trigger sets it to enabled on such a row where an insert leaves it out or"
-         " an update changes enabled alone, as a writer that predates the column means.'"),
-        # The node registry: a node is a row of its own, keyed by its id and
-        # shown by its label, apart from which agent lives on it. A node's own
-        # fields - its kind, address, target, Coolify resource, public key and
-        # when it was last seen - move from each agent's link to it, and a link
-        # keeps what belongs to the pair: the folder, the master and the write
-        # flag. Every node a link named becomes a row whose id and label are
-        # that name, the id it was known by until it moves to a twelve-hex id
-        # of its own (`capabilities node rekey`); its fields are taken from the
-        # link that is a master first, then the one seen last.
-        ("0026-nodes",
-         "CREATE TABLE capabilities_nodes ("
-         " id text PRIMARY KEY CHECK (id <> ''),"
-         " label text NOT NULL CHECK (label <> '' AND label = btrim(label)),"
-         " kind text NOT NULL CHECK (kind IN ('mac', 'server')),"
-         " address text CHECK (address <> ''),"
-         " target text CHECK (target <> ''),"
-         " coolify_connection text CHECK (coolify_connection <> ''),"
-         " coolify_server text CHECK (coolify_server <> ''),"
-         " coolify_resource text CHECK (coolify_resource <> ''),"
-         " public_key text CHECK (public_key ~ '^[A-Za-z0-9+/]{43}=$'),"
-         " last_seen_at timestamptz,"
-         " created_at timestamptz NOT NULL DEFAULT now(),"
-         " updated_at timestamptz NOT NULL DEFAULT now(),"
-         " CONSTRAINT capabilities_nodes_coolify CHECK"
-         "  (num_nonnulls(coolify_connection, coolify_server, coolify_resource) IN (0, 3)));"
-         " INSERT INTO capabilities_nodes (id, label, kind, address, target,"
-         "  coolify_connection, coolify_server, coolify_resource, public_key, last_seen_at)"
-         " SELECT DISTINCT ON (n.node) n.node, n.node, n.kind, n.address, n.target,"
-         "  n.coolify_connection, n.coolify_server, n.coolify_resource, n.public_key,"
-         "  (SELECT max(m.last_seen_at) FROM capabilities_agent_nodes m WHERE m.node = n.node)"
-         " FROM capabilities_agent_nodes n"
-         " ORDER BY n.node, n.is_master DESC, n.last_seen_at DESC NULLS LAST, n.agent_id;"
-         " ALTER TABLE capabilities_agent_nodes"
-         "  DROP CONSTRAINT capabilities_agent_nodes_coolify,"
-         "  DROP COLUMN kind, DROP COLUMN address, DROP COLUMN target,"
-         "  DROP COLUMN last_seen_at, DROP COLUMN coolify_connection,"
-         "  DROP COLUMN coolify_server, DROP COLUMN coolify_resource, DROP COLUMN public_key,"
-         "  ADD CONSTRAINT capabilities_agent_nodes_node FOREIGN KEY (node)"
-         "   REFERENCES capabilities_nodes (id) ON DELETE CASCADE ON UPDATE CASCADE;"
-         " COMMENT ON TABLE capabilities_nodes IS"
-         " 'The node registry: one row per machine an agent runs on, keyed by its id and"
-         " shown by its label. Written by the capabilities manager alone.';"
-         " COMMENT ON COLUMN capabilities_nodes.id IS"
-         " 'The id the machine resolves for itself: twelve lowercase hex characters, from a"
-         " Mac''s hardware or a server''s config home, or AGENT_NODE_ID; a row registered"
-         " before ids holds the name it had until `capabilities node rekey` moves it. Every"
-         " store row that names a node holds this id.';"
-         " COMMENT ON COLUMN capabilities_nodes.label IS"
-         " 'The name shown for the node, free text set and changed at will; renaming a node"
-         " changes this column alone.';"
-         " COMMENT ON COLUMN capabilities_nodes.kind IS"
-         " 'mac: the node resolves its id from its hardware; server: from the id minted onto"
-         " its config volume.';"
-         " COMMENT ON COLUMN capabilities_nodes.address IS"
-         " 'Host name or IP address the node is reached at, where it is fixed.';"
-         " COMMENT ON COLUMN capabilities_nodes.target IS"
-         " 'The deployment target this node is deployed by; null for a node that is not"
-         " deployed, such as a Mac.';"
-         " COMMENT ON COLUMN capabilities_nodes.coolify_connection IS"
-         " 'The coolify capability connection the node was created through; its token"
-         " stays in that connection. Null for a node that is not a Coolify resource.';"
-         " COMMENT ON COLUMN capabilities_nodes.coolify_server IS"
-         " 'The uuid of the Coolify server the node''s resource runs on.';"
-         " COMMENT ON COLUMN capabilities_nodes.coolify_resource IS"
-         " 'The uuid of the Coolify resource that is the node.';"
-         " COMMENT ON COLUMN capabilities_nodes.public_key IS"
-         " 'The node''s X25519 public key, its 32 bytes in base64; the private key"
-         " never leaves the node.';"
-         " COMMENT ON COLUMN capabilities_nodes.last_seen_at IS"
-         " 'When the node last reported itself.';"
-         " COMMENT ON TABLE capabilities_agent_nodes IS"
-         " 'Which agent lives on which node, one row per (agent, node), with what belongs to"
-         " the pair. Written by the capabilities manager alone.';"
-         " COMMENT ON COLUMN capabilities_agent_nodes.node IS"
-         " 'The node''s id in capabilities_nodes.'"),
-        # A reader from before the node registry - an older manager, AgentKit -
-        # still reads a node's fields off its links, so they stay there as a
-        # copy the store keeps of the node's row until those readers read the
-        # registry: nothing writes them, a trigger fills them on every link
-        # written, and a node's row copies them to its links where they
-        # differ. A label is not copied, so renaming a node is still its row
-        # alone. The triggers name the tables in the schema they fire in, so a
-        # writer's search_path does not matter. A step of its own after `0026-nodes`, which a store may hold
-        # already, so every store reaches the same tables.
-        ("0027-agent-node-fields-kept",
-         "ALTER TABLE capabilities_agent_nodes"
-         " ADD COLUMN kind text, ADD COLUMN address text, ADD COLUMN target text,"
-         " ADD COLUMN last_seen_at timestamptz, ADD COLUMN coolify_connection text,"
-         " ADD COLUMN coolify_server text, ADD COLUMN coolify_resource text,"
-         " ADD COLUMN public_key text;"
-         " CREATE FUNCTION capabilities_agent_nodes_node_fields() RETURNS trigger"
-         "  LANGUAGE plpgsql AS $fields$"
-         " BEGIN"
-         "  EXECUTE format('SELECT kind, address, target, last_seen_at, coolify_connection,"
-         "   coolify_server, coolify_resource, public_key FROM %I.capabilities_nodes"
-         "   WHERE id = $1', tg_table_schema)"
-         "  INTO NEW.kind, NEW.address, NEW.target, NEW.last_seen_at, NEW.coolify_connection,"
-         "   NEW.coolify_server, NEW.coolify_resource, NEW.public_key"
-         "  USING NEW.node;"
-         "  RETURN NEW;"
-         " END $fields$;"
-         " CREATE TRIGGER capabilities_agent_nodes_node_fields"
-         "  BEFORE INSERT OR UPDATE ON capabilities_agent_nodes"
-         "  FOR EACH ROW EXECUTE FUNCTION capabilities_agent_nodes_node_fields();"
-         " CREATE FUNCTION capabilities_nodes_to_links() RETURNS trigger"
-         "  LANGUAGE plpgsql AS $links$"
-         " BEGIN"
-         "  EXECUTE format('UPDATE %I.capabilities_agent_nodes SET node = node WHERE node = $1"
-         "   AND (kind, address, target, last_seen_at, coolify_connection, coolify_server,"
-         "    coolify_resource, public_key) IS DISTINCT FROM ($2, $3, $4, $5, $6, $7, $8, $9)',"
-         "   tg_table_schema)"
-         "  USING NEW.id, NEW.kind, NEW.address, NEW.target, NEW.last_seen_at,"
-         "   NEW.coolify_connection, NEW.coolify_server, NEW.coolify_resource, NEW.public_key;"
-         "  RETURN NULL;"
-         " END $links$;"
-         " CREATE TRIGGER capabilities_nodes_to_links"
-         "  AFTER INSERT OR UPDATE ON capabilities_nodes"
-         "  FOR EACH ROW EXECUTE FUNCTION capabilities_nodes_to_links();"
-         " UPDATE capabilities_agent_nodes SET node = node;"
-         " COMMENT ON COLUMN capabilities_agent_nodes.kind IS"
-         " 'A copy of capabilities_nodes.kind kept by the store for readers from before the"
-         " node registry; nothing writes it, and it goes once they read the registry.';"
-         " COMMENT ON COLUMN capabilities_agent_nodes.address IS"
-         " 'A copy of capabilities_nodes.address kept by the store, as kind.';"
-         " COMMENT ON COLUMN capabilities_agent_nodes.target IS"
-         " 'A copy of capabilities_nodes.target kept by the store, as kind.';"
-         " COMMENT ON COLUMN capabilities_agent_nodes.last_seen_at IS"
-         " 'A copy of capabilities_nodes.last_seen_at kept by the store, as kind.';"
-         " COMMENT ON COLUMN capabilities_agent_nodes.coolify_connection IS"
-         " 'A copy of capabilities_nodes.coolify_connection kept by the store, as kind.';"
-         " COMMENT ON COLUMN capabilities_agent_nodes.coolify_server IS"
-         " 'A copy of capabilities_nodes.coolify_server kept by the store, as kind.';"
-         " COMMENT ON COLUMN capabilities_agent_nodes.coolify_resource IS"
-         " 'A copy of capabilities_nodes.coolify_resource kept by the store, as kind.';"
-         " COMMENT ON COLUMN capabilities_agent_nodes.public_key IS"
-         " 'A copy of capabilities_nodes.public_key kept by the store, as kind.'"),
-        # What runs where: one row per service a node supervises, written by
-        # whatever supervises it there - today deployment's runner - and
-        # deleted when it stops supervising it, so the nodes that run a
-        # service are a plain read. `node` carries no foreign key, as the
-        # lease's does not: a service running on a node nobody registered is
-        # still shown, and `capabilities node rekey` moves the column with
-        # every other that names a node. `ready` is computed from `state`,
-        # which alone says whether the service can do its work.
-        ("0028-service-instances",
-         "CREATE TABLE capabilities_service_instances ("
-         " project_id text NOT NULL CHECK (project_id <> ''),"
-         " capability text NOT NULL CHECK (capability ~ '^[a-z][a-z0-9_-]*$'),"
-         " node text NOT NULL CHECK (node <> ''),"
-         " state text NOT NULL CHECK (state IN ('starting', 'ready', 'unusable', 'degraded', 'failing', 'held', 'waiting', 'stopping')),"
-         " ready boolean GENERATED ALWAYS AS (state IN ('ready', 'degraded')) STORED,"
-         " problem text CHECK (problem <> ''),"
-         " problem_code text CHECK (problem_code <> ''),"
-         " payload_sha256 text CHECK (payload_sha256 ~ '^[0-9a-f]{64}$'),"
-         " pid integer CHECK (pid > 0),"
-         " host text CHECK (host <> ''),"
-         " started_at timestamptz,"
-         " checked_at timestamptz NOT NULL DEFAULT now(),"
-         " last_exit_code integer,"
-         " last_error text CHECK (last_error <> ''),"
-         " last_error_at timestamptz,"
-         " skipped_settings jsonb NOT NULL DEFAULT '[]'"
-         "  CHECK (jsonb_typeof(skipped_settings) = 'array'),"
-         " PRIMARY KEY (project_id, capability, node),"
-         " CONSTRAINT capabilities_service_instances_unusable_says_why"
-         "  CHECK (state <> 'unusable' OR problem IS NOT NULL),"
-         " CONSTRAINT capabilities_service_instances_failing_says_why"
-         "  CHECK (state <> 'failing' OR last_error IS NOT NULL));"
-         " COMMENT ON TABLE capabilities_service_instances IS"
-         " 'What each node actually runs: one row per (project, capability, node) while"
-         " something on that node supervises the service, deleted when it stops"
-         " supervising it. Placement says where a service should run and the lease which"
-         " node may run an exclusive one; this row says what runs and whether it works.';"
-         " COMMENT ON COLUMN capabilities_service_instances.project_id IS"
-         " 'The project''s declared id.';"
-         " COMMENT ON COLUMN capabilities_service_instances.node IS"
-         " 'The id of the node the service runs on, as capabilities_nodes keys it.';"
-         " COMMENT ON COLUMN capabilities_service_instances.state IS"
-         " 'starting: running, not yet passed its probe; ready: running and its probe"
-         " passes; unusable: running, and its probe says it cannot do its work (problem says"
-         " why); degraded: ready, with settings skipped on this node; failing: exits and is"
-         " restarted, or cannot be started (last_error says why); held: stopped and not"
-         " restarted until the gate answer changes; waiting: placed here, while another"
-         " node holds the lease; stopping: no longer placed here, being stopped.';"
-         " COMMENT ON COLUMN capabilities_service_instances.ready IS"
-         " 'Whether the service can do its work here: state ready or degraded.';"
-         " COMMENT ON COLUMN capabilities_service_instances.problem IS"
-         " 'Why the service is not ready, in its declared doctor''s words.';"
-         " COMMENT ON COLUMN capabilities_service_instances.problem_code IS"
-         " 'The error code the doctor named, else the category its exit code stands for.';"
-         " COMMENT ON COLUMN capabilities_service_instances.payload_sha256 IS"
-         " 'The installed payload of the capability the service was started from.';"
-         " COMMENT ON COLUMN capabilities_service_instances.pid IS"
-         " 'The service''s process on host; null while it does not run.';"
-         " COMMENT ON COLUMN capabilities_service_instances.host IS"
-         " 'The host name of the machine the pid is on.';"
-         " COMMENT ON COLUMN capabilities_service_instances.started_at IS"
-         " 'When the running process started; null while it does not run.';"
-         " COMMENT ON COLUMN capabilities_service_instances.checked_at IS"
-         " 'When the supervisor last wrote the row; a node that stops writing it is gone"
-         " or cut off, and its rows say nothing after that.';"
-         " COMMENT ON COLUMN capabilities_service_instances.last_exit_code IS"
-         " 'The exit code the service last failed with on this node; null when it could not"
-         " be started at all.';"
-         " COMMENT ON COLUMN capabilities_service_instances.last_error IS"
-         " 'The last lines the service printed to stderr when it last failed, or why it"
-         " could not be started.';"
-         " COMMENT ON COLUMN capabilities_service_instances.last_error_at IS"
-         " 'When the service last failed on this node.';"
-         " COMMENT ON COLUMN capabilities_service_instances.skipped_settings IS"
-         " 'The settings the service reported it cannot honour on this node and skipped,"
-         " as its doctor named them.'"),
-        # Each agent's vault: its secrets, sealed with the agent's own key,
-        # which the store never holds; the agent's row keeps only the key's
-        # fingerprint. A row sealed under another key than the agent's present
-        # one is unreadable, kept until it is set again or removed. Every
-        # change raises the vault's channel version for the agent, so a
-        # process that resolved a secret rereads it.
-        ("0029-vault",
-         "CREATE TABLE capabilities_vault ("
-         " agent_id text NOT NULL CHECK (agent_id <> ''),"
-         " name text NOT NULL CHECK (name ~ '^[A-Za-z_][A-Za-z0-9_]{0,254}$'),"
-         " ciphertext bytea NOT NULL,"
-         " key_fingerprint text NOT NULL CHECK (key_fingerprint ~ '^[0-9a-f]{64}$'),"
-         " updated_at timestamptz NOT NULL DEFAULT now(),"
-         " updated_by text CHECK (updated_by <> ''),"
-         " PRIMARY KEY (agent_id, name));"
-         " ALTER TABLE capabilities_agents ADD COLUMN vault_key text"
-         "  CHECK (vault_key ~ '^[0-9a-f]{64}$');"
-         " CREATE FUNCTION capabilities_vault_announce() RETURNS trigger AS $$"
-         " DECLARE agent text;"
-         " BEGIN"
-         "  IF tg_table_name = 'capabilities_agents' THEN agent := new.id;"
-         "  ELSIF tg_op = 'DELETE' THEN agent := old.agent_id;"
-         "  ELSE agent := new.agent_id; END IF;"
-         "  IF to_regclass(format('%I.schema_channel', tg_table_schema)) IS NOT NULL THEN"
-         "   EXECUTE format('INSERT INTO %I.schema_channel AS c (channel, scope, version)"
-         " VALUES (%L, $1, 1) ON CONFLICT (channel, scope)"
-         " DO UPDATE SET version = c.version + 1',"
-         "                  tg_table_schema, 'capabilities_vault') USING agent;"
-         "  END IF;"
-         "  RETURN NULL;"
-         " END $$ LANGUAGE plpgsql;"
-         " CREATE TRIGGER capabilities_vault_changed"
-         "  AFTER INSERT OR UPDATE OR DELETE ON capabilities_vault"
-         "  FOR EACH ROW EXECUTE FUNCTION capabilities_vault_announce();"
-         " CREATE TRIGGER capabilities_vault_key_changed"
-         "  AFTER UPDATE OF vault_key ON capabilities_agents"
-         "  FOR EACH ROW WHEN (old.vault_key IS DISTINCT FROM new.vault_key)"
-         "  EXECUTE FUNCTION capabilities_vault_announce();"
-         " COMMENT ON TABLE capabilities_vault IS"
-         " 'Each agent''s vault: one row per named secret, sealed with XChaCha20-Poly1305"
-         " under the agent''s own key (AGENT_ENCRYPTION_KEY, kept in the agent''s"
-         " environment and never here), the agent id and the name bound as associated"
-         " data. Written by the capabilities manager''s secrets verbs.';"
-         " COMMENT ON COLUMN capabilities_vault.agent_id IS"
-         " 'The agent the secret is sealed for, as capabilities_agents keys it.';"
-         " COMMENT ON COLUMN capabilities_vault.name IS"
-         " 'The environment variable name the secret answers in the credential cascade.';"
-         " COMMENT ON COLUMN capabilities_vault.ciphertext IS"
-         " 'A format byte, the 24-byte nonce, then the ciphertext with its tag.';"
-         " COMMENT ON COLUMN capabilities_vault.key_fingerprint IS"
-         " 'The fingerprint of the key that sealed the value; a row whose fingerprint is"
-         " not the agent''s vault_key is unreadable.';"
-         " COMMENT ON COLUMN capabilities_agents.vault_key IS"
-         " 'The fingerprint of the agent''s encryption key, never the key; null while"
-         " the agent has none.'"),
-        # What each node says of itself, written by its own manager on a short
-        # beat: one row per machine, shared by every agent on it as its
-        # registry row is, so it carries no project. A node stands for itself
-        # until fresh_until, the store's time, and reads as unreachable once
-        # that has passed. Beside it, per agent, whether its tools are signed
-        # in on that node and whether each device-bound connection holds a
-        # live session there. A sign-in is per agent rather than per machine
-        # because a tool keeps it in the home of the OS user it runs as, and
-        # one machine can hold agents of several OS users, each under its own
-        # manager. All three name the node through a foreign key to the
-        # registry: a row means nothing without its node, a rekey moves it
-        # with the registry's id, and removing the node removes it.
-        ("0030-node-states",
-         "CREATE TABLE capabilities_node_states ("
-         " node text PRIMARY KEY"
-         "  REFERENCES capabilities_nodes (id) ON DELETE CASCADE ON UPDATE CASCADE,"
-         " load_1 double precision CHECK (load_1 >= 0),"
-         " load_5 double precision CHECK (load_5 >= 0),"
-         " load_15 double precision CHECK (load_15 >= 0),"
-         " cpu_count integer CHECK (cpu_count > 0),"
-         " memory_used_bytes bigint CHECK (memory_used_bytes >= 0),"
-         " memory_limit_bytes bigint CHECK (memory_limit_bytes > 0),"
-         " disk_used_bytes bigint CHECK (disk_used_bytes >= 0),"
-         " disk_total_bytes bigint CHECK (disk_total_bytes > 0),"
-         " booted_at timestamptz,"
-         " boot_line text CHECK (boot_line <> ''),"
-         " image_version text CHECK (image_version <> ''),"
-         " reported_at timestamptz NOT NULL DEFAULT now(),"
-         " fresh_until timestamptz NOT NULL,"
-         " CONSTRAINT capabilities_node_states_fresh_after_report"
-         "  CHECK (fresh_until > reported_at));"
-         " CREATE TABLE capabilities_node_logins ("
-         " project_id text NOT NULL CHECK (project_id <> ''),"
-         " node text NOT NULL"
-         "  REFERENCES capabilities_nodes (id) ON DELETE CASCADE ON UPDATE CASCADE,"
-         " claude_login text NOT NULL DEFAULT 'unknown'"
-         "  CHECK (claude_login IN ('signed_in', 'signed_out', 'absent', 'unknown')),"
-         " claude_account text CHECK (claude_account <> ''),"
-         " codex_login text NOT NULL DEFAULT 'unknown'"
-         "  CHECK (codex_login IN ('signed_in', 'signed_out', 'absent', 'unknown')),"
-         " codex_account text CHECK (codex_account <> ''),"
-         " gh_login text NOT NULL DEFAULT 'unknown'"
-         "  CHECK (gh_login IN ('signed_in', 'signed_out', 'absent', 'unknown')),"
-         " gh_account text CHECK (gh_account <> ''),"
-         " checked_at timestamptz NOT NULL DEFAULT now(),"
-         " PRIMARY KEY (project_id, node),"
-         " CONSTRAINT capabilities_node_logins_account_signed_in CHECK"
-         "  ((claude_account IS NULL OR claude_login = 'signed_in')"
-         "   AND (codex_account IS NULL OR codex_login = 'signed_in')"
-         "   AND (gh_account IS NULL OR gh_login = 'signed_in')));"
-         " CREATE INDEX capabilities_node_logins_node"
-         "  ON capabilities_node_logins (node);"
-         " CREATE TABLE capabilities_node_sessions ("
-         " project_id text NOT NULL CHECK (project_id <> ''),"
-         " node text NOT NULL"
-         "  REFERENCES capabilities_nodes (id) ON DELETE CASCADE ON UPDATE CASCADE,"
-         " capability text NOT NULL CHECK (capability ~ '^[a-z][a-z0-9_-]*$'),"
-         " connection text NOT NULL CHECK (connection <> ''),"
-         " live boolean NOT NULL,"
-         " account text CHECK (account <> ''),"
-         " checked_at timestamptz NOT NULL DEFAULT now(),"
-         " PRIMARY KEY (project_id, node, capability, connection));"
-         " CREATE INDEX capabilities_node_sessions_node"
-         "  ON capabilities_node_sessions (node);"
-         " COMMENT ON TABLE capabilities_node_states IS"
-         " 'What each node says of itself: one row per machine, written by that"
-         " machine''s capabilities manager alone on a short beat and when it changes."
-         " The row belongs to the machine and is shared by every agent on it, as its"
-         " row in capabilities_nodes is, so it carries no project. Read it directly:"
-         " the node is reachable while fresh_until has not passed.';"
-         " COMMENT ON COLUMN capabilities_node_states.node IS"
-         " 'The node''s id in capabilities_nodes.';"
-         " COMMENT ON COLUMN capabilities_node_states.load_1 IS"
-         " 'The machine''s load average over 1 minute, as the operating system"
-         " reports it.';"
-         " COMMENT ON COLUMN capabilities_node_states.load_5 IS"
-         " 'The machine''s load average over 5 minutes.';"
-         " COMMENT ON COLUMN capabilities_node_states.load_15 IS"
-         " 'The machine''s load average over 15 minutes.';"
-         " COMMENT ON COLUMN capabilities_node_states.cpu_count IS"
-         " 'How many CPUs this node''s processes may run on.';"
-         " COMMENT ON COLUMN capabilities_node_states.memory_used_bytes IS"
-         " 'Memory in use: the container''s, less the file cache it may give back,"
-         " where the node runs under a memory limit; else the machine''s.';"
-         " COMMENT ON COLUMN capabilities_node_states.memory_limit_bytes IS"
-         " 'The memory limit the node runs under, where it has one; else the"
-         " machine''s physical memory.';"
-         " COMMENT ON COLUMN capabilities_node_states.disk_used_bytes IS"
-         " 'Bytes used on the filesystem holding the home of the user the node''s"
-         " manager runs as.';"
-         " COMMENT ON COLUMN capabilities_node_states.disk_total_bytes IS"
-         " 'The size of the filesystem disk_used_bytes measures.';"
-         " COMMENT ON COLUMN capabilities_node_states.booted_at IS"
-         " 'When the node started: the container''s start on a container node, the"
-         " machine''s boot otherwise. Its uptime is the store''s now less this.';"
-         " COMMENT ON COLUMN capabilities_node_states.boot_line IS"
-         " 'The line an agent-node image''s boot path last wrote of what it is doing;"
-         " null off the image.';"
-         " COMMENT ON COLUMN capabilities_node_states.image_version IS"
-         " 'The version of the agent-node image the node runs; null off the image.';"
-         " COMMENT ON COLUMN capabilities_node_states.reported_at IS"
-         " 'The store''s time of the node''s last write of this row.';"
-         " COMMENT ON COLUMN capabilities_node_states.fresh_until IS"
-         " 'The store''s time until which the row stands for the node: its write time"
-         " and the stated interval. Once it has passed, the node reads as"
-         " unreachable.';"
-         " COMMENT ON TABLE capabilities_node_logins IS"
-         " 'Per agent, whether Claude Code, Codex and the GitHub CLI are signed in on a"
-         " node and as whom, as each tool answers for the OS user the agent''s folder"
-         " there belongs to. Written by that OS user''s capabilities manager, which"
-         " replaces the agent''s row on each write; a machine with several OS users"
-         " has one manager each, and none writes another''s agents.';"
-         " COMMENT ON COLUMN capabilities_node_logins.project_id IS"
-         " 'The agent whose tools they are.';"
-         " COMMENT ON COLUMN capabilities_node_logins.node IS"
-         " 'The node''s id in capabilities_nodes.';"
-         " COMMENT ON COLUMN capabilities_node_logins.claude_login IS"
-         " 'Whether Claude Code is signed in for this agent on this node, as its own"
-         " status answer there says: signed_in, signed_out, absent (not installed) or"
-         " unknown (its answer could not be read).';"
-         " COMMENT ON COLUMN capabilities_node_logins.claude_account IS"
-         " 'The account Claude Code states it is signed in as; null unless signed in.';"
-         " COMMENT ON COLUMN capabilities_node_logins.codex_login IS"
-         " 'Whether Codex is signed in on this node, as its own status answer says,"
-         " in claude_login''s terms.';"
-         " COMMENT ON COLUMN capabilities_node_logins.codex_account IS"
-         " 'The account Codex states it is signed in as; null unless signed in and"
-         " where it states none.';"
-         " COMMENT ON COLUMN capabilities_node_logins.gh_login IS"
-         " 'Whether the GitHub CLI is signed in to github.com on this node, as its own"
-         " status answer says, in claude_login''s terms.';"
-         " COMMENT ON COLUMN capabilities_node_logins.gh_account IS"
-         " 'The github.com login the GitHub CLI is signed in as; null unless signed in.';"
-         " COMMENT ON COLUMN capabilities_node_logins.checked_at IS"
-         " 'The store''s time of the write that last asked the tools.';"
-         " COMMENT ON TABLE capabilities_node_sessions IS"
-         " 'Per agent, whether each connection of a device-bound capability holds a"
-         " live session on a node, as that capability answers in the agent''s folder"
-         " there. Written by the node''s capabilities manager, which replaces an"
-         " agent''s rows for one capability on a node on each write.';"
-         " COMMENT ON COLUMN capabilities_node_sessions.project_id IS"
-         " 'The agent whose connection it is.';"
-         " COMMENT ON COLUMN capabilities_node_sessions.node IS"
-         " 'The node''s id in capabilities_nodes.';"
-         " COMMENT ON COLUMN capabilities_node_sessions.live IS"
-         " 'Whether a live session of the connection exists on the node.';"
-         " COMMENT ON COLUMN capabilities_node_sessions.account IS"
-         " 'The account the session is, as the capability states it; null where it"
-         " states none.';"
-         " COMMENT ON COLUMN capabilities_node_sessions.checked_at IS"
-         " 'The store''s time of the write that last asked the capability.'"),
-        # What a node is expected to have. Each agent's sign-in row says which
-        # tools the services it places on that node need, as the node's own
-        # manager derives it from their manifests; beside it, the owner's word
-        # per tool and per device-bound connection, expected on or off, which
-        # stands over what the services need. An override is the owner's, not
-        # the node's: no manager write replaces it, and it goes only with its
-        # node or when the owner takes it back.
-        ("0031-node-expectations",
-         "ALTER TABLE capabilities_node_logins"
-         " ADD COLUMN claude_needed boolean NOT NULL DEFAULT false,"
-         " ADD COLUMN codex_needed boolean NOT NULL DEFAULT false,"
-         " ADD COLUMN gh_needed boolean NOT NULL DEFAULT false;"
-         " CREATE TABLE capabilities_node_login_expectations ("
-         " project_id text NOT NULL CHECK (project_id <> ''),"
-         " node text NOT NULL"
-         "  REFERENCES capabilities_nodes (id) ON DELETE CASCADE ON UPDATE CASCADE,"
-         " tool text NOT NULL CHECK (tool IN ('claude', 'codex', 'gh')),"
-         " expected boolean NOT NULL,"
-         " updated_at timestamptz NOT NULL DEFAULT now(),"
-         " updated_by text CHECK (updated_by <> ''),"
-         " PRIMARY KEY (project_id, node, tool));"
-         " CREATE INDEX capabilities_node_login_expectations_node"
-         "  ON capabilities_node_login_expectations (node);"
-         " CREATE TABLE capabilities_node_session_expectations ("
-         " project_id text NOT NULL CHECK (project_id <> ''),"
-         " node text NOT NULL"
-         "  REFERENCES capabilities_nodes (id) ON DELETE CASCADE ON UPDATE CASCADE,"
-         " capability text NOT NULL CHECK (capability ~ '^[a-z][a-z0-9_-]*$'),"
-         " connection text NOT NULL CHECK (connection <> ''),"
-         " expected boolean NOT NULL,"
-         " updated_at timestamptz NOT NULL DEFAULT now(),"
-         " updated_by text CHECK (updated_by <> ''),"
-         " PRIMARY KEY (project_id, node, capability, connection));"
-         " CREATE INDEX capabilities_node_session_expectations_node"
-         "  ON capabilities_node_session_expectations (node);"
-         " COMMENT ON COLUMN capabilities_node_logins.claude_needed IS"
-         " 'Whether a service the agent places on this node needs Claude Code signed"
-         " in here, as the node''s manager derives it from the services'' manifests.';"
-         " COMMENT ON COLUMN capabilities_node_logins.codex_needed IS"
-         " 'Whether a service the agent places on this node needs Codex signed in"
-         " here, in claude_needed''s terms.';"
-         " COMMENT ON COLUMN capabilities_node_logins.gh_needed IS"
-         " 'Whether a service the agent places on this node needs the GitHub CLI"
-         " signed in here, in claude_needed''s terms.';"
-         " COMMENT ON TABLE capabilities_node_login_expectations IS"
-         " 'The owner''s word on whether a tool''s sign-in is expected for an agent on"
-         " a node, standing over whether its placed services need it. A tool with no"
-         " row is expected where they need it.';"
-         " COMMENT ON COLUMN capabilities_node_login_expectations.project_id IS"
-         " 'The agent whose sign-in it is.';"
-         " COMMENT ON COLUMN capabilities_node_login_expectations.node IS"
-         " 'The node''s id in capabilities_nodes.';"
-         " COMMENT ON COLUMN capabilities_node_login_expectations.tool IS"
-         " 'The tool: claude, codex or gh.';"
-         " COMMENT ON COLUMN capabilities_node_login_expectations.expected IS"
-         " 'Whether the sign-in is expected there: true on, false off.';"
-         " COMMENT ON COLUMN capabilities_node_login_expectations.updated_at IS"
-         " 'When the owner last set it.';"
-         " COMMENT ON COLUMN capabilities_node_login_expectations.updated_by IS"
-         " 'Who set it, where the writer names itself.';"
-         " COMMENT ON TABLE capabilities_node_session_expectations IS"
-         " 'The owner''s word on whether a device-bound connection of an agent is"
-         " expected to hold a live session on a node, standing over whether the agent"
-         " places that capability''s service there. A connection with no row is"
-         " expected where it is placed.';"
-         " COMMENT ON COLUMN capabilities_node_session_expectations.project_id IS"
-         " 'The agent whose connection it is.';"
-         " COMMENT ON COLUMN capabilities_node_session_expectations.node IS"
-         " 'The node''s id in capabilities_nodes.';"
-         " COMMENT ON COLUMN capabilities_node_session_expectations.capability IS"
-         " 'The device-bound capability the connection is of.';"
-         " COMMENT ON COLUMN capabilities_node_session_expectations.connection IS"
-         " 'The connection''s id within that capability.';"
-         " COMMENT ON COLUMN capabilities_node_session_expectations.expected IS"
-         " 'Whether a live session is expected there: true on, false off.';"
-         " COMMENT ON COLUMN capabilities_node_session_expectations.updated_at IS"
-         " 'When the owner last set it.';"
-         " COMMENT ON COLUMN capabilities_node_session_expectations.updated_by IS"
-         " 'Who set it, where the writer names itself.'"),
-        # Updates of a node. Its state row says whether a newer manager release,
-        # capability payload or contract library is available and what each
-        # brings, as the node's own manager last checked; the node's regular
-        # state write leaves those columns alone. Beside it, one row per update
-        # run of the node: asked for (requested), taken up (running) and its
-        # outcome. A run is the machine's, as its state row is, so it carries
-        # no project; the store holds at most one requested or running run per
-        # node, and each change raises the node's channel version so the node's
-        # manager takes a request up at once.
-        ("0032-node-updates",
-         "ALTER TABLE capabilities_node_states"
-         " ADD COLUMN update_available boolean,"
-         " ADD COLUMN update_offer jsonb,"
-         " ADD COLUMN update_checked_at timestamptz;"
-         " CREATE TABLE capabilities_node_updates ("
-         " id uuid PRIMARY KEY DEFAULT gen_random_uuid(),"
-         " node text NOT NULL"
-         "  REFERENCES capabilities_nodes (id) ON DELETE CASCADE ON UPDATE CASCADE,"
-         " state text NOT NULL DEFAULT 'requested' CHECK (state IN ('requested', 'running',"
-         "  'updated', 'current', 'rolled_back', 'failed')),"
-         " requested_at timestamptz NOT NULL DEFAULT now(),"
-         " requested_by text CHECK (requested_by <> ''),"
-         " started_at timestamptz,"
-         " finished_at timestamptz,"
-         " reason text CHECK (reason <> ''),"
-         " versions_before jsonb,"
-         " versions_after jsonb,"
-         " doctors jsonb,"
-         " CONSTRAINT capabilities_node_updates_started"
-         "  CHECK ((state = 'requested') = (started_at IS NULL)),"
-         " CONSTRAINT capabilities_node_updates_finished"
-         "  CHECK ((state IN ('requested', 'running')) = (finished_at IS NULL)),"
-         " CONSTRAINT capabilities_node_updates_why"
-         "  CHECK (state NOT IN ('rolled_back', 'failed') OR reason IS NOT NULL));"
-         " CREATE UNIQUE INDEX capabilities_node_updates_one_open"
-         "  ON capabilities_node_updates (node) WHERE state IN ('requested', 'running');"
-         " CREATE INDEX capabilities_node_updates_node"
-         "  ON capabilities_node_updates (node, requested_at DESC);"
-         " CREATE FUNCTION capabilities_node_updates_announce() RETURNS trigger AS $$"
-         " BEGIN"
-         "  IF to_regclass(format('%I.schema_channel', tg_table_schema)) IS NOT NULL THEN"
-         "   EXECUTE format('INSERT INTO %I.schema_channel AS c (channel, scope, version)"
-         " VALUES (%L, $1, 1) ON CONFLICT (channel, scope)"
-         " DO UPDATE SET version = c.version + 1',"
-         "                  tg_table_schema, 'capabilities_node_update') USING new.node;"
-         "  END IF;"
-         "  RETURN NULL;"
-         " END $$ LANGUAGE plpgsql;"
-         " CREATE TRIGGER capabilities_node_updates_changed"
-         "  AFTER INSERT OR UPDATE ON capabilities_node_updates"
-         "  FOR EACH ROW EXECUTE FUNCTION capabilities_node_updates_announce();"
-         " COMMENT ON COLUMN capabilities_node_states.update_available IS"
-         " 'Whether a newer manager release, capability payload or contract library is"
-         " available to the node, as its manager last checked; null until it has.';"
-         " COMMENT ON COLUMN capabilities_node_states.update_offer IS"
-         " 'What the node''s manager found newer at that check, as it reports it: per"
-         " component behind, the installed and available versions and the change-log"
-         " entries newer than installed.';"
-         " COMMENT ON COLUMN capabilities_node_states.update_checked_at IS"
-         " 'The store''s time of the check update_available and update_offer answer.';"
-         " COMMENT ON TABLE capabilities_node_updates IS"
-         " 'One row per update run of a node: asked for by anyone (requested), taken up"
-         " by the node''s own capabilities manager (running), and its outcome. The row"
-         " is the machine''s, as its row in capabilities_nodes is, so it carries no"
-         " project. At most one row per node is requested or running; each change"
-         " raises the version of channel capabilities_node_update for the node in"
-         " schema_channel.';"
-         " COMMENT ON COLUMN capabilities_node_updates.id IS"
-         " 'The run''s id, which the request answers.';"
-         " COMMENT ON COLUMN capabilities_node_updates.node IS"
-         " 'The node''s id in capabilities_nodes.';"
-         " COMMENT ON COLUMN capabilities_node_updates.state IS"
-         " 'requested (asked, not taken up), running, updated (something changed and"
-         " every placed service''s doctor answered), current (nothing to change),"
-         " rolled_back (a step or a doctor failed and the node runs what it ran before)"
-         " or failed (the run stopped, or could not return the node to what it ran"
-         " before).';"
-         " COMMENT ON COLUMN capabilities_node_updates.requested_at IS"
-         " 'When the run was asked for.';"
-         " COMMENT ON COLUMN capabilities_node_updates.requested_by IS"
-         " 'Who asked, where the writer names itself.';"
-         " COMMENT ON COLUMN capabilities_node_updates.started_at IS"
-         " 'When the node''s manager took the run up; null while requested.';"
-         " COMMENT ON COLUMN capabilities_node_updates.finished_at IS"
-         " 'When the run ended; null while requested or running.';"
-         " COMMENT ON COLUMN capabilities_node_updates.reason IS"
-         " 'Why it ended as it did, in words: the step or the doctor that failed, with"
-         " its message; required for rolled_back and failed.';"
-         " COMMENT ON COLUMN capabilities_node_updates.versions_before IS"
-         " 'What the node ran when the run started, as its manager reports it: the"
-         " manager release, each capability payload and each environment''s contract"
-         " library.';"
-         " COMMENT ON COLUMN capabilities_node_updates.versions_after IS"
-         " 'What the node runs when the run ended, in versions_before''s terms.';"
-         " COMMENT ON COLUMN capabilities_node_updates.doctors IS"
-         " 'The answers of the doctors of the services placed on the node, as its"
-         " manager reports them: after the update, and after a rollback.'"),
-        # What a node's log says lately, so it can be read without reaching the
-        # machine: per agent and source - the node's manager, or one service it
-        # places there - the last lines that process printed, bounded and with
-        # what reads as a secret masked by the store tier's one writer. Per
-        # agent, as a sign-in is, because a machine can run a manager under
-        # each of several OS users; a row outlives the process that wrote it,
-        # so the last words of a stopped service stay readable, and goes when
-        # the service is no longer placed on the node or the agent is no
-        # longer linked to it, or with the node.
-        ("0033-node-logs",
-         "CREATE TABLE capabilities_node_logs ("
-         " project_id text NOT NULL CHECK (project_id <> ''),"
-         " node text NOT NULL"
-         "  REFERENCES capabilities_nodes (id) ON DELETE CASCADE ON UPDATE CASCADE,"
-         " source text NOT NULL CHECK (source ~ '^[a-z][a-z0-9_-]*$'),"
-         " lines text[] NOT NULL DEFAULT '{}'"
-         "  CHECK (cardinality(lines) <= 100),"
-         " captured_at timestamptz NOT NULL DEFAULT now(),"
-         " PRIMARY KEY (project_id, node, source));"
-         " CREATE INDEX capabilities_node_logs_node ON capabilities_node_logs (node);"
-         " COMMENT ON TABLE capabilities_node_logs IS"
-         " 'Per agent, the last lines each process its node''s capabilities manager"
-         " runs there printed: the manager itself and each placed service''s"
-         " supervisor, with what the service wrote to stderr. Written by those"
-         " processes through the store tier, which keeps at most 100 lines of"
-         " at most 500 characters each and masks what reads as a secret.';"
-         " COMMENT ON COLUMN capabilities_node_logs.project_id IS"
-         " 'The agent the process runs for.';"
-         " COMMENT ON COLUMN capabilities_node_logs.node IS"
-         " 'The node''s id in capabilities_nodes.';"
-         " COMMENT ON COLUMN capabilities_node_logs.source IS"
-         " 'manager for the node''s manager (node run), else the capability whose"
-         " service the lines are of.';"
-         " COMMENT ON COLUMN capabilities_node_logs.lines IS"
-         " 'The source''s last lines, oldest first.';"
-         " COMMENT ON COLUMN capabilities_node_logs.captured_at IS"
-         " 'The store''s time of the write that last replaced the lines.'"),
-        # Why a connection's session is down on a node, in a closed set the
-        # node's manager derives from the capability's own connections answer:
-        # a required key that does not resolve there, naming each such key as
-        # the doctor gate names it, else the capability's word that the device
-        # session is missing or not signed in. A row with no reason is one
-        # whose capability states none, or one a manager from before this step
-        # wrote; a live session has none.
-        ("0034-node-session-reasons",
-         "ALTER TABLE capabilities_node_sessions"
-         " ADD COLUMN reason text"
-         "  CHECK (reason IN ('not_signed_in', 'session_missing', 'key_missing')),"
-         " ADD COLUMN reason_keys text[]"
-         "  CHECK (cardinality(reason_keys) > 0 AND array_position(reason_keys, NULL) IS NULL"
-         "   AND array_position(reason_keys, '') IS NULL),"
-         " ADD CONSTRAINT capabilities_node_sessions_reason_when_down"
-         "  CHECK (reason IS NULL OR NOT live),"
-         " ADD CONSTRAINT capabilities_node_sessions_keys_with_key_missing"
-         "  CHECK ((reason_keys IS NOT NULL) = coalesce(reason = 'key_missing', false));"
-         " COMMENT ON COLUMN capabilities_node_sessions.reason IS"
-         " 'Why the session is down on the node: key_missing (a key the connection"
-         " requires does not resolve there, named in reason_keys), session_missing (the"
-         " capability says no device session of the connection exists there) or"
-         " not_signed_in (one exists but is not signed in). Null where the session is"
-         " live, or where the capability states no reason.';"
-         " COMMENT ON COLUMN capabilities_node_sessions.reason_keys IS"
-         " 'The required keys that do not resolve on the node, as the capability''s"
-         " connections answer reports them; set exactly when reason is key_missing.'"),
-        # A node kept on record and taken out of service: a machine that is off,
-        # or a server superseded and kept for a while. Its row and everything
-        # naming it stay; nothing is placed on it and nothing is expected of it.
-        ("0035-node-disabled",
-         "ALTER TABLE capabilities_nodes ADD COLUMN disabled_at timestamptz;"
-         " COMMENT ON COLUMN capabilities_nodes.disabled_at IS"
-         " 'When the node was disabled (`capabilities node disable`): kept on record, but"
-         " nothing is placed on it, run on it or expected of it until it is enabled"
-         " again. Null for a node in service.'"),
-        # A connection's id is the name it was added under, which every grant,
-        # default pointer, node session, secret's env key and capability's own
-        # state already holds, so no reference is rewritten and the id never
-        # changes. What it is called is its label, changed at will; null shows
-        # the id. Within one capability no id or label is another row's id or
-        # label, so either one names exactly one connection.
-        ("0036-connection-label",
-         "ALTER TABLE capabilities_connections ADD COLUMN label text"
-         " CHECK (label <> '' AND label = btrim(label) AND label <> name);"
-         " CREATE UNIQUE INDEX capabilities_connections_label"
-         "  ON capabilities_connections (capability, label) WHERE label IS NOT NULL;"
-         " CREATE FUNCTION capabilities_connections_label() RETURNS trigger"
-         "  LANGUAGE plpgsql SET search_path FROM CURRENT AS $label$"
-         " BEGIN"
-         "  IF TG_OP = 'UPDATE' AND NEW.name IS DISTINCT FROM OLD.name THEN"
-         "   RAISE EXCEPTION '% connection % keeps its id; its label is what is renamed',"
-         "    OLD.capability, OLD.name USING ERRCODE = 'check_violation';"
-         "  END IF;"
-         "  PERFORM pg_advisory_xact_lock(hashtext('capabilities_connections:'"
-         "   || NEW.capability));"
-         "  IF EXISTS (SELECT 1 FROM capabilities_connections"
-         "   WHERE capability = NEW.capability AND name <> NEW.name"
-         "   AND (label = NEW.name OR name = NEW.label OR label = NEW.label)) THEN"
-         "   RAISE EXCEPTION '% connection % or its label % is already another"
-         " connection''s id or label', NEW.capability, NEW.name, NEW.label"
-         "    USING ERRCODE = 'unique_violation';"
-         "  END IF;"
-         "  RETURN NEW;"
-         " END $label$;"
-         " CREATE TRIGGER capabilities_connections_label"
-         "  BEFORE INSERT OR UPDATE OF name, label ON capabilities_connections"
-         "  FOR EACH ROW EXECUTE FUNCTION capabilities_connections_label();"
-         " COMMENT ON TABLE capabilities_connections IS"
-         " 'What a connection is: one row per (capability, name), name its id and label"
-         " what it is called, its spec the entry interior with secret references only. A"
-         " row is shared by the capability (owner null) or one agent''s own.';"
-         " COMMENT ON COLUMN capabilities_connections.name IS"
-         " 'The connection''s id: the name it was added under, never changed, and what"
-         " every grant, default pointer and node session holds.';"
-         " COMMENT ON COLUMN capabilities_connections.label IS"
-         " 'What the connection is called, set by `<capability> connection rename`; null"
-         " shows its id. No id or label of the capability is another row''s id or"
-         " label.'"),
-        # An agent's kind: an ordinary agent, or a system agent an app keeps
-        # on each machine for itself, whose identity and doctrine no edit
-        # changes. A system agent stays one, lives on one node, and a node
-        # holds at most one; system agents on different machines may share a
-        # slug, which no ordinary agent shares with any.
-        ("0037-agent-kind",
-         "ALTER TABLE capabilities_agents ADD COLUMN kind text NOT NULL DEFAULT 'agent'"
-         " CHECK (kind IN ('agent', 'system'));"
-         " DROP INDEX capabilities_agents_slug;"
-         " CREATE UNIQUE INDEX capabilities_agents_slug ON capabilities_agents (slug)"
-         "  WHERE kind = 'agent';"
-         " CREATE FUNCTION capabilities_agents_kind() RETURNS trigger"
-         "  LANGUAGE plpgsql SET search_path FROM CURRENT AS $kind$"
-         " BEGIN"
-         "  IF TG_OP = 'UPDATE' AND OLD.kind = 'system' AND NEW.kind <> 'system' THEN"
-         "   RAISE EXCEPTION 'agent % is a system agent and stays one', OLD.id"
-         "    USING ERRCODE = 'check_violation';"
-         "  END IF;"
-         "  PERFORM pg_advisory_xact_lock(hashtext('capabilities_agents:kind'));"
-         "  IF NEW.slug IS NOT NULL AND EXISTS (SELECT 1 FROM capabilities_agents"
-         "   WHERE slug = NEW.slug AND id <> NEW.id"
-         "   AND (kind = 'agent' OR NEW.kind = 'agent')) THEN"
-         "   RAISE EXCEPTION 'slug % is already another agent''s', NEW.slug"
-         "    USING ERRCODE = 'unique_violation';"
-         "  END IF;"
-         "  IF NEW.kind = 'system' AND (TG_OP = 'INSERT' OR OLD.kind <> 'system') THEN"
-         "   IF (SELECT count(*) FROM capabilities_agent_nodes WHERE agent_id = NEW.id) > 1 THEN"
-         "    RAISE EXCEPTION 'agent % lives on more than one node, and a system agent"
-         " lives on one', NEW.id USING ERRCODE = 'check_violation';"
-         "   END IF;"
-         "   IF EXISTS (SELECT 1 FROM capabilities_agent_nodes l"
-         "    JOIN capabilities_agent_nodes o ON o.node = l.node AND o.agent_id <> l.agent_id"
-         "    JOIN capabilities_agents a ON a.id = o.agent_id AND a.kind = 'system'"
-         "    WHERE l.agent_id = NEW.id) THEN"
-         "    RAISE EXCEPTION 'the node of agent % already holds a system agent', NEW.id"
-         "     USING ERRCODE = 'unique_violation';"
-         "   END IF;"
-         "  END IF;"
-         "  RETURN NEW;"
-         " END $kind$;"
-         " CREATE TRIGGER capabilities_agents_kind"
-         "  BEFORE INSERT OR UPDATE OF kind, slug ON capabilities_agents"
-         "  FOR EACH ROW EXECUTE FUNCTION capabilities_agents_kind();"
-         " CREATE FUNCTION capabilities_agent_nodes_system() RETURNS trigger"
-         "  LANGUAGE plpgsql SET search_path FROM CURRENT AS $system$"
-         " BEGIN"
-         "  IF NOT EXISTS (SELECT 1 FROM capabilities_agents"
-         "   WHERE id = NEW.agent_id AND kind = 'system') THEN"
-         "   RETURN NEW;"
-         "  END IF;"
-         "  PERFORM pg_advisory_xact_lock(hashtext('capabilities_agents:kind'));"
-         "  IF EXISTS (SELECT 1 FROM capabilities_agent_nodes"
-         "   WHERE agent_id = NEW.agent_id AND node <> NEW.node"
-         "   AND (TG_OP = 'INSERT' OR node <> OLD.node)) THEN"
-         "   RAISE EXCEPTION 'agent % is a system agent, which lives on one node',"
-         "    NEW.agent_id USING ERRCODE = 'check_violation';"
-         "  END IF;"
-         "  IF EXISTS (SELECT 1 FROM capabilities_agent_nodes l"
-         "   JOIN capabilities_agents a ON a.id = l.agent_id AND a.kind = 'system'"
-         "   WHERE l.node = NEW.node AND l.agent_id <> NEW.agent_id) THEN"
-         "   RAISE EXCEPTION 'node % already holds a system agent', NEW.node"
-         "    USING ERRCODE = 'unique_violation';"
-         "  END IF;"
-         "  RETURN NEW;"
-         " END $system$;"
-         " CREATE TRIGGER capabilities_agent_nodes_system"
-         "  BEFORE INSERT OR UPDATE OF agent_id, node ON capabilities_agent_nodes"
-         "  FOR EACH ROW EXECUTE FUNCTION capabilities_agent_nodes_system();"
-         " COMMENT ON COLUMN capabilities_agents.kind IS"
-         " 'agent: an ordinary agent; system: an agent an app keeps on one machine for"
-         " itself (capabilities init --system), whose name, identity and doctrine the"
-         " manager refuses to change and which agent lists for people leave out. A"
-         " system agent stays one, lives on one node, and a node holds at most one.';"
-         " COMMENT ON COLUMN capabilities_agents.slug IS"
-         " 'The agent''s short technical name: lowercase letters, digits and hyphens. No"
-         " two ordinary agents share one, and no ordinary agent shares one with a system"
-         " agent; system agents on different nodes may share one. It names the agent''s"
-         " state directories, service log lines and --project shorthand; null while it"
-         " has none, where the id stands in.'"),
-        # Each agent's public sealing key, derived from its key and published
-        # beside the key's fingerprint, so a writer that holds no key of the
-        # agent's - another agent writing a shared connection's secret for
-        # each of its grantees - seals a value only that key opens. A key that
-        # changes leaves the public key of the one before unpublished, so no
-        # writer seals for a key the agent no longer holds.
-        ("0038-agent-public-key",
-         "ALTER TABLE capabilities_agents ADD COLUMN vault_public_key text"
-         " CHECK (vault_public_key ~ '^[A-Za-z0-9_-]{43}$'),"
-         " ADD CONSTRAINT capabilities_agents_vault_public_key"
-         "  CHECK (vault_public_key IS NULL OR vault_key IS NOT NULL);"
-         " CREATE FUNCTION capabilities_agents_vault_public_key() RETURNS trigger"
-         "  LANGUAGE plpgsql AS $public$"
-         " BEGIN"
-         "  IF NEW.vault_key IS DISTINCT FROM OLD.vault_key"
-         "   AND NEW.vault_public_key IS NOT DISTINCT FROM OLD.vault_public_key THEN"
-         "   NEW.vault_public_key := NULL;"
-         "  END IF;"
-         "  RETURN NEW;"
-         " END $public$;"
-         " CREATE TRIGGER capabilities_agents_vault_public_key"
-         "  BEFORE UPDATE OF vault_key ON capabilities_agents"
-         "  FOR EACH ROW EXECUTE FUNCTION capabilities_agents_vault_public_key();"
-         " COMMENT ON COLUMN capabilities_agents.vault_public_key IS"
-         " 'The agent''s public sealing key: the X25519 public key its encryption key"
-         " gives, URL-safe base64 of 32 bytes, never the key; null until a command"
-         " using the key publishes it, and again once vault_key changes without it.';"
-         " COMMENT ON TABLE capabilities_vault IS"
-         " 'Each agent''s vault: one row per named secret, sealed with XChaCha20-Poly1305"
-         " under the agent''s own key (AGENT_ENCRYPTION_KEY, kept in the agent''s"
-         " environment and never here), or for the agent''s public sealing key"
-         " (capabilities_agents.vault_public_key) by a writer that holds no key of the"
-         " agent''s, such as another grantee writing a shared connection''s secret; the"
-         " agent id and the name bound as associated data either way, and only the"
-         " agent''s key opens it. Written by the capabilities manager''s secrets verbs"
-         " and the capabilities'' connection verbs.';"
-         " COMMENT ON COLUMN capabilities_vault.ciphertext IS"
-         " 'A format byte, then for format 1 the 24-byte nonce, for format 2 the 32-byte"
-         " ephemeral X25519 public key and the 24-byte nonce, then the ciphertext with"
-         " its tag.';"
-         " COMMENT ON COLUMN capabilities_vault.key_fingerprint IS"
-         " 'The fingerprint of the agent key the value opens under, whoever sealed it;"
-         " a row whose fingerprint is not the agent''s vault_key is unreadable.'"),
-    ]
+def record_table_steps() -> list[Any]:
+    """The migration steps of the contract's tables: the core's (`db.CORE_STEPS`),
+    owner STORE_OWNER at STORE_TABLES_VERSION, each a `db.Step` that keeps the
+    major it raises the core to. The steps they had as owner `capabilities`, up
+    to 1.23, are history the core's first step replays where a store has not
+    applied them (`capabilities_contract.db._legacy`)."""
+    from capabilities_contract.db import _migrate
+    return list(_migrate.CORE_STEPS)
 
 
 def service_instance_put(conn: Any, project_id: str, capability: str, node: str, *,
@@ -1774,11 +417,11 @@ def service_instance_put(conn: Any, project_id: str, capability: str, node: str,
         return value[-SERVICE_INSTANCE_TEXT_CHARS:] or None
 
     conn.execute(
-        "INSERT INTO capabilities_service_instances AS i (project_id, capability, node,"
+        "INSERT INTO service_instances AS i (agent_id, capability, node,"
         " state, problem, problem_code, payload_sha256, pid, host, started_at,"
         " last_exit_code, last_error, last_error_at, skipped_settings)"
         " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)"
-        " ON CONFLICT (project_id, capability, node) DO UPDATE SET"
+        " ON CONFLICT (agent_id, capability, node) DO UPDATE SET"
         " state = EXCLUDED.state, problem = EXCLUDED.problem,"
         " problem_code = EXCLUDED.problem_code, payload_sha256 = EXCLUDED.payload_sha256,"
         " pid = EXCLUDED.pid, host = EXCLUDED.host, started_at = EXCLUDED.started_at,"
@@ -1794,8 +437,8 @@ def service_instance_drop(conn: Any, project_id: str, capability: str, node: str
     """Delete the row once `node` no longer supervises `capability` for the
     project; whether there was one."""
     return bool(conn.execute(
-        "DELETE FROM capabilities_service_instances"
-        " WHERE project_id = %s AND capability = %s AND node = %s",
+        "DELETE FROM service_instances"
+        " WHERE agent_id = %s AND capability = %s AND node = %s",
         (project_id, capability, node)).rowcount)
 
 
@@ -1844,7 +487,7 @@ def node_state_put(conn: Any, node: str, *, load: Sequence[float] | None = None,
               disk_total_bytes, booted_at, _node_text(boot_line), _node_text(image_version)]
     written = NODE_STATE_COLUMNS[:-2]
     row = conn.execute(
-        f"INSERT INTO capabilities_node_states (node, {', '.join(written)}, reported_at,"
+        f"INSERT INTO node_states (node, {', '.join(written)}, reported_at,"
         " fresh_until) VALUES (%s, " + ", ".join(["%s"] * len(written))
         + ", now(), now() + make_interval(secs => %s))"
         " ON CONFLICT (node) DO UPDATE SET "
@@ -1882,9 +525,9 @@ def node_logins_put(conn: Any, project_id: str, node: str,
         values += [tool in needed for tool in NODE_STATE_TOOLS]
         columns += NODE_LOGIN_NEED_COLUMNS
     conn.execute(
-        "INSERT INTO capabilities_node_logins (project_id, node, "
+        "INSERT INTO node_logins (agent_id, node, "
         f"{', '.join(columns)}, checked_at) VALUES (%s, %s, " + ", ".join(["%s"] * len(columns))
-        + ", now()) ON CONFLICT (project_id, node) DO UPDATE SET "
+        + ", now()) ON CONFLICT (agent_id, node) DO UPDATE SET "
         + ", ".join(f"{column} = EXCLUDED.{column}" for column in (*columns, "checked_at")),
         (project_id, node, *values))
 
@@ -1909,11 +552,11 @@ def node_sessions_put(conn: Any, project_id: str, node: str, capability: str,
             raise StoreError("bad_state", "a session names the keys that do not resolve"
                              " exactly when its reason is key_missing")
         rows.append((connection, bool(live), _node_text(account), reason, keys))
-    conn.execute("DELETE FROM capabilities_node_sessions"
-                 " WHERE project_id = %s AND node = %s AND capability = %s",
+    conn.execute("DELETE FROM node_sessions"
+                 " WHERE agent_id = %s AND node = %s AND capability = %s",
                  (project_id, node, capability))
     for connection, live, account, reason, keys in rows:
-        conn.execute("INSERT INTO capabilities_node_sessions (project_id, node, capability,"
+        conn.execute("INSERT INTO node_sessions (agent_id, node, capability,"
                      " connection, live, account, reason, reason_keys)"
                      " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                      (project_id, node, capability, connection, live, account, reason, keys))
@@ -1929,15 +572,15 @@ def node_agents_prune(conn: Any, node: str, asked: Sequence[str],
     many rows went."""
     projects = [project for project, _capability in kept]
     capabilities = [capability for _project, capability in kept]
-    unlinked = (" NOT EXISTS (SELECT 1 FROM capabilities_agent_nodes l"
-                "  WHERE l.agent_id = t.project_id AND l.node = t.node)")
+    unlinked = (" NOT EXISTS (SELECT 1 FROM agent_nodes l"
+                "  WHERE l.agent_id = t.agent_id AND l.node = t.node)")
     gone = conn.execute(
-        "DELETE FROM capabilities_node_sessions t WHERE t.node = %s AND ((t.project_id = ANY (%s)"
-        " AND NOT EXISTS (SELECT 1 FROM unnest(%s::text[], %s::text[]) AS k (project_id,"
-        " capability) WHERE k.project_id = t.project_id AND k.capability = t.capability))"
+        "DELETE FROM node_sessions t WHERE t.node = %s AND ((t.agent_id = ANY (%s)"
+        " AND NOT EXISTS (SELECT 1 FROM unnest(%s::text[], %s::text[]) AS k (agent_id,"
+        " capability) WHERE k.agent_id = t.agent_id AND k.capability = t.capability))"
         " OR" + unlinked + ")",
         (node, list(asked), projects, capabilities)).rowcount
-    for table in ("capabilities_node_logins", "capabilities_node_logs"):
+    for table in ("node_logins", "node_logs"):
         gone += conn.execute(f"DELETE FROM {table} t WHERE t.node = %s AND" + unlinked,
                              (node,)).rowcount
     return gone
@@ -1951,7 +594,7 @@ def node_states(conn: Any, nodes: Sequence[str]) -> list[dict[str, Any]]:
     columns = (*NODE_STATE_COLUMNS, *NODE_UPDATE_OFFER_COLUMNS)
     found = conn.execute(
         f"SELECT node, {', '.join(columns)}, fresh_until > now(),"
-        " extract(epoch FROM now() - booted_at) FROM capabilities_node_states"
+        " extract(epoch FROM now() - booted_at) FROM node_states"
         " WHERE node = ANY (%s) ORDER BY node", (list(nodes),)).fetchall()
     out = []
     for row in found:
@@ -1969,8 +612,8 @@ def node_logins(conn: Any, project_id: str, nodes: Sequence[str]) -> list[dict[s
     when that was asked. A node with no row for the project is not answered."""
     columns = ("node", *NODE_LOGIN_COLUMNS, *NODE_LOGIN_NEED_COLUMNS, "checked_at")
     found = conn.execute(
-        f"SELECT {', '.join(columns)} FROM capabilities_node_logins"
-        " WHERE project_id = %s AND node = ANY (%s) ORDER BY node",
+        f"SELECT {', '.join(columns)} FROM node_logins"
+        " WHERE agent_id = %s AND node = ANY (%s) ORDER BY node",
         (project_id, list(nodes))).fetchall()
     return [dict(zip(columns, row, strict=True)) for row in found]
 
@@ -1978,8 +621,8 @@ def node_logins(conn: Any, project_id: str, nodes: Sequence[str]) -> list[dict[s
 def node_sessions(conn: Any, project_id: str, nodes: Sequence[str]) -> list[dict[str, Any]]:
     """The project's sessions on `nodes`, by node, capability and connection."""
     found = conn.execute(
-        f"SELECT {', '.join(NODE_SESSION_COLUMNS)} FROM capabilities_node_sessions"
-        " WHERE project_id = %s AND node = ANY (%s) ORDER BY node, capability, connection",
+        f"SELECT {', '.join(NODE_SESSION_COLUMNS)} FROM node_sessions"
+        " WHERE agent_id = %s AND node = ANY (%s) ORDER BY node, capability, connection",
         (project_id, list(nodes))).fetchall()
     return [dict(zip(NODE_SESSION_COLUMNS, row, strict=True)) for row in found]
 
@@ -2029,8 +672,8 @@ def node_log_put(conn: Any, project_id: str, node: str, source: str,
         line = " ".join(str(line).replace("\x00", "").splitlines()).rstrip()
         kept.append(node_log_mask(line, secrets)[:NODE_LOG_LINE_CHARS])
     row = conn.execute(
-        "INSERT INTO capabilities_node_logs (project_id, node, source, lines)"
-        " VALUES (%s, %s, %s, %s) ON CONFLICT (project_id, node, source) DO UPDATE SET"
+        "INSERT INTO node_logs (agent_id, node, source, lines)"
+        " VALUES (%s, %s, %s, %s) ON CONFLICT (agent_id, node, source) DO UPDATE SET"
         " lines = EXCLUDED.lines, captured_at = now() RETURNING captured_at",
         (project_id, node, source, kept)).fetchone()
     return {"lines": len(kept), "captured_at": row[0]}
@@ -2040,7 +683,7 @@ def node_logs_prune(conn: Any, project_id: str, node: str, sources: Sequence[str
     """Delete the project's log lines on `node` of every source not in
     `sources`: a service no longer placed there. Answers how many rows went."""
     return conn.execute(
-        "DELETE FROM capabilities_node_logs WHERE project_id = %s AND node = %s"
+        "DELETE FROM node_logs WHERE agent_id = %s AND node = %s"
         " AND NOT (source = ANY (%s))", (project_id, node, list(sources))).rowcount
 
 
@@ -2048,8 +691,8 @@ def node_logs(conn: Any, project_id: str, nodes: Sequence[str]) -> list[dict[str
     """The project's last log lines on `nodes`, by node and source:
     {node, source, lines, captured_at}."""
     found = conn.execute(
-        f"SELECT {', '.join(NODE_LOG_COLUMNS)} FROM capabilities_node_logs"
-        " WHERE project_id = %s AND node = ANY (%s) ORDER BY node, source",
+        f"SELECT {', '.join(NODE_LOG_COLUMNS)} FROM node_logs"
+        " WHERE agent_id = %s AND node = ANY (%s) ORDER BY node, source",
         (project_id, list(nodes))).fetchall()
     return [dict(zip(NODE_LOG_COLUMNS, row, strict=True)) for row in found]
 
@@ -2072,11 +715,11 @@ def node_expectation_set(conn: Any, project_id: str, node: str, *,
     if expected is not None and not isinstance(expected, bool):
         raise StoreError("bad_state", "an expectation is true, false or none")
     if tool is not None:
-        table, keys, key_values = ("capabilities_node_login_expectations", ("tool",), (tool,))
+        table, keys, key_values = ("node_login_expectations", ("tool",), (tool,))
     else:
-        table, keys, key_values = ("capabilities_node_session_expectations",
+        table, keys, key_values = ("node_session_expectations",
                                    ("capability", "connection"), (capability, connection))
-    where = " AND ".join(f"{column} = %s" for column in ("project_id", "node", *keys))
+    where = " AND ".join(f"{column} = %s" for column in ("agent_id", "node", *keys))
     params = (project_id, node, *key_values)
     row = conn.execute(f"SELECT expected FROM {table} WHERE {where} FOR UPDATE",
                        params).fetchone()
@@ -2086,9 +729,9 @@ def node_expectation_set(conn: Any, project_id: str, node: str, *,
             conn.execute(f"DELETE FROM {table} WHERE {where}", params)
     elif before != expected:
         conn.execute(
-            f"INSERT INTO {table} (project_id, node, {', '.join(keys)}, expected, updated_by)"
+            f"INSERT INTO {table} (agent_id, node, {', '.join(keys)}, expected, updated_by)"
             f" VALUES (%s, %s, {', '.join(['%s'] * len(keys))}, %s, %s)"
-            f" ON CONFLICT (project_id, node, {', '.join(keys)}) DO UPDATE SET"
+            f" ON CONFLICT (agent_id, node, {', '.join(keys)}) DO UPDATE SET"
             " expected = EXCLUDED.expected, updated_at = now(),"
             " updated_by = EXCLUDED.updated_by",
             (*params, expected, _node_text(by)))
@@ -2101,13 +744,13 @@ def node_expectations(conn: Any, project_id: str,
     expected, updated_at, updated_by}], sessions [{node, capability,
     connection, expected, updated_at, updated_by}]}."""
     out: dict[str, list[dict[str, Any]]] = {}
-    for kind, table, keys in (("sign_ins", "capabilities_node_login_expectations", ("tool",)),
-                              ("sessions", "capabilities_node_session_expectations",
+    for kind, table, keys in (("sign_ins", "node_login_expectations", ("tool",)),
+                              ("sessions", "node_session_expectations",
                                ("capability", "connection"))):
         columns = ("node", *keys, *NODE_EXPECTATION_COLUMNS)
         found = conn.execute(
             f"SELECT {', '.join(columns)} FROM {table}"
-            " WHERE project_id = %s AND node = ANY (%s)"
+            " WHERE agent_id = %s AND node = ANY (%s)"
             f" ORDER BY node, {', '.join(keys)}", (project_id, list(nodes))).fetchall()
         out[kind] = [dict(zip(columns, row, strict=True)) for row in found]
     return out
@@ -2123,7 +766,7 @@ def node_update_offer_put(conn: Any, node: str, *, available: bool,
     if not isinstance(available, bool):
         raise StoreError("bad_state", "an update is available or it is not: true or false")
     row = conn.execute(
-        "UPDATE capabilities_node_states SET update_available = %s,"
+        "UPDATE node_states SET update_available = %s,"
         " update_offer = %s::jsonb, update_checked_at = now() WHERE node = %s"
         " RETURNING update_available, update_checked_at",
         (available, None if offer is None else json.dumps(offer, ensure_ascii=False,
@@ -2137,7 +780,7 @@ def _node_update_row(row: Sequence[Any] | None) -> dict[str, Any] | None:
 
 def _node_update_open(conn: Any, node: str) -> dict[str, Any] | None:
     return _node_update_row(conn.execute(
-        f"SELECT {', '.join(NODE_UPDATE_COLUMNS)} FROM capabilities_node_updates"
+        f"SELECT {', '.join(NODE_UPDATE_COLUMNS)} FROM node_updates"
         " WHERE node = %s AND state IN ('requested', 'running')", (node,)).fetchone())
 
 
@@ -2146,7 +789,7 @@ def node_update_request(conn: Any, node: str, *, by: str | None = None) -> dict[
     up. Refused with update_pending, naming the open run, where one is
     already requested or running for the node. Answers the row."""
     row = conn.execute(
-        "INSERT INTO capabilities_node_updates (node, requested_by) VALUES (%s, %s)"
+        "INSERT INTO node_updates (node, requested_by) VALUES (%s, %s)"
         " ON CONFLICT (node) WHERE state IN ('requested', 'running') DO NOTHING"
         f" RETURNING {', '.join(NODE_UPDATE_COLUMNS)}", (node, _node_text(by))).fetchone()
     if row is None:
@@ -2167,17 +810,17 @@ def node_update_claim(conn: Any, node: str, *, by: str | None = None,
     requested run is marked running, or, with none requested, a running row
     of its own is made. Answers {run, interrupted [ids]}."""
     closed = [found[0] for found in conn.execute(
-        "UPDATE capabilities_node_updates SET state = 'failed', finished_at = now(),"
+        "UPDATE node_updates SET state = 'failed', finished_at = now(),"
         " reason = %s WHERE node = %s AND state = 'running' RETURNING id",
         (_node_text(interrupted), node)).fetchall()]
     row = conn.execute(
-        "UPDATE capabilities_node_updates SET state = 'running', started_at = now()"
-        " WHERE id = (SELECT id FROM capabilities_node_updates WHERE node = %s"
+        "UPDATE node_updates SET state = 'running', started_at = now()"
+        " WHERE id = (SELECT id FROM node_updates WHERE node = %s"
         "  AND state = 'requested' FOR UPDATE)"
         f" RETURNING {', '.join(NODE_UPDATE_COLUMNS)}", (node,)).fetchone()
     if row is None:
         row = conn.execute(
-            "INSERT INTO capabilities_node_updates (node, state, requested_by, started_at)"
+            "INSERT INTO node_updates (node, state, requested_by, started_at)"
             " VALUES (%s, 'running', %s, now())"
             f" RETURNING {', '.join(NODE_UPDATE_COLUMNS)}", (node, _node_text(by))).fetchone()
     return {"run": _node_update_row(row), "interrupted": closed}
@@ -2202,7 +845,7 @@ def node_update_finish(conn: Any, run_id: Any, *, state: str, reason: str | None
     def jsonb(value: Any) -> str | None:
         return None if value is None else json.dumps(value, ensure_ascii=False, default=str)
     return _node_update_row(conn.execute(
-        "UPDATE capabilities_node_updates SET state = %s, finished_at = now(), reason = %s,"
+        "UPDATE node_updates SET state = %s, finished_at = now(), reason = %s,"
         " versions_before = %s::jsonb, versions_after = %s::jsonb, doctors = %s::jsonb"
         " WHERE id = %s AND state = 'running'"
         f" RETURNING {', '.join(NODE_UPDATE_COLUMNS)}",
@@ -2216,7 +859,7 @@ def node_updates(conn: Any, nodes: Sequence[str]) -> list[dict[str, Any]]:
     answered."""
     found = conn.execute(
         f"SELECT DISTINCT ON (node) {', '.join(NODE_UPDATE_COLUMNS)}"
-        " FROM capabilities_node_updates WHERE node = ANY (%s)"
+        " FROM node_updates WHERE node = ANY (%s)"
         " ORDER BY node, requested_at DESC, id", (list(nodes),)).fetchall()
     return [_node_update_row(row) for row in found]
 
@@ -2304,7 +947,7 @@ def _document_key(prefix: str | None, stem: str) -> str:
 
 # --- references in the store -----------------------------------------------------
 #
-# A project's references may be rows of `capabilities_references` rather than
+# A project's references may be rows of `reference_versions` rather than
 # files: one row per version, keyed by project, capability and name, the body
 # every byte of the file. A reference with an active version is read from
 # there before any file; where the store holds none, or no store answers, the
@@ -2338,7 +981,7 @@ def stored_references(conn: Any, project_id: str,
     """The active version of each reference the store holds for the project,
     of one capability or of all, ordered by capability and name."""
     query = (f"SELECT {_REFERENCE_COLUMNS} FROM {STORE_REFERENCES_TABLE} "
-             "WHERE project_id = %s AND active")
+             "WHERE agent_id = %s AND active")
     params: list[Any] = [project_id]
     if capability is not None:
         query += " AND capability = %s"
@@ -2352,7 +995,7 @@ def reference_history(conn: Any, project_id: str, capability: str,
     """Every version of one reference, newest first."""
     rows = conn.execute(
         f"SELECT {_REFERENCE_COLUMNS} FROM {STORE_REFERENCES_TABLE} "
-        "WHERE project_id = %s AND capability = %s "
+        "WHERE agent_id = %s AND capability = %s "
         "AND lower(replace(name, '_', '-')) = %s ORDER BY created_at DESC, id",
         (project_id, capability, reference_key(name)[len(REFERENCE_DOCUMENT_PREFIX) + 1:])
     ).fetchall()
@@ -2412,7 +1055,7 @@ def reference_save(conn: Any, project_id: str, capability: str, name: str, body:
         conn.execute(f"UPDATE {STORE_REFERENCES_TABLE} SET active = false WHERE id = %s",
                      (active["version"],))
     [(vid,)] = conn.execute(
-        f"INSERT INTO {STORE_REFERENCES_TABLE} (project_id, capability, name, body, "
+        f"INSERT INTO {STORE_REFERENCES_TABLE} (agent_id, capability, name, body, "
         "created_by, note) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
         (project_id, capability, name, body, author, note)).fetchall()
     return {"version": str(vid), "changed": True,
@@ -2522,7 +1165,7 @@ class FileRecords(Records):
         # where its database resolves; set by `open_records` alone.
         self._guard_agent: str | None = None
         self._guard_root: Path | None = None
-        self._guard_application = STORE_OWNER
+        self._guard_application = STORE_APPLICATION
         self.actor: str | None = None
 
     # Where the global layer's connections, grants, default pointer and policy
@@ -2538,7 +1181,7 @@ class FileRecords(Records):
 
     def _global_rows(self, write: bool = False) -> "GlobalRows | None":
         """The store's rows for every agent where they are in force - a
-        database resolves and `capabilities_global.global_migrated_at` is
+        database resolves and `store_state.global_migrated_at` is
         set - else None, and the config home's files are the global layer as
         before. A configured store that does not answer leaves a read on the
         files and refuses a write (`write`), which would otherwise land in a
@@ -3248,7 +1891,7 @@ class StoreRecords(FileRecords):
     def __init__(self, envelope: Path, global_dir: Path,
                  project_id: str | None = None, project: str | None = None,
                  include_global: bool = True, project_root: Path | None = None,
-                 application_name: str = STORE_OWNER, connection: Any = None,
+                 application_name: str = STORE_APPLICATION, connection: Any = None,
                  schema: str | None = None, held: str = RECORDS_MODE_KEY):
         super().__init__(envelope, global_dir, project_id, project, include_global)
         if held not in STORE_COLLECTIONS:
@@ -3525,7 +2168,7 @@ class StoreRecords(FileRecords):
         held = self._fresh(key)
         if held is None:
             statements: list[tuple[str, Sequence[Any]]] = [(
-                "SELECT name, spec FROM capabilities_connections "
+                "SELECT name, spec FROM connections "
                 "WHERE capability = %s ORDER BY name", (capability,))]
             # The agent's sealed secrets ride in the same round trip, so the
             # cascade's last tier asks the store nothing more.
@@ -3551,7 +2194,7 @@ class StoreRecords(FileRecords):
             if self.project_id:
                 rows = self._read(
                     "SELECT connection, node, enabled, allow_write, is_default "
-                    "FROM capabilities_connection_grants "
+                    "FROM grants "
                     "WHERE agent_id = %s AND capability = %s "
                     "AND (node IS NULL OR node = %s) "
                     "ORDER BY connection, node NULLS LAST",
@@ -3568,7 +2211,7 @@ class StoreRecords(FileRecords):
         """The agent whose own connection this is; None for a shared one."""
         _store_check("capability", capability, CAPABILITY_RE)
         rows = self._read(
-            "SELECT owner FROM capabilities_connections WHERE capability = %s "
+            "SELECT owner_agent_id FROM connections WHERE capability = %s "
             "AND name = %s", (capability, connection))
         return rows[0][0] if rows else None
 
@@ -3579,12 +2222,12 @@ class StoreRecords(FileRecords):
         holds no such row - an agent's own, or none."""
         _store_check("capability", capability, CAPABILITY_RE)
         rows = self._read(
-            "SELECT owner IS NULL FROM capabilities_connections WHERE capability = %s "
+            "SELECT owner_agent_id IS NULL FROM connections WHERE capability = %s "
             "AND name = %s", (capability, connection))
         if not rows or not rows[0][0]:
             return None
         found = self._read(
-            "SELECT DISTINCT agent_id FROM capabilities_connection_grants "
+            "SELECT DISTINCT agent_id FROM grants "
             "WHERE capability = %s AND connection = %s AND enabled "
             "AND agent_id IS NOT NULL ORDER BY agent_id", (capability, connection))
         return [agent for (agent,) in found]
@@ -3594,7 +2237,7 @@ class StoreRecords(FileRecords):
         if "grant" not in self.collections:
             return []
         rows = self._read(
-            "SELECT DISTINCT agent_id FROM capabilities_connection_grants "
+            "SELECT DISTINCT agent_id FROM grants "
             "WHERE capability = %s AND connection = %s AND enabled "
             "AND agent_id IS NOT NULL ORDER BY agent_id", (capability, connection))
         return [agent for (agent,) in rows]
@@ -3623,7 +2266,7 @@ class StoreRecords(FileRecords):
             rows = self._read(
                 "SELECT agent_id, label, value, note, updated_at, "
                 "to_jsonb(i) ->> 'node' "
-                "FROM capabilities_identifiers i "
+                "FROM identifiers i "
                 "WHERE capability = %s AND (agent_id IS NULL OR agent_id = %s) "
                 "ORDER BY label", (capability, self.project_id))
             for agent_id, label, value, note, updated_at, node in rows:
@@ -3643,7 +2286,7 @@ class StoreRecords(FileRecords):
             found: dict[tuple[str, str | None], dict[str, tuple]] = {}
             rows = self._read(
                 "SELECT agent_id, capability, node, enabled, updated_at, service "
-                "FROM capabilities_policy "
+                "FROM policies "
                 "WHERE (agent_id IS NULL OR agent_id = %s) "
                 "AND (node IS NULL OR node = %s) ORDER BY capability",
                 (self.project_id, self.node))
@@ -3806,7 +2449,7 @@ class StoreRecords(FileRecords):
         row that exists keeps its owner, and one another agent owns is refused.
         With `change` false an existing row is left as it is."""
         added = conn.execute(
-            "INSERT INTO capabilities_connections (capability, name, spec, owner) "
+            "INSERT INTO connections (capability, name, spec, owner_agent_id) "
             "VALUES (%s, %s, %s::jsonb, %s) ON CONFLICT (capability, name) DO NOTHING",
             (capability, cid, json.dumps(spec, ensure_ascii=False),
              agent if own else None)).rowcount
@@ -3815,7 +2458,7 @@ class StoreRecords(FileRecords):
         if not change:
             return False
         (held,) = conn.execute(
-            "SELECT owner FROM capabilities_connections WHERE capability = %s "
+            "SELECT owner_agent_id FROM connections WHERE capability = %s "
             "AND name = %s FOR UPDATE", (capability, cid)).fetchone()
         if held is not None and held != agent:
             raise StoreError("connection_owned",
@@ -3824,7 +2467,7 @@ class StoreRecords(FileRecords):
                              "change it in that agent's project, or add a connection "
                              "of this agent's own under another id")
         conn.execute(
-            "UPDATE capabilities_connections SET spec = %s::jsonb "
+            "UPDATE connections SET spec = %s::jsonb "
             "WHERE capability = %s AND name = %s",
             (json.dumps(spec, ensure_ascii=False), capability, cid))
         return False
@@ -3834,7 +2477,7 @@ class StoreRecords(FileRecords):
         """Remove a connection with its grants; whether it was there. One
         another agent owns is refused."""
         row = conn.execute(
-            "SELECT owner FROM capabilities_connections WHERE capability = %s "
+            "SELECT owner_agent_id FROM connections WHERE capability = %s "
             "AND name = %s FOR UPDATE", (capability, cid)).fetchone()
         if row is None:
             return False
@@ -3844,7 +2487,7 @@ class StoreRecords(FileRecords):
                              "so only that agent removes it",
                              "remove it in that agent's project")
         return conn.execute(
-            "DELETE FROM capabilities_connections WHERE capability = %s AND name = %s",
+            "DELETE FROM connections WHERE capability = %s AND name = %s",
             (capability, cid)).rowcount > 0
 
     def connection_labels(self, capability: str) -> dict[str, str]:
@@ -3854,7 +2497,7 @@ class StoreRecords(FileRecords):
         if held is None:
             # Read through the row, so a store from before labels reads none.
             rows = self._read(
-                "SELECT c.name, to_jsonb(c) ->> 'label' FROM capabilities_connections c "
+                "SELECT c.name, to_jsonb(c) ->> 'label' FROM connections c "
                 "WHERE c.capability = %s", (capability,))
             held = {name: label for name, label in rows if label}
             self._cache[key] = (time.monotonic(), held)
@@ -3868,7 +2511,7 @@ class StoreRecords(FileRecords):
         is refused by the store."""
         import psycopg
         row = conn.execute(
-            "SELECT owner FROM capabilities_connections WHERE capability = %s "
+            "SELECT owner_agent_id FROM connections WHERE capability = %s "
             "AND name = %s FOR UPDATE", (capability, cid)).fetchone()
         if row is None:
             raise StoreError("unknown_connection",
@@ -3882,7 +2525,7 @@ class StoreRecords(FileRecords):
         try:
             with conn.transaction():
                 conn.execute(
-                    "UPDATE capabilities_connections SET label = %s "
+                    "UPDATE connections SET label = %s "
                     "WHERE capability = %s AND name = %s",
                     (None if label in (None, cid) else label, capability, cid))
         except psycopg.errors.UniqueViolation:
@@ -3905,7 +2548,7 @@ class StoreRecords(FileRecords):
                              "this project has no id a grant could name",
                              "run `capabilities init` in the project")
         known = conn.execute(
-            "SELECT 1 FROM capabilities_connections WHERE capability = %s AND name = %s",
+            "SELECT 1 FROM connections WHERE capability = %s AND name = %s",
             (capability, cid)).fetchone()
         if known is None:
             raise StoreError("unknown_connection",
@@ -3914,7 +2557,7 @@ class StoreRecords(FileRecords):
                              f"connection {cid} '{{...}}'`")
         if fields.get("is_default"):
             conn.execute(
-                "UPDATE capabilities_connection_grants SET is_default = false "
+                "UPDATE grants SET is_default = false "
                 "WHERE agent_id = %s AND capability = %s AND connection <> %s "
                 "AND coalesce(node, '') = coalesce(%s, '') AND is_default",
                 (self.project_id, capability, cid, node))
@@ -3922,7 +2565,7 @@ class StoreRecords(FileRecords):
         values = [self.project_id, capability, cid, node, *fields.values()]
         updates = ", ".join(f"{field} = EXCLUDED.{field}" for field in fields)
         conn.execute(
-            f"INSERT INTO capabilities_connection_grants ({', '.join(columns)}) "
+            f"INSERT INTO grants ({', '.join(columns)}) "
             f"VALUES ({', '.join(['%s'] * len(values))}) "
             "ON CONFLICT (agent_id, capability, connection, (coalesce(node, ''))) "
             + (f"DO UPDATE SET {updates}" if updates else "DO NOTHING"),
@@ -3935,7 +2578,7 @@ class StoreRecords(FileRecords):
                              "this project has no id a grant could name",
                              "run `capabilities init` in the project")
         conn.execute(
-            "UPDATE capabilities_connection_grants SET is_default = false "
+            "UPDATE grants SET is_default = false "
             "WHERE agent_id = %s AND capability = %s "
             "AND coalesce(node, '') = coalesce(%s, '') AND is_default",
             (self.project_id, capability, node))
@@ -3968,7 +2611,7 @@ class StoreRecords(FileRecords):
                         note: str | None, scope: str | None) -> None:
         agent = self._agent(scope)
         self._write(lambda conn: conn.execute(
-            "INSERT INTO capabilities_identifiers "
+            "INSERT INTO identifiers "
             "(agent_id, capability, label, value, note) "
             "VALUES (%s, %s, %s, %s::jsonb, %s) "
             "ON CONFLICT ((coalesce(agent_id, '')), capability, label, "
@@ -4056,7 +2699,7 @@ class StoreRecords(FileRecords):
         def work(conn: Any) -> dict[str, Any]:
             target = self._place_node(conn, node, actor)
             row = conn.execute(
-                f"SELECT enabled, service FROM capabilities_policy WHERE {where} "
+                f"SELECT enabled, service FROM policies WHERE {where} "
                 "FOR UPDATE", (agent, capability, target)).fetchone()
             out: dict[str, Any] = {"node": target, "changed": False, "unplaced": []}
             if placed:
@@ -4070,31 +2713,31 @@ class StoreRecords(FileRecords):
                         f"--project --node {target}`")
                 if row is None:
                     conn.execute(
-                        "INSERT INTO capabilities_policy "
+                        "INSERT INTO policies "
                         "(agent_id, capability, node, enabled, service) "
                         "VALUES (%s, %s, %s, true, true)", (agent, capability, target))
                     out.update(changed=True, enabled_on_node=True)
                 elif not row[1]:
                     conn.execute(
-                        "UPDATE capabilities_policy SET service = true, updated_at = now() "
+                        "UPDATE policies SET service = true, updated_at = now() "
                         f"WHERE {where}", (agent, capability, target))
                     out["changed"] = True
                 if exclusive:
                     others = [n for (n,) in conn.execute(
-                        "SELECT node FROM capabilities_policy WHERE agent_id = %s "
+                        "SELECT node FROM policies WHERE agent_id = %s "
                         "AND capability = %s AND node <> %s AND service "
                         "ORDER BY node FOR UPDATE", (agent, capability, target)).fetchall()]
                     for other in others:
                         self._place_node(conn, other, actor)
                     if others:
                         conn.execute(
-                            "UPDATE capabilities_policy SET service = false, "
+                            "UPDATE policies SET service = false, "
                             "updated_at = now() WHERE agent_id = %s AND capability = %s "
                             "AND node = ANY(%s)", (agent, capability, others))
                         out.update(changed=True, unplaced=others)
             elif row is not None and row[1]:
                 conn.execute(
-                    "UPDATE capabilities_policy SET service = false, updated_at = now() "
+                    "UPDATE policies SET service = false, updated_at = now() "
                     f"WHERE {where}", (agent, capability, target))
                 out["changed"] = True
             return out
@@ -4106,7 +2749,7 @@ class StoreRecords(FileRecords):
         _store_check("capability", capability, CAPABILITY_RE)
         agent = self._agent("project")
         return [node for (node,) in self._read(
-            "SELECT node FROM capabilities_policy WHERE agent_id = %s "
+            "SELECT node FROM policies WHERE agent_id = %s "
             "AND capability = %s AND service ORDER BY node", (agent, capability))]
 
     def _place_node(self, conn: Any, node: str, actor: str | None) -> str:
@@ -4126,7 +2769,7 @@ class StoreRecords(FileRecords):
 
             def work(conn: Any) -> bool:
                 return conn.execute(
-                    "DELETE FROM capabilities_identifiers "
+                    "DELETE FROM identifiers "
                     "WHERE coalesce(agent_id, '') = coalesce(%s, '') "
                     "AND capability = %s AND label = %s AND node IS NULL",
                     (agent, capability, key)).rowcount > 0
@@ -4136,7 +2779,7 @@ class StoreRecords(FileRecords):
 
             def work(conn: Any) -> bool:
                 return conn.execute(
-                    "DELETE FROM capabilities_policy "
+                    "DELETE FROM policies "
                     "WHERE coalesce(agent_id, '') = coalesce(%s, '') "
                     "AND capability = %s AND coalesce(node, '') = coalesce(%s, '')",
                     (agent, key, node)).rowcount > 0
@@ -4146,13 +2789,13 @@ class StoreRecords(FileRecords):
         elif collection == "grant":
             def work(conn: Any) -> bool:
                 return conn.execute(
-                    "DELETE FROM capabilities_connection_grants WHERE agent_id = %s "
+                    "DELETE FROM grants WHERE agent_id = %s "
                     "AND capability = %s AND connection = %s AND node IS NULL",
                     (self.project_id, capability, key)).rowcount > 0
         else:
             def work(conn: Any) -> bool:
                 return conn.execute(
-                    "UPDATE capabilities_connection_grants SET is_default = false "
+                    "UPDATE grants SET is_default = false "
                     "WHERE agent_id = %s AND capability = %s AND node IS NULL "
                     "AND is_default", (self.project_id, capability)).rowcount > 0
         return bool(self._write(work))
@@ -4236,9 +2879,9 @@ def _agent_state(conn: Any, agent_id: str) -> dict | None:
     no such row or no registry at all."""
     import psycopg
     from capabilities_contract import db
-    agent = ("SELECT migrating_since, migrated_at FROM capabilities_agents WHERE id = %s",
+    agent = ("SELECT migrating_since, migrated_at FROM agents WHERE id = %s",
              (agent_id,))
-    nodes_of = ("SELECT node, is_master, may_write FROM capabilities_agent_nodes "
+    nodes_of = ("SELECT node, is_master, may_write FROM agent_nodes "
                 "WHERE agent_id = %s ORDER BY node", (agent_id,))
     try:
         if getattr(db, "batch", None) is not None:
@@ -4349,7 +2992,7 @@ def settings_leaves(document: dict, prefix: tuple = ()) -> dict[tuple, Any]:
 
 class GlobalRows(StoreRecords):
     """The store's rows for every agent, which are the global layer once the
-    store holds them (`capabilities_global.global_migrated_at` is set): every
+    store holds them (`store_state.global_migrated_at` is set): every
     shared connection row (its owner null; a row an agent owns is that agent's
     own and never part of the global layer), the grant for every agent and
     every node with the default pointer it carries, and the policy row for
@@ -4362,7 +3005,7 @@ class GlobalRows(StoreRecords):
     node, and the store refuses one for a connection an agent owns."""
 
     def __init__(self, global_dir: Path | str, project_root: Path | str | None,
-                 application_name: str = STORE_OWNER):
+                 application_name: str = STORE_APPLICATION):
         super().__init__(Path(global_dir), Path(global_dir), None, None,
                          application_name=application_name)
         self.project_root = Path(project_root) if project_root is not None else None
@@ -4385,7 +3028,7 @@ class GlobalRows(StoreRecords):
         import psycopg
         try:
             try:
-                row = conn.execute("SELECT global_migrated_at FROM capabilities_global"
+                row = conn.execute("SELECT global_migrated_at FROM store_state"
                                    ).fetchone()
             except psycopg.errors.UndefinedTable:
                 row = None
@@ -4415,10 +3058,10 @@ class GlobalRows(StoreRecords):
         held = self._fresh(key)
         if held is None:
             connections, grants = self._read_many([
-                ("SELECT name, spec FROM capabilities_connections "
-                 "WHERE capability = %s AND owner IS NULL ORDER BY name", (capability,)),
+                ("SELECT name, spec FROM connections "
+                 "WHERE capability = %s AND owner_agent_id IS NULL ORDER BY name", (capability,)),
                 ("SELECT connection, enabled, allow_write, is_default "
-                 "FROM capabilities_connection_grants WHERE agent_id IS NULL "
+                 "FROM grants WHERE agent_id IS NULL "
                  "AND node IS NULL AND capability = %s ORDER BY connection",
                  (capability,))])
             held = {"connections": {name: dict(spec) if isinstance(spec, dict) else {}
@@ -4439,7 +3082,7 @@ class GlobalRows(StoreRecords):
         held = self._fresh(key)
         if held is None:
             held = {name: {"enabled": bool(enabled)} for name, enabled in self._read(
-                "SELECT capability, enabled FROM capabilities_policy "
+                "SELECT capability, enabled FROM policies "
                 "WHERE agent_id IS NULL AND node IS NULL ORDER BY capability", ())}
             self._cache[key] = (time.monotonic(), held)
         return held
@@ -4476,7 +3119,7 @@ class GlobalRows(StoreRecords):
     def _put_global_grant(self, conn: Any, capability: str, cid: str,
                           fields: dict[str, Any]) -> None:
         known = conn.execute(
-            "SELECT 1 FROM capabilities_connections WHERE capability = %s AND name = %s",
+            "SELECT 1 FROM connections WHERE capability = %s AND name = %s",
             (capability, cid)).fetchone()
         if known is None:
             raise StoreError("unknown_connection",
@@ -4484,14 +3127,14 @@ class GlobalRows(StoreRecords):
                              f"add it first: `{capability} connection add {cid} --machine`")
         if fields.get("is_default"):
             conn.execute(
-                "UPDATE capabilities_connection_grants SET is_default = false "
+                "UPDATE grants SET is_default = false "
                 "WHERE agent_id IS NULL AND node IS NULL AND capability = %s "
                 "AND connection <> %s AND is_default", (capability, cid))
         columns = ["capability", "connection", *fields]
         values = [capability, cid, *fields.values()]
         updates = ", ".join(f"{field} = EXCLUDED.{field}" for field in fields)
         conn.execute(
-            f"INSERT INTO capabilities_connection_grants (agent_id, node, {', '.join(columns)}) "
+            f"INSERT INTO grants (agent_id, node, {', '.join(columns)}) "
             f"VALUES (NULL, NULL, {', '.join(['%s'] * len(values))}) "
             "ON CONFLICT ((coalesce(agent_id, '')), capability, connection, "
             "(coalesce(node, ''))) "
@@ -4506,7 +3149,7 @@ class GlobalRows(StoreRecords):
 
     def _clear_default(self, conn: Any, capability: str) -> bool:
         return conn.execute(
-            "UPDATE capabilities_connection_grants SET is_default = false "
+            "UPDATE grants SET is_default = false "
             "WHERE agent_id IS NULL AND node IS NULL AND capability = %s AND is_default",
             (capability,)).rowcount > 0
 
@@ -4547,7 +3190,7 @@ class GlobalRows(StoreRecords):
         if collection == "policy":
             def work(conn: Any) -> bool:
                 return conn.execute(
-                    "DELETE FROM capabilities_policy WHERE agent_id IS NULL "
+                    "DELETE FROM policies WHERE agent_id IS NULL "
                     "AND node IS NULL AND capability = %s", (key,)).rowcount > 0
         elif collection == "connection":
             def work(conn: Any) -> bool:
@@ -4555,13 +3198,13 @@ class GlobalRows(StoreRecords):
         elif collection == "grant":
             def work(conn: Any) -> bool:
                 cleared = conn.execute(
-                    "UPDATE capabilities_connection_grants SET enabled = NULL, "
+                    "UPDATE grants SET enabled = NULL, "
                     "allow_write = NULL WHERE agent_id IS NULL AND node IS NULL "
                     "AND capability = %s AND connection = %s "
                     "AND (enabled IS NOT NULL OR allow_write IS NOT NULL)",
                     (capability, key)).rowcount > 0
                 conn.execute(
-                    "DELETE FROM capabilities_connection_grants WHERE agent_id IS NULL "
+                    "DELETE FROM grants WHERE agent_id IS NULL "
                     "AND node IS NULL AND capability = %s AND connection = %s "
                     "AND NOT is_default", (capability, key))
                 return cleared
@@ -4572,7 +3215,7 @@ class GlobalRows(StoreRecords):
 
 
 def global_records(global_dir: Path | str, project_root: Path | str | None = None,
-                   application_name: str = STORE_OWNER) -> "FileRecords":
+                   application_name: str = STORE_APPLICATION) -> "FileRecords":
     """The machine's global layer alone, as a process outside any project
     reads and writes it: the config home's files, or the store's rows for
     every agent once they are in force there (see `GlobalRows`), the database
@@ -4605,7 +3248,7 @@ def _user_name() -> str:
 
 
 class AgentRecords(StoreRecords):
-    """An agent whose records moved into the store: its `capabilities_agents`
+    """An agent whose records moved into the store: its `agents`
     row has `migrated_at`. Every record it keeps - connections, grants, the
     default pointer, identifiers, policy - and its settings documents are rows
     of the contract's tables; its files are not read. Documents stay files.
@@ -4632,7 +3275,7 @@ class AgentRecords(StoreRecords):
     def __init__(self, envelope: Path, global_dir: Path, project_id: str,
                  project: str | None, *, agent: dict, node: str,
                  include_global: bool = True, project_root: Path | None = None,
-                 application_name: str = STORE_OWNER, actor: str | None = None):
+                 application_name: str = STORE_APPLICATION, actor: str | None = None):
         super().__init__(envelope, global_dir, project_id, project,
                          include_global=include_global, project_root=project_root,
                          application_name=application_name, held=RECORDS_MODE_KEY)
@@ -4801,7 +3444,7 @@ class AgentRecords(StoreRecords):
             out: dict[str, list[dict[str, Any]]] = {}
             rows = self._read(
                 "SELECT agent_id, connection, node, enabled, allow_write, is_default "
-                "FROM capabilities_connection_grants "
+                "FROM grants "
                 "WHERE capability = %s AND (agent_id = %s OR (agent_id IS NULL AND %s)) "
                 "AND (node IS NULL OR node = %s) "
                 "ORDER BY connection, agent_id NULLS LAST, node NULLS LAST",
@@ -4840,7 +3483,7 @@ class AgentRecords(StoreRecords):
                     for node in (self.node, None)}
             rows = self._read(
                 "SELECT agent_id, node, label, value, note, updated_at "
-                "FROM capabilities_identifiers "
+                "FROM identifiers "
                 "WHERE capability = %s AND (agent_id IS NULL OR agent_id = %s) "
                 "AND (node IS NULL OR node = %s) ORDER BY label",
                 (capability, self.project_id, self.node))
@@ -4871,10 +3514,10 @@ class AgentRecords(StoreRecords):
             rows: dict[tuple, list] = {}
             where = (capability, self.project_id, self.node)
             documents, leaves = self._read_many([
-                ("SELECT agent_id, node, generation FROM capabilities_settings_documents "
+                ("SELECT agent_id, node, generation FROM settings_documents "
                  "WHERE capability = %s AND (agent_id IS NULL OR agent_id = %s) "
                  "AND (node IS NULL OR node = %s)", where),
-                ("SELECT agent_id, node, path, value FROM capabilities_settings "
+                ("SELECT agent_id, node, path, value FROM settings "
                  "WHERE capability = %s AND (agent_id IS NULL OR agent_id = %s) "
                  "AND (node IS NULL OR node = %s) ORDER BY path", where)])
             for agent_id, node, generation in documents:
@@ -4965,8 +3608,8 @@ class AgentRecords(StoreRecords):
             # owns; a row an agent owns is that agent's own and never one.
             _store_check("capability", capability, CAPABILITY_RE)
             rows = self._read(
-                "SELECT name, spec FROM capabilities_connections "
-                "WHERE capability = %s AND owner IS NULL ORDER BY name", (capability,))
+                "SELECT name, spec FROM connections "
+                "WHERE capability = %s AND owner_agent_id IS NULL ORDER BY name", (capability,))
             return {name: self._record("global", capability, collection, name,
                                        spec if isinstance(spec, dict) else {},
                                        f"global/{name}")
@@ -5002,10 +3645,10 @@ class AgentRecords(StoreRecords):
     def _document_rows(self, conn: Any, agent: str | None, capability: str,
                        node: str | None) -> tuple[dict[tuple, Any], int | None]:
         rows, documents = _read_together(conn, [
-            ("SELECT path, value FROM capabilities_settings "
+            ("SELECT path, value FROM settings "
              "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
              "AND coalesce(node, '') = coalesce(%s::text, '')", (agent, capability, node)),
-            ("SELECT generation FROM capabilities_settings_documents "
+            ("SELECT generation FROM settings_documents "
              "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
              "AND coalesce(node, '') = coalesce(%s::text, '')", (agent, capability, node))])
         found = documents[0] if documents else None
@@ -5038,7 +3681,7 @@ class AgentRecords(StoreRecords):
 
             def trail(action: str, path: tuple, was: Any, now: Any) -> int:
                 return conn.execute(
-                    "INSERT INTO capabilities_settings_changes "
+                    "INSERT INTO settings_changes "
                     "(agent_id, capability, node, action, path, old_value, new_value, "
                     "changed_by) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s) "
                     "RETURNING id",
@@ -5048,7 +3691,7 @@ class AgentRecords(StoreRecords):
 
             for path in sorted(set(old) - set(new)):
                 conn.execute(
-                    "DELETE FROM capabilities_settings "
+                    "DELETE FROM settings "
                     "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') "
                     "AND capability = %s AND coalesce(node, '') = coalesce(%s::text, '') "
                     "AND path = %s", (agent, capability, node, list(path)))
@@ -5059,7 +3702,7 @@ class AgentRecords(StoreRecords):
                     continue
                 if path in old:
                     conn.execute(
-                        "UPDATE capabilities_settings SET value = %s::jsonb, "
+                        "UPDATE settings SET value = %s::jsonb, "
                         "updated_at = now(), updated_by = %s "
                         "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') "
                         "AND capability = %s AND coalesce(node, '') = coalesce(%s::text, '') "
@@ -5067,14 +3710,14 @@ class AgentRecords(StoreRecords):
                         (_canonical(new[path]), who, agent, capability, node, list(path)))
                 else:
                     conn.execute(
-                        "INSERT INTO capabilities_settings "
+                        "INSERT INTO settings "
                         "(agent_id, capability, node, path, value, updated_by) "
                         "VALUES (%s, %s, %s, %s, %s::jsonb, %s)",
                         (agent, capability, node, list(path), _canonical(new[path]), who))
                 generation = trail("set", path, old.get(path), new[path])
                 changed += 1
             conn.execute(
-                "INSERT INTO capabilities_settings_documents "
+                "INSERT INTO settings_documents "
                 "(agent_id, capability, node, generation) VALUES (%s, %s, %s, %s) "
                 "ON CONFLICT ((coalesce(agent_id, '')), capability, (coalesce(node, ''))) "
                 "DO UPDATE SET generation = EXCLUDED.generation",
@@ -5084,14 +3727,14 @@ class AgentRecords(StoreRecords):
         def work(conn: Any) -> dict[str, Any]:
             # A node holding paths of its own in this document writes those
             # paths there, and the rest in the shared document.
-            node = self._landing(conn, scope, None, actor, "capabilities_settings",
+            node = self._landing(conn, scope, None, actor, "settings",
                                  agent, "capability = %s", (capability,))
             self._lock_document(conn, agent, capability, None)
             if node is not None:
                 self._lock_document(conn, agent, capability, node)
             if base is not _UNREAD:
                 [(now,)] = conn.execute(
-                    "SELECT max(generation) FROM capabilities_settings_documents "
+                    "SELECT max(generation) FROM settings_documents "
                     "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') "
                     "AND capability = %s AND (node IS NULL OR node = %s)",
                     (agent, capability, self.node)).fetchall()
@@ -5169,7 +3812,7 @@ class AgentRecords(StoreRecords):
     def _put_grant_at(self, conn: Any, capability: str, cid: str,
                       fields: dict[str, Any], agent: str | None, node: str | None) -> None:
         known = conn.execute(
-            "SELECT 1 FROM capabilities_connections WHERE capability = %s AND name = %s",
+            "SELECT 1 FROM connections WHERE capability = %s AND name = %s",
             (capability, cid)).fetchone()
         if known is None:
             raise StoreError("unknown_connection",
@@ -5178,7 +3821,7 @@ class AgentRecords(StoreRecords):
                              f"connection {cid} '{{...}}'`")
         if fields.get("is_default"):
             conn.execute(
-                "UPDATE capabilities_connection_grants SET is_default = false "
+                "UPDATE grants SET is_default = false "
                 "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
                 "AND connection <> %s AND coalesce(node, '') = coalesce(%s::text, '') "
                 "AND is_default", (agent, capability, cid, node))
@@ -5186,7 +3829,7 @@ class AgentRecords(StoreRecords):
         values = [agent, capability, cid, node, *fields.values()]
         updates = ", ".join(f"{field} = EXCLUDED.{field}" for field in fields)
         conn.execute(
-            f"INSERT INTO capabilities_connection_grants ({', '.join(columns)}) "
+            f"INSERT INTO grants ({', '.join(columns)}) "
             f"VALUES ({', '.join(['%s'] * len(values))}) "
             "ON CONFLICT ((coalesce(agent_id, '')), capability, connection, "
             "(coalesce(node, ''))) "
@@ -5196,7 +3839,7 @@ class AgentRecords(StoreRecords):
     def _put_default_at(self, conn: Any, capability: str, cid: str | None,
                         agent: str | None, node: str | None) -> bool:
         cleared = conn.execute(
-            "UPDATE capabilities_connection_grants SET is_default = false "
+            "UPDATE grants SET is_default = false "
             "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
             "AND coalesce(node, '') = coalesce(%s::text, '') AND is_default",
             (agent, capability, node)).rowcount
@@ -5227,16 +3870,16 @@ class AgentRecords(StoreRecords):
                 raise StoreError("bad_default", "the default pointer names a connection id")
             self._write(lambda conn: self._put_default_at(
                 conn, capability, cid, agent, self._landing(
-                    conn, scope, None, actor, "capabilities_connection_grants", agent,
+                    conn, scope, None, actor, "grants", agent,
                     "capability = %s AND is_default", (capability,))))
             return None
         if collection == "identifier":
             def work(conn: Any) -> None:
                 at = self._landing(
-                    conn, scope, None, actor, "capabilities_identifiers", agent,
+                    conn, scope, None, actor, "identifiers", agent,
                     "capability = %s AND label = %s", (capability, key))
                 conn.execute(
-                    "INSERT INTO capabilities_identifiers "
+                    "INSERT INTO identifiers "
                     "(agent_id, capability, node, label, value, note) "
                     "VALUES (%s, %s, %s, %s, %s::jsonb, %s) "
                     "ON CONFLICT ((coalesce(agent_id, '')), capability, label, "
@@ -5255,7 +3898,7 @@ class AgentRecords(StoreRecords):
             wanted = _node_check(node)
             self._write(lambda conn: _upsert_policy(
                 conn, agent, key, self._landing(
-                    conn, scope, wanted, actor, "capabilities_policy", agent,
+                    conn, scope, wanted, actor, "policies", agent,
                     "capability = %s", (key,)),
                 value["enabled"]))
             return None
@@ -5287,7 +3930,7 @@ class AgentRecords(StoreRecords):
                     fields, wanted = self._grant_value(key, wanted_grant)
                     if at is None:
                         at = self._landing(
-                            conn, scope, wanted, actor, "capabilities_connection_grants",
+                            conn, scope, wanted, actor, "grants",
                             agent, "capability = %s AND connection = %s", (capability, key))
                     self._put_grant_at(conn, capability, key, fields, agent, at)
             self._write(work)
@@ -5295,7 +3938,7 @@ class AgentRecords(StoreRecords):
         fields, wanted = self._grant_value(key, value)
         self._write(lambda conn: self._put_grant_at(
             conn, capability, key, fields, agent,
-            self._landing(conn, scope, wanted, actor, "capabilities_connection_grants",
+            self._landing(conn, scope, wanted, actor, "grants",
                           agent, "capability = %s AND connection = %s", (capability, key))))
         return None
 
@@ -5333,28 +3976,28 @@ class AgentRecords(StoreRecords):
         if collection == "setting":
             return bool(self._write(lambda conn: self._put_default_at(
                 conn, capability, None, agent, self._landing(
-                    conn, scope, None, None, "capabilities_connection_grants", agent,
+                    conn, scope, None, None, "grants", agent,
                     "capability = %s AND is_default", (capability,)))))
         wanted = _node_check(node) if collection == "policy" else None
         if collection == "identifier":
-            sql = ("DELETE FROM capabilities_identifiers "
+            sql = ("DELETE FROM identifiers "
                    "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
                    "AND label = %s AND coalesce(node, '') = coalesce(%s::text, '')")
             target = (agent, capability, key)
-            own = ("capabilities_identifiers", "capability = %s AND label = %s",
+            own = ("identifiers", "capability = %s AND label = %s",
                    (capability, key))
         elif collection == "policy":
-            sql = ("DELETE FROM capabilities_policy "
+            sql = ("DELETE FROM policies "
                    "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
                    "AND coalesce(node, '') = coalesce(%s::text, '')")
             target = (agent, key)
-            own = ("capabilities_policy", "capability = %s", (key,))
+            own = ("policies", "capability = %s", (key,))
         elif collection == "grant":
-            sql = ("DELETE FROM capabilities_connection_grants "
+            sql = ("DELETE FROM grants "
                    "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
                    "AND connection = %s AND coalesce(node, '') = coalesce(%s::text, '')")
             target = (agent, capability, key)
-            own = ("capabilities_connection_grants", "capability = %s AND connection = %s",
+            own = ("grants", "capability = %s AND connection = %s",
                    (capability, key))
         else:
             def work(conn: Any) -> bool:
@@ -5373,8 +4016,8 @@ class AgentRecords(StoreRecords):
 
 def _refuse_disabled_node(conn: Any, node: str, capability: str) -> None:
     """Refuse to place `capability`'s service on `node` while the node is
-    disabled (`capabilities_nodes.disabled_at`)."""
-    found = conn.execute("SELECT disabled_at IS NOT NULL FROM capabilities_nodes "
+    disabled (`nodes.disabled_at`)."""
+    found = conn.execute("SELECT disabled_at IS NOT NULL FROM nodes "
                          "WHERE id = %s", (node,)).fetchone()
     if found is not None and found[0]:
         raise StoreError(
@@ -5392,7 +4035,7 @@ def _upsert_policy(conn: Any, agent: str | None, capability: str, node: str | No
     if enabled and agent is not None and node is not None:
         _refuse_disabled_node(conn, node, capability)
     conn.execute(
-        "INSERT INTO capabilities_policy (agent_id, capability, node, enabled, service) "
+        "INSERT INTO policies (agent_id, capability, node, enabled, service) "
         "VALUES (%s, %s, %s, %s, %s) "
         "ON CONFLICT ((coalesce(agent_id, '')), capability, (coalesce(node, ''))) "
         "DO UPDATE SET enabled = EXCLUDED.enabled, service = EXCLUDED.service, "
@@ -5542,7 +4185,7 @@ def agent_kind(conn: Any, agent_id: str) -> str | None:
 def open_records(envelope: Path | str, global_dir: Path | str,
                  project_only: bool = False, project_root: Path | str | None = None,
                  project_id: str | None = None,
-                 application_name: str = STORE_OWNER,
+                 application_name: str = STORE_APPLICATION,
                  actor: str | None = None) -> Records:
     """The adapter this project's configuration is read and written through:
     the project's envelope, then `global_dir` unless `project_only`; in store

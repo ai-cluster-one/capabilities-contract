@@ -20,10 +20,19 @@ from capabilities_contract.db import (
     store_major,
 )
 
+# What the library itself declares, read before any test patches it.
+REAL_CORE_STEPS, REAL_CORE_VERSION = _migrate.CORE_STEPS, _migrate.CORE_VERSION
+
 
 @pytest.fixture(autouse=True)
 def outside_the_upgrade(monkeypatch):
+    """Outside the upgrade, on a library whose core holds no steps: the rule is
+    measured on owners of the tests' own, and a test that needs a core gives it
+    its own. The real core's crossing is `test_core`'s."""
     monkeypatch.delenv(UPGRADE_ENV, raising=False)
+    monkeypatch.setattr(_migrate, "CORE_STEPS", ())
+    monkeypatch.setattr(_migrate, "CORE_VERSION", (0, 0))
+    monkeypatch.setattr(_migrate, "STORE_MAJOR", 1)
 
 
 def _connect():
@@ -201,8 +210,8 @@ def test_store_major_reads_none_then_1_then_the_cores_major_with_since(store, mo
 
 
 def test_the_library_names_the_store_major_its_own_steps_read():
-    expected = _migrate.CORE_VERSION[0] if _migrate.CORE_STEPS else 1
-    assert expected == STORE_MAJOR
+    expected = REAL_CORE_VERSION[0] if REAL_CORE_STEPS else 1
+    assert expected == STORE_MAJOR == 2
 
 
 MESSAGE = "this store moved to schema 2: run capabilities self-update, then capabilities update"

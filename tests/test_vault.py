@@ -76,7 +76,7 @@ def vaulted(store):
         major, minor = store_tier.STORE_TABLES_VERSION
         migrate(conn, store_tier.STORE_OWNER, store_tier.record_table_steps(),
                 major=major, minor=minor)
-        conn.execute("INSERT INTO capabilities_agents (id) VALUES (%s)", (AGENT,))
+        conn.execute("INSERT INTO agents (id) VALUES (%s)", (AGENT,))
         conn.commit()
     disconnect()
     vault._READERS.clear()
@@ -103,8 +103,8 @@ def test_the_store_keeps_ciphertext_and_the_key_fingerprint_never_the_key(vaulte
         with conn.transaction():
             vault.record_key(conn, AGENT, vault.fingerprint(key))
         rows = vault.rows(conn, AGENT)
-        dump = repr(conn.execute("SELECT * FROM capabilities_vault").fetchall()) \
-            + repr(conn.execute("SELECT * FROM capabilities_agents").fetchall())
+        dump = repr(conn.execute("SELECT * FROM secrets").fetchall()) \
+            + repr(conn.execute("SELECT * FROM agents").fetchall())
         assert vault.recorded_key(conn, AGENT) == (True, vault.fingerprint(key))
     assert [r["name"] for r in rows] == ["API_TOKEN"]
     assert rows[0]["key_fingerprint"] == vault.fingerprint(key)
@@ -303,7 +303,7 @@ def test_share_seals_for_each_grantee_its_key_opens_and_names_one_not_published(
     writer_text, peer_text, late_text = (vault.generate_key() for _ in range(3))
     peer_key, late_key = vault.parse_key(peer_text), vault.parse_key(late_text)
     with connect(application_name="setup", transaction=True) as conn, conn.transaction():
-        conn.execute("INSERT INTO capabilities_agents (id) VALUES (%s), (%s)", (PEER, LATE))
+        conn.execute("INSERT INTO agents (id) VALUES (%s), (%s)", (PEER, LATE))
         vault.record_key(conn, PEER, vault.fingerprint(peer_key))
         assert vault.publish(conn, PEER, peer_key) is True
         assert vault.publish(conn, PEER, peer_key) is False

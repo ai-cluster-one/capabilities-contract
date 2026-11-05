@@ -353,7 +353,7 @@ def test_a_capability_migrates_the_further_owners_it_names_first_and_reports_eac
     with connect(application_name="capabilities-contract-tests") as conn:
         ledger = conn.execute(f'SELECT owner FROM "{store.schema}".schema_ledger '
                               "ORDER BY applied_at").fetchall()
-    assert ledger == [("harness",), ("probe",)]
+    assert ledger == [("core",), ("harness",), ("probe",)]
     namespace["_cmd_migrate"](["status"])
     assert [o["state"] for o in seen.pop()["other_owners"]] == ["current"]
 
