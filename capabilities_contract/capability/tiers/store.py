@@ -59,6 +59,9 @@ COLLECTIONS: dict[str, dict[str, str]] = {
 # falls back to the capability's own WRITE_DEFAULT rather than to a value here,
 # because "does a write leave the system" is the capability's fact.
 GRANT_FIELDS = ("enabled", "allow_write")
+# What a resolved connection entry carries beside its spec: its id and its
+# label, which the store keeps in their own columns and never in a spec.
+ENTRY_KEYS = ("id", "label")
 
 # A document version is named by the first twelve hex characters of its sha256.
 # Forty-eight bits is far more than a project's worth of prose needs, and a name
@@ -338,7 +341,7 @@ NODE_LOG_MANAGER = "manager"
 NODE_LOG_LINES = 100
 NODE_LOG_LINE_CHARS = 500
 NODE_LOG_MASK = "***"
-STORE_TABLES_VERSION = (2, 0)
+STORE_TABLES_VERSION = (3, 0)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -396,6 +399,41 @@ def record_table_steps() -> list[Any]:
     return list(_migrate.CORE_STEPS)
 
 
+# A connection in the store is keyed by its id, twelve lowercase hex characters
+# the store mints when it is added, and called by its label, unique within its
+# capability and never any connection's id: a word a person gives names a
+# connection by its id, else by its label, and never two.
+CONNECTION_ID_RE = re.compile(r"[0-9a-f]{12}")
+# The pre-image the store's cutover to ids left: each connection's id beside
+# the name it was keyed by before (`capabilities_contract.db.CONNECTION_NAMES_TABLE`).
+CONNECTION_NAMES_TABLE = "core_premig_connection_names"
+_CONNECTION_WORD = "(id = %s OR label = %s)"
+
+
+def connection_id_for(conn: Any, capability: str, word: Any) -> str | None:
+    """The id of `capability`'s connection in the store whose id, else label,
+    is `word`; None where none is."""
+    if not isinstance(word, str) or not word:
+        return None
+    row = conn.execute(
+        f"SELECT id FROM connections WHERE capability = %s AND {_CONNECTION_WORD}",
+        (capability, word, word)).fetchone()
+    return row[0] if row else None
+
+
+def connection_former_names(conn: Any, capability: str | None = None) -> dict[str, str]:
+    """{id: name} of each connection - of `capability`, or of every capability
+    - the store held before its cutover to ids, as its pre-image keeps them;
+    {} where the store holds no pre-image (a store made after the cutover)."""
+    if conn.execute("SELECT to_regclass(%s)", (CONNECTION_NAMES_TABLE,)).fetchone()[0] is None:
+        return {}
+    rows = conn.execute(
+        f"SELECT id, name FROM {CONNECTION_NAMES_TABLE}"
+        " WHERE %s::text IS NULL OR capability = %s ORDER BY id",
+        (capability, capability)).fetchall()
+    return {cid: name for cid, name in rows}
+
+
 def service_instance_put(conn: Any, project_id: str, capability: str, node: str, *,
                          state: str, problem: str | None = None,
                          problem_code: str | None = None,
@@ -448,8 +486,17 @@ NODE_STATE_COLUMNS = ("load_1", "load_5", "load_15", "cpu_count", "memory_used_b
 NODE_LOGIN_COLUMNS = tuple(f"{tool}_{part}" for tool in NODE_STATE_TOOLS
                            for part in ("login", "account"))
 NODE_LOGIN_NEED_COLUMNS = tuple(f"{tool}_needed" for tool in NODE_STATE_TOOLS)
-NODE_SESSION_COLUMNS = ("node", "capability", "connection", "live", "account", "reason",
-                        "reason_keys", "checked_at")
+NODE_SESSION_COLUMNS = ("node", "capability", "connection_id", "file_connection", "live",
+                        "account", "reason", "reason_keys", "checked_at")
+# A node session, and the owner's word on one, is of a store connection - its
+# id in `connection_id` - or of one only a machine's files hold - its key in
+# `file_connection`; exactly one is set. A key given is a store connection's
+# where the store holds that id for the capability, a file connection's else.
+_NODE_CONNECTION = "coalesce(connection_id, file_connection)"
+_NODE_CONNECTION_KEY = (
+    "(SELECT c.id FROM connections c WHERE c.id = k.key AND c.capability = k.capability),"
+    " CASE WHEN EXISTS (SELECT 1 FROM connections c WHERE c.id = k.key"
+    " AND c.capability = k.capability) THEN NULL ELSE k.key END")
 # Why a session is down on a node: a required key that does not resolve there,
 # else the device session missing, else not signed in.
 NODE_SESSION_REASONS = ("key_missing", "session_missing", "not_signed_in")
@@ -536,7 +583,9 @@ def node_sessions_put(conn: Any, project_id: str, node: str, capability: str,
                       sessions: Sequence[tuple]) -> None:
     """Replace the project's sessions of `capability` on `node` with
     `sessions`, each (connection, live, account) or (connection, live,
-    account, reason, reason_keys): reason one of NODE_SESSION_REASONS or
+    account, reason, reason_keys) - the connection's key: a store
+    connection's id, kept as `connection_id`, or the key of one only files
+    hold, kept as `file_connection`: reason one of NODE_SESSION_REASONS or
     None, never beside a live session, and reason_keys the keys that do not
     resolve, given exactly with key_missing. `checked_at` is the store's now.
     An empty set leaves the project no row for it there."""
@@ -557,9 +606,10 @@ def node_sessions_put(conn: Any, project_id: str, node: str, capability: str,
                  (project_id, node, capability))
     for connection, live, account, reason, keys in rows:
         conn.execute("INSERT INTO node_sessions (agent_id, node, capability,"
-                     " connection, live, account, reason, reason_keys)"
-                     " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                     (project_id, node, capability, connection, live, account, reason, keys))
+                     " connection_id, file_connection, live, account, reason, reason_keys)"
+                     f" SELECT %s, %s, k.capability, {_NODE_CONNECTION_KEY},"
+                     " %s, %s, %s, %s FROM (SELECT %s::text AS capability, %s::text AS key) k",
+                     (project_id, node, live, account, reason, keys, capability, connection))
 
 
 def node_agents_prune(conn: Any, node: str, asked: Sequence[str],
@@ -619,10 +669,14 @@ def node_logins(conn: Any, project_id: str, nodes: Sequence[str]) -> list[dict[s
 
 
 def node_sessions(conn: Any, project_id: str, nodes: Sequence[str]) -> list[dict[str, Any]]:
-    """The project's sessions on `nodes`, by node, capability and connection."""
+    """The project's sessions on `nodes`, by node, capability and connection:
+    each {node, capability, connection_id, file_connection, live, account,
+    reason, reason_keys, checked_at}, one of connection_id and
+    file_connection null."""
     found = conn.execute(
         f"SELECT {', '.join(NODE_SESSION_COLUMNS)} FROM node_sessions"
-        " WHERE agent_id = %s AND node = ANY (%s) ORDER BY node, capability, connection",
+        " WHERE agent_id = %s AND node = ANY (%s)"
+        f" ORDER BY node, capability, {_NODE_CONNECTION}",
         (project_id, list(nodes))).fetchall()
     return [dict(zip(NODE_SESSION_COLUMNS, row, strict=True)) for row in found]
 
@@ -702,7 +756,9 @@ def node_expectation_set(conn: Any, project_id: str, node: str, *,
                          connection: str | None = None, expected: bool | None,
                          by: str | None = None) -> dict[str, Any]:
     """Set the owner's word on whether the project's sign-in of `tool`, or the
-    live session of `capability`'s `connection`, is expected on `node`: True
+    live session of `capability`'s connection `connection` - a store
+    connection's id, else the key of one only files hold - is expected on
+    `node`: True
     on, False off, None to take it back so that what the placed services need
     decides again. Answers {before, after, changed}, each word True, False or
     None."""
@@ -718,7 +774,8 @@ def node_expectation_set(conn: Any, project_id: str, node: str, *,
         table, keys, key_values = ("node_login_expectations", ("tool",), (tool,))
     else:
         table, keys, key_values = ("node_session_expectations",
-                                   ("capability", "connection"), (capability, connection))
+                                   ("capability", _NODE_CONNECTION),
+                                   (capability, connection))
     where = " AND ".join(f"{column} = %s" for column in ("agent_id", "node", *keys))
     params = (project_id, node, *key_values)
     row = conn.execute(f"SELECT expected FROM {table} WHERE {where} FOR UPDATE",
@@ -727,14 +784,24 @@ def node_expectation_set(conn: Any, project_id: str, node: str, *,
     if expected is None:
         if row:
             conn.execute(f"DELETE FROM {table} WHERE {where}", params)
-    elif before != expected:
+    elif before != expected and tool is not None:
         conn.execute(
-            f"INSERT INTO {table} (agent_id, node, {', '.join(keys)}, expected, updated_by)"
-            f" VALUES (%s, %s, {', '.join(['%s'] * len(keys))}, %s, %s)"
-            f" ON CONFLICT (agent_id, node, {', '.join(keys)}) DO UPDATE SET"
+            f"INSERT INTO {table} (agent_id, node, tool, expected, updated_by)"
+            " VALUES (%s, %s, %s, %s, %s)"
+            " ON CONFLICT (agent_id, node, tool) DO UPDATE SET"
             " expected = EXCLUDED.expected, updated_at = now(),"
             " updated_by = EXCLUDED.updated_by",
             (*params, expected, _node_text(by)))
+    elif before != expected:
+        conn.execute(
+            f"INSERT INTO {table} (agent_id, node, capability, connection_id,"
+            " file_connection, expected, updated_by)"
+            f" SELECT %s, %s, k.capability, {_NODE_CONNECTION_KEY}, %s, %s"
+            " FROM (SELECT %s::text AS capability, %s::text AS key) k"
+            f" ON CONFLICT (agent_id, node, capability, ({_NODE_CONNECTION})) DO UPDATE SET"
+            " expected = EXCLUDED.expected, updated_at = now(),"
+            " updated_by = EXCLUDED.updated_by",
+            (project_id, node, expected, _node_text(by), capability, connection))
     return {"before": before, "after": expected, "changed": before != expected}
 
 
@@ -742,16 +809,19 @@ def node_expectations(conn: Any, project_id: str,
                       nodes: Sequence[str]) -> dict[str, list[dict[str, Any]]]:
     """The owner's words for the project on `nodes`: {sign_ins [{node, tool,
     expected, updated_at, updated_by}], sessions [{node, capability,
-    connection, expected, updated_at, updated_by}]}."""
+    connection_id, file_connection, expected, updated_at, updated_by}]}, one
+    of connection_id and file_connection null."""
     out: dict[str, list[dict[str, Any]]] = {}
-    for kind, table, keys in (("sign_ins", "node_login_expectations", ("tool",)),
-                              ("sessions", "node_session_expectations",
-                               ("capability", "connection"))):
+    for kind, table, keys, order in (
+            ("sign_ins", "node_login_expectations", ("tool",), "tool"),
+            ("sessions", "node_session_expectations",
+             ("capability", "connection_id", "file_connection"),
+             f"capability, {_NODE_CONNECTION}")):
         columns = ("node", *keys, *NODE_EXPECTATION_COLUMNS)
         found = conn.execute(
             f"SELECT {', '.join(columns)} FROM {table}"
             " WHERE agent_id = %s AND node = ANY (%s)"
-            f" ORDER BY node, {', '.join(keys)}", (project_id, list(nodes))).fetchall()
+            f" ORDER BY node, {order}", (project_id, list(nodes))).fetchall()
         out[kind] = [dict(zip(columns, row, strict=True)) for row in found]
     return out
 
@@ -1408,6 +1478,12 @@ class FileRecords(Records):
                     # fieldless identity stands, which is the only reading a
                     # glued file leaves for it.
                     out[key] = row
+        if collection == "connection":
+            # The same holds for an entry a file keeps under the label of a
+            # connection the store holds under its id.
+            for cid, label in self.connection_labels(capability).items():
+                if label != cid and cid in out and not (out.get(label) or {"value": 1})["value"]:
+                    out.pop(label)
         return out
 
     def _scope_root(self, scope: str) -> tuple[Path, str | None]:
@@ -1486,7 +1562,13 @@ class FileRecords(Records):
         the machine itself declares is then usable, read-only, unless its grant
         resolves to `enabled: false`."""
         identities = self.resolve(capability, "connection")
-        layers = self.config_layers(capability, "grant")
+        labels = self.connection_labels(capability)
+        # A grant a file keeps may name a connection the store holds by its
+        # label; it is that connection's grant, keyed by its id.
+        aliases = {label: cid for cid, label in labels.items() if label not in identities}
+        layers = [{(key if key in identities else aliases.get(key, key)): row
+                   for key, row in layer.items()}
+                  for layer in self.config_layers(capability, "grant")]
         # Under the read-only switch every connection is a source, whatever its
         # grant or the capability's WRITE_DEFAULT says.
         writable = not read_only_switch()
@@ -1519,6 +1601,7 @@ class FileRecords(Records):
             grant = rows[0] if rows else None
             out[cid] = {
                 "id": cid,
+                "label": labels.get(cid) or cid,
                 "value": entry["value"],
                 "scope": (entry["scope"], entry["project_id"]),
                 "enabled": enabled,
@@ -1531,9 +1614,33 @@ class FileRecords(Records):
         return out
 
     def connection_labels(self, capability: str) -> dict[str, str]:
-        """What each connection is called where that is not its id, by id.
-        Files keep no label: a connection there is called by its id."""
-        return {}
+        """What each connection the store holds is called, by id. Files keep
+        no label: a connection there is called by its id, which is its key;
+        where the store's rows are the global layer, theirs are answered."""
+        rows = self._global_rows()
+        return rows.connection_labels(capability) if rows is not None else {}
+
+    def _word_id(self, capability: str, word: Any) -> Any:
+        """The id of the connection `word` names by its label, where it names
+        none by its id; `word` itself otherwise."""
+        labels = self.connection_labels(capability)
+        if not isinstance(word, str) or word in labels:
+            return word
+        return next((cid for cid, label in labels.items() if label == word), word)
+
+    def connection_id(self, capability: str, word: Any) -> str | None:
+        """The id of the connection this project sees that `word` names - by
+        its id, else by its label - granted or not; None where it names none."""
+        held = self.connections(capability, include_disabled=True)
+        cid = self._word_id(capability, word)
+        return cid if isinstance(cid, str) and cid in held else None
+
+    def connection_former_name(self, capability: str, cid: str) -> str | None:
+        """The name connection `cid` was keyed by before the store's cutover to
+        ids, as its pre-image keeps it; None for a connection kept in files, on
+        a store made after the cutover, and where the pre-image holds no row."""
+        rows = self._global_rows()
+        return rows.connection_former_name(capability, cid) if rows is not None else None
 
     def rename_connection(self, capability: str, cid: str, label: str | None,
                           actor: str | None = None) -> None:
@@ -1548,7 +1655,11 @@ class FileRecords(Records):
 
     def set(self, capability: str, collection: str, key: str, value: Any,
             actor: str | None = None, note: str | None = None,
-            scope: str | None = None, node: str | None = None) -> None:
+            scope: str | None = None, node: str | None = None,
+            ref_connection_id: str | None = None) -> Any:
+        """Write one record. A connection answers its id: in files, its key.
+        `ref_connection_id` marks an identifier standing for a connection,
+        which only the store records."""
         _store_check("capability", capability, CAPABILITY_RE)
         _store_check("key", key, KEY_RE)
         _semantics(collection)
@@ -1593,6 +1704,7 @@ class FileRecords(Records):
         else:
             body[key] = value
         self._save(path, body, sort=collection == "identifier")
+        return key if collection == "connection" else None
 
     def delete(self, capability: str, collection: str, key: str,
                scope: str | None = None, node: str | None = None) -> bool:
@@ -2168,8 +2280,8 @@ class StoreRecords(FileRecords):
         held = self._fresh(key)
         if held is None:
             statements: list[tuple[str, Sequence[Any]]] = [(
-                "SELECT name, spec FROM connections "
-                "WHERE capability = %s ORDER BY name", (capability,))]
+                "SELECT id, spec, label FROM connections "
+                "WHERE capability = %s ORDER BY label", (capability,))]
             # The agent's sealed secrets ride in the same round trip, so the
             # cascade's last tier asks the store nothing more.
             reader = self.vault_reader()
@@ -2180,8 +2292,11 @@ class StoreRecords(FileRecords):
             rows = found[0]
             if len(found) == 3:
                 reader.seed(found[1], found[2])
-            held = {name: spec if isinstance(spec, dict) else {} for name, spec in rows}
-            self._cache[key] = (time.monotonic(), held)
+            held = {cid: spec if isinstance(spec, dict) else {} for cid, spec, _label in rows}
+            now = time.monotonic()
+            self._cache[key] = (now, held)
+            self._cache[("label", capability)] = (now, {cid: label
+                                                        for cid, _spec, label in rows})
         return held
 
     def _grant_rows(self, capability: str) -> dict[str, list[dict[str, Any]]]:
@@ -2193,11 +2308,11 @@ class StoreRecords(FileRecords):
             out: dict[str, list[dict[str, Any]]] = {}
             if self.project_id:
                 rows = self._read(
-                    "SELECT connection, node, enabled, allow_write, is_default "
+                    "SELECT connection_id, node, enabled, allow_write, is_default "
                     "FROM grants "
                     "WHERE agent_id = %s AND capability = %s "
                     "AND (node IS NULL OR node = %s) "
-                    "ORDER BY connection, node NULLS LAST",
+                    "ORDER BY connection_id, node NULLS LAST",
                     (self.project_id, capability, self.node))
                 for cid, node, enabled, allow_write, is_default in rows:
                     out.setdefault(cid, []).append({
@@ -2208,11 +2323,12 @@ class StoreRecords(FileRecords):
         return held
 
     def connection_owner(self, capability: str, connection: str) -> str | None:
-        """The agent whose own connection this is; None for a shared one."""
+        """The agent whose own connection this is - named by its id or its
+        label; None for a shared one."""
         _store_check("capability", capability, CAPABILITY_RE)
         rows = self._read(
             "SELECT owner_agent_id FROM connections WHERE capability = %s "
-            "AND name = %s", (capability, connection))
+            f"AND {_CONNECTION_WORD}", (capability, connection, connection))
         return rows[0][0] if rows else None
 
     def shared_grantees(self, capability: str, connection: str) -> list[str] | None:
@@ -2222,14 +2338,14 @@ class StoreRecords(FileRecords):
         holds no such row - an agent's own, or none."""
         _store_check("capability", capability, CAPABILITY_RE)
         rows = self._read(
-            "SELECT owner_agent_id IS NULL FROM connections WHERE capability = %s "
-            "AND name = %s", (capability, connection))
+            "SELECT owner_agent_id IS NULL, id FROM connections WHERE capability = %s "
+            f"AND {_CONNECTION_WORD}", (capability, connection, connection))
         if not rows or not rows[0][0]:
             return None
         found = self._read(
             "SELECT DISTINCT agent_id FROM grants "
-            "WHERE capability = %s AND connection = %s AND enabled "
-            "AND agent_id IS NOT NULL ORDER BY agent_id", (capability, connection))
+            "WHERE capability = %s AND connection_id = %s AND enabled "
+            "AND agent_id IS NOT NULL ORDER BY agent_id", (capability, rows[0][1]))
         return [agent for (agent,) in found]
 
     def grantees(self, capability: str, connection: str) -> list[str]:
@@ -2237,9 +2353,11 @@ class StoreRecords(FileRecords):
         if "grant" not in self.collections:
             return []
         rows = self._read(
-            "SELECT DISTINCT agent_id FROM grants "
-            "WHERE capability = %s AND connection = %s AND enabled "
-            "AND agent_id IS NOT NULL ORDER BY agent_id", (capability, connection))
+            "SELECT DISTINCT g.agent_id FROM grants g "
+            "JOIN connections c ON c.id = g.connection_id "
+            "WHERE c.capability = %s AND (c.id = %s OR c.label = %s) AND g.enabled "
+            "AND g.agent_id IS NOT NULL ORDER BY g.agent_id",
+            (capability, connection, connection))
         return [agent for (agent,) in rows]
 
     def _store_default(self, capability: str) -> str | None:
@@ -2351,8 +2469,8 @@ class StoreRecords(FileRecords):
         _store_check("capability", capability, CAPABILITY_RE)
         if collection == "connection":
             rows = self._connection_rows(capability)
-            return [{name: self._record("store", capability, collection, name, spec, name)
-                     for name, spec in rows.items()}] if rows else []
+            return [{cid: self._record("store", capability, collection, cid, spec, cid)
+                     for cid, spec in rows.items()}] if rows else []
         if collection == "grant":
             layers: list[dict[str, dict[str, Any]]] = []
             for node in (self.node, None):
@@ -2441,25 +2559,45 @@ class StoreRecords(FileRecords):
                              f"grant {cid!r} node must name a node, or be null for every node")
         return {f: value[f] for f in (*GRANT_FIELDS, "is_default") if f in value}, node
 
-    def _put_connection(self, conn: Any, capability: str, cid: str, spec: dict,
-                        agent: str | None, own: bool, change: bool = True) -> bool:
-        """Write a connection's spec for the writer `agent` (None at the
-        machine's scope); whether the row is new. A new row is the writer's own
-        where `own` is asked and the writer is an agent, and shared otherwise; a
-        row that exists keeps its owner, and one another agent owns is refused.
-        With `change` false an existing row is left as it is."""
-        added = conn.execute(
-            "INSERT INTO connections (capability, name, spec, owner_agent_id) "
-            "VALUES (%s, %s, %s::jsonb, %s) ON CONFLICT (capability, name) DO NOTHING",
-            (capability, cid, json.dumps(spec, ensure_ascii=False),
-             agent if own else None)).rowcount
-        if added:
-            return True
+    @staticmethod
+    def _held_connection(conn: Any, capability: str, word: str) -> tuple | None:
+        """(id, owner, label) of `capability`'s connection whose id, else
+        label, is `word`, locked for the transaction; None where none is."""
+        return conn.execute(
+            "SELECT id, owner_agent_id, label FROM connections WHERE capability = %s "
+            f"AND {_CONNECTION_WORD} FOR UPDATE", (capability, word, word)).fetchone()
+
+    def _put_connection(self, conn: Any, capability: str, word: str, spec: dict,
+                        agent: str | None, own: bool, change: bool = True) -> tuple[str, bool]:
+        """Write the spec of the connection `word` names, by its id or its
+        label, for the writer `agent` (None at the machine's scope), or add one
+        labelled `word`, its id minted by the store: (its id, whether the row
+        is new). A new row is the writer's own where `own` is asked and the
+        writer is an agent, and shared otherwise; a row that exists keeps its
+        owner, and one another agent owns is refused. With `change` false an
+        existing row is left as it is."""
+        import psycopg
+        row = self._held_connection(conn, capability, word)
+        if row is None:
+            try:
+                with conn.transaction():
+                    added = conn.execute(
+                        "INSERT INTO connections (capability, label, spec, owner_agent_id) "
+                        "VALUES (%s, %s, %s::jsonb, %s) ON CONFLICT (capability, label) "
+                        "DO NOTHING RETURNING id",
+                        (capability, word, json.dumps(spec, ensure_ascii=False),
+                         agent if own else None)).fetchone()
+            except psycopg.errors.UniqueViolation:
+                raise StoreError("connection_exists",
+                                 f"{word!r} is already the id of a connection, so it "
+                                 f"cannot be what a {capability} connection is called",
+                                 "choose another word to add it under") from None
+            if added is not None:
+                return added[0], True
+            row = self._held_connection(conn, capability, word)
+        cid, held, _label = row
         if not change:
-            return False
-        (held,) = conn.execute(
-            "SELECT owner_agent_id FROM connections WHERE capability = %s "
-            "AND name = %s FOR UPDATE", (capability, cid)).fetchone()
+            return cid, False
         if held is not None and held != agent:
             raise StoreError("connection_owned",
                              f"{capability} connection {cid!r} is agent {held}'s own, "
@@ -2467,71 +2605,92 @@ class StoreRecords(FileRecords):
                              "change it in that agent's project, or add a connection "
                              "of this agent's own under another id")
         conn.execute(
-            "UPDATE connections SET spec = %s::jsonb "
-            "WHERE capability = %s AND name = %s",
-            (json.dumps(spec, ensure_ascii=False), capability, cid))
-        return False
+            "UPDATE connections SET spec = %s::jsonb WHERE id = %s",
+            (json.dumps(spec, ensure_ascii=False), cid))
+        return cid, False
 
-    def _drop_connection(self, conn: Any, capability: str, cid: str,
+    def _drop_connection(self, conn: Any, capability: str, word: str,
                          agent: str | None) -> bool:
-        """Remove a connection with its grants; whether it was there. One
-        another agent owns is refused."""
-        row = conn.execute(
-            "SELECT owner_agent_id FROM connections WHERE capability = %s "
-            "AND name = %s FOR UPDATE", (capability, cid)).fetchone()
+        """Remove the connection `word` names, by its id or its label, with
+        every row that names it; whether it was there. One another agent owns
+        is refused."""
+        row = self._held_connection(conn, capability, word)
         if row is None:
             return False
-        if row[0] is not None and row[0] != agent:
+        cid, held, _label = row
+        if held is not None and held != agent:
             raise StoreError("connection_owned",
-                             f"{capability} connection {cid!r} is agent {row[0]}'s own, "
+                             f"{capability} connection {word!r} is agent {held}'s own, "
                              "so only that agent removes it",
                              "remove it in that agent's project")
-        return conn.execute(
-            "DELETE FROM connections WHERE capability = %s AND name = %s",
-            (capability, cid)).rowcount > 0
+        return conn.execute("DELETE FROM connections WHERE id = %s", (cid,)).rowcount > 0
 
     def connection_labels(self, capability: str) -> dict[str, str]:
+        """What each connection of `capability` the store holds is called, by
+        its id."""
         _store_check("capability", capability, CAPABILITY_RE)
         key = ("label", capability)
         held = self._fresh(key)
         if held is None:
-            # Read through the row, so a store from before labels reads none.
-            rows = self._read(
-                "SELECT c.name, to_jsonb(c) ->> 'label' FROM connections c "
-                "WHERE c.capability = %s", (capability,))
-            held = {name: label for name, label in rows if label}
+            rows = self._read("SELECT id, label FROM connections WHERE capability = %s "
+                              "ORDER BY label", (capability,))
+            held = {cid: label for cid, label in rows}
             self._cache[key] = (time.monotonic(), held)
         return held
 
-    def _label_connection(self, conn: Any, capability: str, cid: str,
+    def connection_former_name(self, capability: str, cid: str) -> str | None:
+        _store_check("capability", capability, CAPABILITY_RE)
+        key = ("former", capability)
+        held = self._fresh(key)
+        if held is None:
+            found = self._read("SELECT to_regclass(%s) IS NOT NULL",
+                               (CONNECTION_NAMES_TABLE,))
+            held = dict(self._read(
+                f"SELECT id, name FROM {CONNECTION_NAMES_TABLE} WHERE capability = %s",
+                (capability,))) if found and found[0][0] else {}
+            self._cache[key] = (time.monotonic(), held)
+        return held.get(cid)
+
+    def _known_connection(self, conn: Any, capability: str, word: str, hint: str) -> str:
+        """The id of the connection `word` names, by its id or its label;
+        refused where the store holds none."""
+        cid = connection_id_for(conn, capability, word)
+        if cid is None:
+            raise StoreError("unknown_connection",
+                             f"the store holds no {capability} connection {word!r}", hint)
+        return cid
+
+    def _label_connection(self, conn: Any, capability: str, word: str,
                           label: str | None, agent: str | None) -> None:
-        """Write what connection `cid` is called, for the writer `agent`; its
-        id, and so every row naming it, stays. One another agent owns is
-        refused, and a label that is already another connection's id or label
-        is refused by the store."""
+        """Write what the connection `word` names, by its id or its label, is
+        called, for the writer `agent`; its id, and so every row naming it,
+        stays. One another agent owns is refused, and a label that is already
+        a connection's id or another connection's label is refused by the
+        store."""
         import psycopg
-        row = conn.execute(
-            "SELECT owner_agent_id FROM connections WHERE capability = %s "
-            "AND name = %s FOR UPDATE", (capability, cid)).fetchone()
+        if not isinstance(label, str) or not label:
+            raise StoreError("bad_label", f"a {capability} connection is called by a label",
+                             "give the label to call it")
+        row = self._held_connection(conn, capability, word)
         if row is None:
             raise StoreError("unknown_connection",
-                             f"the store holds no {capability} connection {cid!r}",
+                             f"the store holds no {capability} connection {word!r}",
                              f"`{capability} connections` lists them")
-        if row[0] is not None and row[0] != agent:
+        cid, held, current = row
+        if held is not None and held != agent:
             raise StoreError("connection_owned",
-                             f"{capability} connection {cid!r} is agent {row[0]}'s own, "
+                             f"{capability} connection {word!r} is agent {held}'s own, "
                              "so only that agent renames it",
                              "rename it in that agent's project")
+        if label == current:
+            return
         try:
             with conn.transaction():
-                conn.execute(
-                    "UPDATE connections SET label = %s "
-                    "WHERE capability = %s AND name = %s",
-                    (None if label in (None, cid) else label, capability, cid))
+                conn.execute("UPDATE connections SET label = %s WHERE id = %s", (label, cid))
         except psycopg.errors.UniqueViolation:
             raise StoreError("connection_exists",
-                             f"{label!r} is already the id or label of another "
-                             f"{capability} connection",
+                             f"{label!r} is already a connection's id or the label of "
+                             f"another {capability} connection",
                              "choose another label") from None
 
     def rename_connection(self, capability: str, cid: str, label: str | None,
@@ -2547,27 +2706,22 @@ class StoreRecords(FileRecords):
             raise StoreError("no_project_id",
                              "this project has no id a grant could name",
                              "run `capabilities init` in the project")
-        known = conn.execute(
-            "SELECT 1 FROM connections WHERE capability = %s AND name = %s",
-            (capability, cid)).fetchone()
-        if known is None:
-            raise StoreError("unknown_connection",
-                             f"the store holds no {capability} connection {cid!r}",
-                             f"declare it first: `capabilities set {capability} "
-                             f"connection {cid} '{{...}}'`")
+        cid = self._known_connection(conn, capability, cid,
+                                     f"declare it first: `capabilities set {capability} "
+                                     f"connection {cid} '{{...}}'`")
         if fields.get("is_default"):
             conn.execute(
                 "UPDATE grants SET is_default = false "
-                "WHERE agent_id = %s AND capability = %s AND connection <> %s "
+                "WHERE agent_id = %s AND capability = %s AND connection_id <> %s "
                 "AND coalesce(node, '') = coalesce(%s, '') AND is_default",
                 (self.project_id, capability, cid, node))
-        columns = ["agent_id", "capability", "connection", "node", *fields]
+        columns = ["agent_id", "capability", "connection_id", "node", *fields]
         values = [self.project_id, capability, cid, node, *fields.values()]
         updates = ", ".join(f"{field} = EXCLUDED.{field}" for field in fields)
         conn.execute(
             f"INSERT INTO grants ({', '.join(columns)}) "
             f"VALUES ({', '.join(['%s'] * len(values))}) "
-            "ON CONFLICT (agent_id, capability, connection, (coalesce(node, ''))) "
+            "ON CONFLICT (agent_id, capability, connection_id, (coalesce(node, ''))) "
             + (f"DO UPDATE SET {updates}" if updates else "DO NOTHING"),
             values)
 
@@ -2608,18 +2762,19 @@ class StoreRecords(FileRecords):
         return self.project_id
 
     def _put_identifier(self, capability: str, label: str, value: Any,
-                        note: str | None, scope: str | None) -> None:
+                        note: str | None, scope: str | None,
+                        ref_connection_id: str | None = None) -> None:
         agent = self._agent(scope)
         self._write(lambda conn: conn.execute(
             "INSERT INTO identifiers "
-            "(agent_id, capability, label, value, note) "
-            "VALUES (%s, %s, %s, %s::jsonb, %s) "
+            "(agent_id, capability, label, value, note, ref_connection_id) "
+            "VALUES (%s, %s, %s, %s::jsonb, %s, %s) "
             "ON CONFLICT ((coalesce(agent_id, '')), capability, label, "
             "(coalesce(node, ''))) "
             "DO UPDATE SET value = EXCLUDED.value, note = EXCLUDED.note, "
-            "updated_at = now()",
+            "ref_connection_id = EXCLUDED.ref_connection_id, updated_at = now()",
             (agent, capability, label, json.dumps(value, ensure_ascii=False),
-             note or "")))
+             note or "", ref_connection_id)))
 
     def _put_policy(self, name: str, value: Any, scope: str | None,
                     node: str | None = None) -> None:
@@ -2633,9 +2788,13 @@ class StoreRecords(FileRecords):
 
     def set(self, capability: str, collection: str, key: str, value: Any,
             actor: str | None = None, note: str | None = None,
-            scope: str | None = None, node: str | None = None, own: bool = False) -> None:
+            scope: str | None = None, node: str | None = None, own: bool = False,
+            ref_connection_id: str | None = None) -> Any:
         """`own` writes a new connection at project scope as this project's
-        own, with its grant enabling it, in one transaction."""
+        own, with its grant enabling it, in one transaction. A connection,
+        grant or default pointer names its connection by its id or its label;
+        a connection `key` names none of is added labelled `key`, and a
+        connection's write answers its id."""
         if not self._scoped(collection, key, scope):
             return super().set(capability, collection, key, value,
                                actor=actor, note=note, scope=scope, node=node)
@@ -2644,7 +2803,8 @@ class StoreRecords(FileRecords):
         _only_policy_names_a_node(collection, node)
         self.guard_write(capability, collection, scope)
         if collection == "identifier":
-            return self._put_identifier(capability, key, value, note, scope)
+            return self._put_identifier(capability, key, value, note, scope,
+                                        ref_connection_id)
         if collection == "policy":
             return self._put_policy(key, value, scope, node)
         if scope not in (None, "project"):
@@ -2655,18 +2815,19 @@ class StoreRecords(FileRecords):
                 raise StoreError("bad_connection",
                                  f"connection {key!r} must be a table, got "
                                  f"{type(value).__name__}")
-            spec = {k: v for k, v in value.items() if k not in GRANT_FIELDS}
+            spec = {k: v for k, v in value.items() if k not in (*GRANT_FIELDS, *ENTRY_KEYS)}
             grant = {k: value[k] for k in GRANT_FIELDS if k in value}
 
-            def work(conn: Any) -> None:
-                added = self._put_connection(conn, capability, key, spec,
-                                             self.project_id, own)
+            def work(conn: Any) -> str:
+                cid, added = self._put_connection(conn, capability, key, spec,
+                                                  self.project_id, own)
                 wanted = ({"enabled": True, **grant} if added and own and self.project_id
                           else grant)
                 if wanted:
                     fields, node = self._grant_value(key, wanted)
-                    self._put_grant(conn, capability, key, fields, node)
-            self._write(work)
+                    self._put_grant(conn, capability, cid, fields, node)
+                return cid
+            return self._write(work)
         elif collection == "grant":
             fields, node = self._grant_value(key, value)
             self._write(lambda conn: self._put_grant(conn, capability, key, fields, node))
@@ -2790,8 +2951,9 @@ class StoreRecords(FileRecords):
             def work(conn: Any) -> bool:
                 return conn.execute(
                     "DELETE FROM grants WHERE agent_id = %s "
-                    "AND capability = %s AND connection = %s AND node IS NULL",
-                    (self.project_id, capability, key)).rowcount > 0
+                    "AND capability = %s AND connection_id = %s AND node IS NULL",
+                    (self.project_id, capability,
+                     connection_id_for(conn, capability, key))).rowcount > 0
         else:
             def work(conn: Any) -> bool:
                 return conn.execute(
@@ -3058,14 +3220,16 @@ class GlobalRows(StoreRecords):
         held = self._fresh(key)
         if held is None:
             connections, grants = self._read_many([
-                ("SELECT name, spec FROM connections "
-                 "WHERE capability = %s AND owner_agent_id IS NULL ORDER BY name", (capability,)),
-                ("SELECT connection, enabled, allow_write, is_default "
+                ("SELECT id, spec, label FROM connections "
+                 "WHERE capability = %s AND owner_agent_id IS NULL ORDER BY label",
+                 (capability,)),
+                ("SELECT connection_id, enabled, allow_write, is_default "
                  "FROM grants WHERE agent_id IS NULL "
-                 "AND node IS NULL AND capability = %s ORDER BY connection",
+                 "AND node IS NULL AND capability = %s ORDER BY connection_id",
                  (capability,))])
-            held = {"connections": {name: dict(spec) if isinstance(spec, dict) else {}
-                                    for name, spec in connections},
+            held = {"connections": {cid: dict(spec) if isinstance(spec, dict) else {}
+                                    for cid, spec, _label in connections},
+                    "labels": {cid: label for cid, _spec, label in connections},
                     "grants": {}, "default": None}
             for cid, enabled, allow_write, is_default in grants:
                 fields = {f: v for f, v in (("enabled", enabled),
@@ -3076,6 +3240,11 @@ class GlobalRows(StoreRecords):
                     held["default"] = cid
             self._cache[key] = (time.monotonic(), held)
         return held
+
+    def connection_labels(self, capability: str) -> dict[str, str]:
+        """What each shared connection of `capability` is called, by its id."""
+        _store_check("capability", capability, CAPABILITY_RE)
+        return dict(self._layer(capability)["labels"])
 
     def _policy(self) -> dict[str, dict[str, bool]]:
         key = ("global", "")
@@ -3089,22 +3258,23 @@ class GlobalRows(StoreRecords):
 
     def entries(self, capability: str, collection: str,
                 files: dict[str, Any]) -> dict[str, Any]:
-        """The global scope's entries of one collection: the store's, with
-        `files` (the config home's) answering only for a name the store holds
-        no row of - a connection id, or a capability's policy. A file's
-        default pointer stands only for a capability the store holds no
-        connection of."""
+        """The global scope's entries of one collection: the store's, keyed by
+        connection id, with `files` (the config home's) answering only for a
+        key the store holds no row of - a connection neither the id nor the
+        label of a row, or a capability's policy. A file's default pointer
+        stands only for a capability the store holds no connection of."""
         if collection == "policy":
             stored = self._policy()
             return {**{k: v for k, v in files.items() if k not in stored}, **stored}
         layer = self._layer(capability)
         names = layer["connections"]
+        held = set(names) | set(layer["labels"].values())
         if collection == "connection":
-            out = {cid: v for cid, v in files.items() if cid not in names}
+            out = {cid: v for cid, v in files.items() if cid not in held}
             out.update(names)
             return out
         if collection == "grant":
-            out = {cid: v for cid, v in files.items() if cid not in names}
+            out = {cid: v for cid, v in files.items() if cid not in held}
             out.update(layer["grants"])
             return out
         out = dict(files)
@@ -3118,25 +3288,20 @@ class GlobalRows(StoreRecords):
 
     def _put_global_grant(self, conn: Any, capability: str, cid: str,
                           fields: dict[str, Any]) -> None:
-        known = conn.execute(
-            "SELECT 1 FROM connections WHERE capability = %s AND name = %s",
-            (capability, cid)).fetchone()
-        if known is None:
-            raise StoreError("unknown_connection",
-                             f"the store holds no {capability} connection {cid!r}",
-                             f"add it first: `{capability} connection add {cid} --machine`")
+        cid = self._known_connection(
+            conn, capability, cid, f"add it first: `{capability} connection add {cid} --machine`")
         if fields.get("is_default"):
             conn.execute(
                 "UPDATE grants SET is_default = false "
                 "WHERE agent_id IS NULL AND node IS NULL AND capability = %s "
-                "AND connection <> %s AND is_default", (capability, cid))
-        columns = ["capability", "connection", *fields]
+                "AND connection_id <> %s AND is_default", (capability, cid))
+        columns = ["capability", "connection_id", *fields]
         values = [capability, cid, *fields.values()]
         updates = ", ".join(f"{field} = EXCLUDED.{field}" for field in fields)
         conn.execute(
             f"INSERT INTO grants (agent_id, node, {', '.join(columns)}) "
             f"VALUES (NULL, NULL, {', '.join(['%s'] * len(values))}) "
-            "ON CONFLICT ((coalesce(agent_id, '')), capability, connection, "
+            "ON CONFLICT ((coalesce(agent_id, '')), capability, connection_id, "
             "(coalesce(node, ''))) "
             + (f"DO UPDATE SET {updates}" if updates else "DO NOTHING"),
             values)
@@ -3155,7 +3320,8 @@ class GlobalRows(StoreRecords):
 
     def set(self, capability: str, collection: str, key: str, value: Any,
             actor: str | None = None, note: str | None = None,
-            scope: str | None = None, node: str | None = None, own: bool = False) -> None:
+            scope: str | None = None, node: str | None = None, own: bool = False,
+            ref_connection_id: str | None = None) -> Any:
         if collection == "policy":
             return self._put_policy(key, value, "global")
         if collection == "connection":
@@ -3163,13 +3329,14 @@ class GlobalRows(StoreRecords):
                 raise StoreError("bad_connection",
                                  f"connection {key!r} must be a table, got "
                                  f"{type(value).__name__}")
-            spec = {k: v for k, v in value.items() if k not in GRANT_FIELDS}
+            spec = {k: v for k, v in value.items() if k not in (*GRANT_FIELDS, *ENTRY_KEYS)}
             grant = {k: value[k] for k in GRANT_FIELDS if k in value}
 
-            def work(conn: Any) -> None:
-                self._put_connection(conn, capability, key, spec, None, False)
+            def work(conn: Any) -> str:
+                cid, _added = self._put_connection(conn, capability, key, spec, None, False)
                 if grant:
-                    self._put_global_grant(conn, capability, key, grant)
+                    self._put_global_grant(conn, capability, cid, grant)
+                return cid
             return self._write(work)
         if collection == "grant":
             fields = {k: v for k, v in (value or {}).items() if k in GRANT_FIELDS}
@@ -3197,16 +3364,17 @@ class GlobalRows(StoreRecords):
                 return self._drop_connection(conn, capability, key, None)
         elif collection == "grant":
             def work(conn: Any) -> bool:
+                cid = connection_id_for(conn, capability, key)
                 cleared = conn.execute(
                     "UPDATE grants SET enabled = NULL, "
                     "allow_write = NULL WHERE agent_id IS NULL AND node IS NULL "
-                    "AND capability = %s AND connection = %s "
+                    "AND capability = %s AND connection_id = %s "
                     "AND (enabled IS NOT NULL OR allow_write IS NOT NULL)",
-                    (capability, key)).rowcount > 0
+                    (capability, cid)).rowcount > 0
                 conn.execute(
                     "DELETE FROM grants WHERE agent_id IS NULL "
-                    "AND node IS NULL AND capability = %s AND connection = %s "
-                    "AND NOT is_default", (capability, key))
+                    "AND node IS NULL AND capability = %s AND connection_id = %s "
+                    "AND NOT is_default", (capability, cid))
                 return cleared
         else:
             def work(conn: Any) -> bool:
@@ -3443,11 +3611,11 @@ class AgentRecords(StoreRecords):
         if held is None:
             out: dict[str, list[dict[str, Any]]] = {}
             rows = self._read(
-                "SELECT agent_id, connection, node, enabled, allow_write, is_default "
+                "SELECT agent_id, connection_id, node, enabled, allow_write, is_default "
                 "FROM grants "
                 "WHERE capability = %s AND (agent_id = %s OR (agent_id IS NULL AND %s)) "
                 "AND (node IS NULL OR node = %s) "
-                "ORDER BY connection, agent_id NULLS LAST, node NULLS LAST",
+                "ORDER BY connection_id, agent_id NULLS LAST, node NULLS LAST",
                 (capability, self.project_id, self.include_global, self.node))
             for agent_id, cid, node, enabled, allow_write, is_default in rows:
                 out.setdefault(cid, []).append({
@@ -3608,12 +3776,12 @@ class AgentRecords(StoreRecords):
             # owns; a row an agent owns is that agent's own and never one.
             _store_check("capability", capability, CAPABILITY_RE)
             rows = self._read(
-                "SELECT name, spec FROM connections "
-                "WHERE capability = %s AND owner_agent_id IS NULL ORDER BY name", (capability,))
-            return {name: self._record("global", capability, collection, name,
-                                       spec if isinstance(spec, dict) else {},
-                                       f"global/{name}")
-                    for name, spec in rows}
+                "SELECT id, spec FROM connections "
+                "WHERE capability = %s AND owner_agent_id IS NULL ORDER BY label", (capability,))
+            return {cid: self._record("global", capability, collection, cid,
+                                      spec if isinstance(spec, dict) else {},
+                                      f"global/{cid}")
+                    for cid, spec in rows}
         return super().resolve_scope(capability, collection, scope)
 
     def global_grantees(self, capability: str, connection: str) -> list[str]:
@@ -3700,20 +3868,21 @@ class AgentRecords(StoreRecords):
             for path in sorted(new):
                 if path in old and _canonical(old[path]) == _canonical(new[path]):
                     continue
+                ref = _setting_connection_id(conn, path, new[path])
                 if path in old:
                     conn.execute(
-                        "UPDATE settings SET value = %s::jsonb, "
+                        "UPDATE settings SET value = %s::jsonb, connection_id = %s, "
                         "updated_at = now(), updated_by = %s "
                         "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') "
                         "AND capability = %s AND coalesce(node, '') = coalesce(%s::text, '') "
                         "AND path = %s",
-                        (_canonical(new[path]), who, agent, capability, node, list(path)))
+                        (_canonical(new[path]), ref, who, agent, capability, node, list(path)))
                 else:
                     conn.execute(
                         "INSERT INTO settings "
-                        "(agent_id, capability, node, path, value, updated_by) "
-                        "VALUES (%s, %s, %s, %s, %s::jsonb, %s)",
-                        (agent, capability, node, list(path), _canonical(new[path]), who))
+                        "(agent_id, capability, node, path, value, connection_id, updated_by) "
+                        "VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s)",
+                        (agent, capability, node, list(path), _canonical(new[path]), ref, who))
                 generation = trail("set", path, old.get(path), new[path])
                 changed += 1
             conn.execute(
@@ -3767,6 +3936,12 @@ class AgentRecords(StoreRecords):
                 if problems:
                     raise StoreError("settings_invalid", str(problems[0]))
             new = settings_leaves(after)
+            # The connection a top-level `connection` names is kept by its id.
+            named = new.get(_SETTING_CONNECTION)
+            if isinstance(named, str):
+                cid = connection_id_for(conn, capability, named)
+                if cid is not None and cid != named:
+                    new[_SETTING_CONNECTION] = after[_SETTING_CONNECTION[0]] = cid
 
             def held(path: tuple) -> bool:
                 return any(m[:len(path)] == path or path[:len(m)] == m for m in mine)
@@ -3811,27 +3986,22 @@ class AgentRecords(StoreRecords):
 
     def _put_grant_at(self, conn: Any, capability: str, cid: str,
                       fields: dict[str, Any], agent: str | None, node: str | None) -> None:
-        known = conn.execute(
-            "SELECT 1 FROM connections WHERE capability = %s AND name = %s",
-            (capability, cid)).fetchone()
-        if known is None:
-            raise StoreError("unknown_connection",
-                             f"the store holds no {capability} connection {cid!r}",
-                             f"declare it first: `capabilities set {capability} "
-                             f"connection {cid} '{{...}}'`")
+        cid = self._known_connection(conn, capability, cid,
+                                     f"declare it first: `capabilities set {capability} "
+                                     f"connection {cid} '{{...}}'`")
         if fields.get("is_default"):
             conn.execute(
                 "UPDATE grants SET is_default = false "
                 "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
-                "AND connection <> %s AND coalesce(node, '') = coalesce(%s::text, '') "
+                "AND connection_id <> %s AND coalesce(node, '') = coalesce(%s::text, '') "
                 "AND is_default", (agent, capability, cid, node))
-        columns = ["agent_id", "capability", "connection", "node", *fields]
+        columns = ["agent_id", "capability", "connection_id", "node", *fields]
         values = [agent, capability, cid, node, *fields.values()]
         updates = ", ".join(f"{field} = EXCLUDED.{field}" for field in fields)
         conn.execute(
             f"INSERT INTO grants ({', '.join(columns)}) "
             f"VALUES ({', '.join(['%s'] * len(values))}) "
-            "ON CONFLICT ((coalesce(agent_id, '')), capability, connection, "
+            "ON CONFLICT ((coalesce(agent_id, '')), capability, connection_id, "
             "(coalesce(node, ''))) "
             + (f"DO UPDATE SET {updates}" if updates else "DO NOTHING"),
             values)
@@ -3849,7 +4019,8 @@ class AgentRecords(StoreRecords):
 
     def set(self, capability: str, collection: str, key: str, value: Any,
             actor: str | None = None, note: str | None = None,
-            scope: str | None = None, node: str | None = None, own: bool = False) -> None:
+            scope: str | None = None, node: str | None = None, own: bool = False,
+            ref_connection_id: str | None = None) -> Any:
         if collection not in self.collections:
             return FileRecords.set(self, capability, collection, key, value,
                                    actor=actor, note=note, scope=scope, node=node)
@@ -3880,14 +4051,14 @@ class AgentRecords(StoreRecords):
                     "capability = %s AND label = %s", (capability, key))
                 conn.execute(
                     "INSERT INTO identifiers "
-                    "(agent_id, capability, node, label, value, note) "
-                    "VALUES (%s, %s, %s, %s, %s::jsonb, %s) "
+                    "(agent_id, capability, node, label, value, note, ref_connection_id) "
+                    "VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s) "
                     "ON CONFLICT ((coalesce(agent_id, '')), capability, label, "
                     "(coalesce(node, ''))) "
                     "DO UPDATE SET value = EXCLUDED.value, note = EXCLUDED.note, "
-                    "updated_at = now()",
+                    "ref_connection_id = EXCLUDED.ref_connection_id, updated_at = now()",
                     (agent, capability, at, key, json.dumps(value, ensure_ascii=False),
-                     note or ""))
+                     note or "", ref_connection_id))
             self._write(work)
             return None
         if collection == "policy":
@@ -3907,17 +4078,17 @@ class AgentRecords(StoreRecords):
                 raise StoreError("bad_connection",
                                  f"connection {key!r} must be a table, got "
                                  f"{type(value).__name__}")
-            spec = {k: v for k, v in value.items() if k not in GRANT_FIELDS}
+            spec = {k: v for k, v in value.items() if k not in (*GRANT_FIELDS, *ENTRY_KEYS)}
             grant = {k: value[k] for k in GRANT_FIELDS if k in value}
 
-            def work(conn: Any) -> None:
+            def work(conn: Any) -> str:
                 at = self._authority(conn, scope, None, actor)
                 # A connection is one row for every agent and node, so a node
                 # that writes only its own rows may add one, never change one
                 # another node may use. One added as the agent's own is
                 # granted to it in the same transaction.
-                added = self._put_connection(conn, capability, key, spec, agent, own,
-                                             change=at is None)
+                cid, added = self._put_connection(conn, capability, key, spec, agent, own,
+                                                  change=at is None)
                 if not added and at is not None:
                     raise StoreError(
                         "node_read_only",
@@ -3931,15 +4102,16 @@ class AgentRecords(StoreRecords):
                     if at is None:
                         at = self._landing(
                             conn, scope, wanted, actor, "grants",
-                            agent, "capability = %s AND connection = %s", (capability, key))
-                    self._put_grant_at(conn, capability, key, fields, agent, at)
-            self._write(work)
-            return None
+                            agent, "capability = %s AND connection_id = %s", (capability, cid))
+                    self._put_grant_at(conn, capability, cid, fields, agent, at)
+                return cid
+            return self._write(work)
         fields, wanted = self._grant_value(key, value)
         self._write(lambda conn: self._put_grant_at(
             conn, capability, key, fields, agent,
             self._landing(conn, scope, wanted, actor, "grants",
-                          agent, "capability = %s AND connection = %s", (capability, key))))
+                          agent, "capability = %s AND connection_id = %s",
+                          (capability, connection_id_for(conn, capability, key)))))
         return None
 
     def rename_connection(self, capability: str, cid: str, label: str | None,
@@ -3995,10 +4167,13 @@ class AgentRecords(StoreRecords):
         elif collection == "grant":
             sql = ("DELETE FROM grants "
                    "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
-                   "AND connection = %s AND coalesce(node, '') = coalesce(%s::text, '')")
-            target = (agent, capability, key)
-            own = ("grants", "capability = %s AND connection = %s",
-                   (capability, key))
+                   "AND connection_id IN (SELECT c.id FROM connections c "
+                   "WHERE c.capability = %s AND (c.id = %s OR c.label = %s)) "
+                   "AND coalesce(node, '') = coalesce(%s::text, '')")
+            target = (agent, capability, capability, key, key)
+            own = ("grants", "capability = %s AND connection_id IN (SELECT c.id FROM "
+                   "connections c WHERE c.capability = %s AND (c.id = %s OR c.label = %s))",
+                   (capability, capability, key, key))
         else:
             def work(conn: Any) -> bool:
                 if self._authority(conn, scope, None, None) is not None:
@@ -4012,6 +4187,27 @@ class AgentRecords(StoreRecords):
         return bool(self._write(lambda conn: conn.execute(
             sql, (*target, self._landing(conn, scope, wanted, None, own[0], agent, own[1],
                                           own[2]))).rowcount > 0))
+
+
+# The setting every capability that keeps one names its connection by.
+_SETTING_CONNECTION = ("connection",)
+
+
+def _setting_connection_id(conn: Any, path: Sequence[str], value: Any) -> str | None:
+    """The connection a settings row names, which the row carries as
+    `connection_id`: the connection whose id is one of the row's path
+    segments, or the last dotted part of one (a setting key such as
+    `binding.<id>` names its connection that way), the first that is, else its
+    value; None where neither is."""
+    words = [part for part in (str(seg).rsplit(".", 1)[-1] for seg in path)
+             if CONNECTION_ID_RE.fullmatch(part)]
+    if isinstance(value, str) and CONNECTION_ID_RE.fullmatch(value):
+        words.append(value)
+    if not words:
+        return None
+    found = {cid for (cid,) in conn.execute(
+        "SELECT id FROM connections WHERE id = ANY (%s)", (words,)).fetchall()}
+    return next((word for word in words if word in found), None)
 
 
 def _refuse_disabled_node(conn: Any, node: str, capability: str) -> None:

@@ -1319,14 +1319,18 @@ def _identifiers_stamp(scope: str) -> None:
         _project_id(write=True)
 
 
-def _identifiers_write(label: str, value, note: str, scope: str = "project") -> None:
+def _identifiers_write(label: str, value, note: str, scope: str = "project",
+                       connection: str | None = None) -> None:
     """Rule 15: a capability is the sole writer of its own identifiers,
-    addressed by (capability, collection) rather than by path."""
+    addressed by (capability, collection) rather than by path. `connection`,
+    the id of the connection the identifier stands for, is recorded beside it
+    where the store keeps it."""
     _identifiers_stamp(scope)
     kept = note or ((_identifiers_scope(scope).get(label) or {}).get("note") or "")
     try:
         _records().set(NAME, "identifier", label, value,
-                       actor=f"{NAME} ids set", note=kept or None, scope=scope)
+                       actor=f"{NAME} ids set", note=kept or None, scope=scope,
+                       ref_connection_id=connection)
     except StoreError as e:
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
 
@@ -1632,21 +1636,70 @@ def _cmd_ids(argv: list[str]) -> None:
     if sub in ("set", "rm"):
         _read_only_gate(f"`{NAME} ids {sub}`")
     if sub == "set":
-        if len(argv) < 3:
-            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>] [--global]")
-        label, raw = argv[1], argv[2]
-        try:
-            value = json.loads(raw)
-        except ValueError:
-            value = raw
+        usage = (f"usage: {NAME} ids set <label> <value> [--note <text>] [--global] | "
+                 f"{NAME} ids set <label> --connection <id|label> [--note <text>] [--global]")
+        # An identifier that stands for a connection is written by naming the
+        # connection as --connection does: it holds the connection's id. A
+        # capability that consumes its own `--connection` selector before it
+        # dispatches the contract verbs hands this verb the words without it, so
+        # the process's own command line is read for it then.
+        if not any(a == "--connection" or a.startswith("--connection=") for a in argv):
+            line, j = sys.argv[1:], 0
+            while j < len(line):
+                if line[j] == "--connection" and j + 1 < len(line):
+                    argv = [*argv, "--connection", line[j + 1]]
+                    break
+                if line[j].startswith("--connection="):
+                    argv = [*argv, line[j]]
+                    break
+                j += 1
+        word, rest, i = None, [], 0
+        while i < len(argv):
+            arg = argv[i]
+            if arg == "--connection" or arg.startswith("--connection="):
+                if word is not None:
+                    _die(6, "input", "--connection names one connection", usage)
+                word = arg[len("--connection="):] if arg.startswith("--connection=") else (
+                    argv[i + 1] if i + 1 < len(argv) else "")
+                if not word or word.startswith("--"):
+                    _die(6, "input", "--connection takes the connection's id or label", usage)
+                i += 1 if arg.startswith("--connection=") else 2
+                continue
+            rest.append(arg)
+            i += 1
+        argv = rest
+        if len(argv) < (2 if word is not None else 3):
+            _die(6, "input", usage)
+        cid = None
+        if word is not None:
+            if "_select_connection" not in globals() or "_connections_registry" not in globals():
+                _die(6, "input", f"{NAME} has no connections, so none of its identifiers "
+                     "stands for one", usage)
+            if len(argv) > 2 and not argv[2].startswith("--"):
+                _die(6, "input", "an identifier written with --connection holds the "
+                     "connection's id; give no value beside it", usage)
+            reg, _source = _connections_registry()
+            cid, _entry = _select_connection(reg, word)
+            label, value = argv[1], cid
+        else:
+            label, raw = argv[1], argv[2]
+            try:
+                value = json.loads(raw)
+            except ValueError:
+                value = raw
         note = ""
         if "--note" in argv:
             ni = argv.index("--note")
             if ni + 1 >= len(argv):
                 _die(6, "input", "--note needs a value")
             note = argv[ni + 1]
-        _identifiers_write(label, value, note, scope)
-        _emit({"set": label} if scope == "project" else {"set": label, "scope": scope})
+        _identifiers_write(label, value, note, scope, connection=cid)
+        out = {"set": label}
+        if cid is not None:
+            out["connection"] = cid
+        if scope != "project":
+            out["scope"] = scope
+        _emit(out)
         return
     if sub == "rm":
         held = data if scope == "project" else _identifiers_scope(scope)

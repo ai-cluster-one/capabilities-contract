@@ -9,6 +9,7 @@ from capabilities_contract.db._changes import FOLLOW_INTERVAL_SECONDS, Follower,
 from capabilities_contract.db._connect import batch, connect, disconnect
 from capabilities_contract.db._errors import DbError
 from capabilities_contract.db._migrate import (
+    CONNECTION_NAMES_TABLE,
     STORE_MAJOR,
     UPGRADE_ENV,
     MigrateResult,
@@ -32,6 +33,7 @@ from capabilities_contract.db._setting import (
 )
 
 __all__ = [
+    "CONNECTION_NAMES_TABLE",
     "DEFAULT_SCHEMA",
     "FOLLOW_INTERVAL_SECONDS",
     "KEYS",

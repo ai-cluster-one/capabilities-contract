@@ -23,6 +23,8 @@ from capabilities_contract.db import (
 from capabilities_contract.db import status as migrate_status
 
 CORE_TABLES = sorted(new for _old, new in _core.CORE_RENAMES)
+CORE_STEP_IDS = [step.id for step in _migrate.CORE_STEPS]
+CORE_AT = ("core", *_migrate.CORE_VERSION)
 OLDER = list(_legacy.LIBRARY_STEPS[:29])  # up to 0029-vault
 
 
@@ -75,20 +77,20 @@ def test_a_fresh_store_gets_the_core_tables_under_their_names(store, monkeypatch
         result = migrate(conn, "demo", [Step("0001", "CREATE TABLE demo_t (agent text "
                                                      "REFERENCES agents (id))", core=(2, 0))],
                          major=1, minor=0)
-        assert result.core.applied == [_core.CORE_STEP_ID] and result.applied == ["0001"]
-        assert (result.core.major, result.core.minor) == (2, 0)
+        assert result.core.applied == CORE_STEP_IDS and result.applied == ["0001"]
+        assert (result.core.major, result.core.minor) == _migrate.CORE_VERSION
         tables = _tables(conn, store.schema)
         assert set(CORE_TABLES) <= tables
         assert not [t for t in tables if t.startswith("capabilities")]
         assert _stubs(conn, store.schema) == set()
         assert _rows(conn, "SELECT owner, major, minor FROM schema_version ORDER BY owner") == [
-            ("capabilities", 2, 0), ("core", 2, 0), ("demo", 1, 0)]
+            ("capabilities", 2, 0), CORE_AT, ("demo", 1, 0)]
         assert _rows(conn, "SELECT owner, step FROM schema_ledger ORDER BY applied_at, owner") \
-            == [("core", _core.CORE_STEP_ID), ("demo", "0001")]
+            == [*(("core", step) for step in CORE_STEP_IDS), ("demo", "0001")]
         again = migrate(conn, "demo", [Step("0001", "CREATE TABLE demo_t (agent text "
                                                     "REFERENCES agents (id))", core=(2, 0))],
                         major=1, minor=0)
-        assert again.core.skipped == [_core.CORE_STEP_ID] and again.skipped == ["0001"]
+        assert again.core.skipped == CORE_STEP_IDS and again.skipped == ["0001"]
 
 
 @pytest.mark.parametrize("steps, version, preimages", [
@@ -103,7 +105,7 @@ def test_a_capabilities_store_moves_to_the_core_in_place_with_every_row(
         held = _rows(conn, "SELECT step, checksum FROM schema_ledger "
                            "WHERE owner = 'capabilities' ORDER BY step")
         result = migrate(conn, "demo", [], major=1, minor=0)
-        assert result.core.applied == [_core.CORE_STEP_ID]
+        assert result.core.applied == CORE_STEP_IDS
         tables = _tables(conn, store.schema)
         assert not [t for t in tables if t.startswith("capabilities")]
         renames = dict((*_core.CORE_RENAMES,
@@ -115,7 +117,7 @@ def test_a_capabilities_store_moves_to_the_core_in_place_with_every_row(
         for old, new in _core.CORE_RENAMES:
             if new in _core.AGENT_ID_TABLES and before.get(old):
                 assert _rows(conn, f"SELECT DISTINCT agent_id FROM {new}") == [(AGENT,)], new
-        assert _rows(conn, "SELECT name, owner_agent_id FROM connections ORDER BY name") == [
+        assert _rows(conn, "SELECT label, owner_agent_id FROM connections ORDER BY label") == [
             ("home", AGENT), ("work", None)]
         assert _rows(conn, "SELECT agent_id, name FROM secrets") == [(AGENT, "DEMO_TOKEN")]
         assert _rows(conn, "SELECT count(*) FROM store_state") == [(1,)]
@@ -128,10 +130,10 @@ def test_a_capabilities_store_moves_to_the_core_in_place_with_every_row(
         assert _rows(conn, "SELECT owner, step, checksum FROM schema_ledger "
                            "WHERE owner <> 'demo' ORDER BY step") == sorted(
             [("core", step, checksum) for step, checksum in held]
-            + [("core", _core.CORE_STEP_ID, _migrate.CORE_STEPS[0].checksum)])
+            + [("core", step.id, step.checksum) for step in _migrate.CORE_STEPS])
         assert len(steps_held) == len(steps or _legacy.LEGACY_STEPS)
         assert _rows(conn, "SELECT owner, major, minor FROM schema_version ORDER BY owner") == [
-            ("capabilities", 2, 0), ("core", 2, 0), ("demo", 1, 0)]
+            ("capabilities", 2, 0), CORE_AT, ("demo", 1, 0)]
 
 
 def test_a_store_in_use_moves_to_the_core_only_under_the_upgrade(store, monkeypatch):
@@ -301,16 +303,17 @@ def test_every_trigger_works_on_a_store_moved_to_the_core(store, monkeypatch):
         refused(psycopg.errors.CheckViolation, "DELETE FROM reference_versions")
         run("UPDATE reference_versions SET active = false")
         # grants_owner, connections_owner, connections_label
+        named = "(SELECT id FROM connections WHERE label = '{}')".format
         refused(psycopg.errors.CheckViolation, "INSERT INTO grants (agent_id, capability, "
-                f"connection) VALUES ('{PEER}', 'demo', 'home')")
-        run("INSERT INTO grants (agent_id, capability, connection) VALUES "
-            f"('{AGENT}', 'demo', 'work'), ('{PEER}', 'demo', 'work')")
+                f"connection_id) VALUES ('{PEER}', 'demo', {named('home')})")
+        run("INSERT INTO grants (agent_id, capability, connection_id) VALUES "
+            f"('{AGENT}', 'demo', {named('work')}), ('{PEER}', 'demo', {named('work')})")
         refused(psycopg.errors.CheckViolation,
-                f"UPDATE connections SET owner_agent_id = '{AGENT}' WHERE name = 'work'")
+                f"UPDATE connections SET owner_agent_id = '{AGENT}' WHERE label = 'work'")
         refused(psycopg.errors.UniqueViolation,
-                "UPDATE connections SET label = 'home' WHERE name = 'work'")
+                "UPDATE connections SET label = 'home' WHERE label = 'work'")
         refused(psycopg.errors.CheckViolation,
-                "UPDATE connections SET name = 'other' WHERE name = 'work'")
+                "UPDATE connections SET id = 'aaaaaaaaaaaa' WHERE label = 'work'")
         # policies_service_follows
         run("INSERT INTO policies (agent_id, capability, node, enabled) "
             f"VALUES ('{AGENT}', 'demo', '{NODE}', true)")

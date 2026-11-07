@@ -211,7 +211,7 @@ def test_store_major_reads_none_then_1_then_the_cores_major_with_since(store, mo
 
 def test_the_library_names_the_store_major_its_own_steps_read():
     expected = REAL_CORE_VERSION[0] if REAL_CORE_STEPS else 1
-    assert expected == STORE_MAJOR == 2
+    assert expected == STORE_MAJOR == 3
 
 
 MESSAGE = "this store moved to schema 2: run capabilities self-update, then capabilities update"

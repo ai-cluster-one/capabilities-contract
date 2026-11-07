@@ -17,6 +17,18 @@ OTHER = "0f0e0d0c0b0a"
 AGENT = "prj_000000000001"
 PEER = "prj_000000000002"
 GONE = "prj_000000000003"
+# The connections the sessions name, by capability and label; their ids sort as
+# their labels do.
+CONN = {("whatsapp", "main"): "00000000000a", ("whatsapp", "spare"): "00000000000b",
+        ("telegram", "main"): "00000000001a", ("telegram", "personal"): "00000000001b",
+        ("telegram", "spare"): "00000000001c", ("telegram", "third"): "00000000001d",
+        ("telegram", "work"): "00000000001e"}
+LABEL = {cid: label for (_capability, label), cid in CONN.items()}
+
+
+def _ids(capability, sessions):
+    """`sessions` with each connection's label replaced by its id."""
+    return [(CONN[(capability, session[0])], *session[1:]) for session in sessions]
 
 
 def _migrate(steps, major, minor):
@@ -40,6 +52,9 @@ def nodes(store):
         for agent in (AGENT, PEER):
             conn.execute("INSERT INTO agent_nodes (agent_id, node)"
                          " VALUES (%s, %s)", (agent, NODE))
+        for (capability, label), cid in CONN.items():
+            conn.execute("INSERT INTO connections (id, capability, label, spec)"
+                         " VALUES (%s, %s, %s, '{}')", (cid, capability, label))
     disconnect()
     return store
 
@@ -163,26 +178,33 @@ def test_the_helper_and_the_store_refuse_what_the_row_cannot_say(nodes):
                      " VALUES ('nowhere', now() + interval '1 minute')")
     with _conn() as conn, pytest.raises(psycopg.errors.CheckViolation):
         conn.execute("INSERT INTO node_sessions (agent_id, node, capability,"
-                     " connection, live) VALUES ('', %s, 'whatsapp', 'main', true)", (NODE,))
+                     " connection_id, live) VALUES ('', %s, 'whatsapp', %s, true)",
+                     (NODE, CONN[("whatsapp", "main")]))
 
 
 def test_a_write_replaces_one_capabilitys_sessions_and_a_prune_drops_only_its_own(nodes):
     with _conn() as conn:
         with conn.transaction():
             store_tier.node_sessions_put(conn, AGENT, NODE, "whatsapp",
-                                         [("main", True, "+10000000000"), ("spare", False, None)])
-            store_tier.node_sessions_put(conn, AGENT, NODE, "telegram", [("main", True, None)])
-            store_tier.node_sessions_put(conn, PEER, NODE, "whatsapp", [("main", True, None)])
-            store_tier.node_sessions_put(conn, GONE, NODE, "whatsapp", [("main", True, None)])
+                                         _ids("whatsapp", [("main", True, "+10000000000"),
+                                                           ("spare", False, None)]))
+            store_tier.node_sessions_put(conn, AGENT, NODE, "telegram",
+                                         _ids("telegram", [("main", True, None)]))
+            store_tier.node_sessions_put(conn, PEER, NODE, "whatsapp",
+                                         _ids("whatsapp", [("main", True, None)]))
+            store_tier.node_sessions_put(conn, GONE, NODE, "whatsapp",
+                                         _ids("whatsapp", [("main", True, None)]))
             for agent in (AGENT, PEER, GONE):
                 store_tier.node_logins_put(conn, agent, NODE, {})
         rows = store_tier.node_sessions(conn, AGENT, [NODE])
-    assert [(r["capability"], r["connection"], r["live"], r["account"]) for r in rows] == [
+    assert [(r["capability"], LABEL[r["connection_id"]], r["live"], r["account"])
+            for r in rows] == [
         ("telegram", "main", True, None), ("whatsapp", "main", True, "+10000000000"),
         ("whatsapp", "spare", False, None)]
     with _conn() as conn:
         with conn.transaction():
-            store_tier.node_sessions_put(conn, AGENT, NODE, "whatsapp", [("main", False, None)])
+            store_tier.node_sessions_put(conn, AGENT, NODE, "whatsapp",
+                                         _ids("whatsapp", [("main", False, None)]))
             gone = store_tier.node_agents_prune(conn, NODE, [AGENT], [(AGENT, "whatsapp")])
         # This agent's telegram, and the unlinked agent's session and sign-ins;
         # the other agent linked here is another manager's and keeps its own.
@@ -192,7 +214,7 @@ def test_a_write_replaces_one_capabilitys_sessions_and_a_prune_drops_only_its_ow
         assert store_tier.node_sessions(conn, GONE, [NODE]) == []
         assert [r["node"] for r in store_tier.node_logins(conn, PEER, [NODE])] == [NODE]
         assert store_tier.node_logins(conn, GONE, [NODE]) == []
-    assert [(r["capability"], r["connection"], r["live"]) for r in rows] == [
+    assert [(r["capability"], LABEL[r["connection_id"]], r["live"]) for r in rows] == [
         ("whatsapp", "main", False)]
     assert [(r["capability"], r["live"]) for r in peer] == [("whatsapp", True)]
 
@@ -202,7 +224,8 @@ def test_both_tables_follow_the_registry_id_and_go_with_the_node(nodes):
         with conn.transaction():
             store_tier.node_state_put(conn, NODE, cpu_count=1)
             store_tier.node_logins_put(conn, AGENT, NODE, {})
-            store_tier.node_sessions_put(conn, AGENT, NODE, "whatsapp", [("main", True, None)])
+            store_tier.node_sessions_put(conn, AGENT, NODE, "whatsapp",
+                                         _ids("whatsapp", [("main", True, None)]))
             conn.execute("UPDATE nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
                          (NODE,))
         assert [r["node"] for r in store_tier.node_states(conn, ["aaaaaaaaaaaa"])] == [
@@ -265,14 +288,15 @@ def test_the_owners_word_is_set_changed_and_taken_back_per_agent_and_node(nodes)
             again = store_tier.node_expectation_set(conn, AGENT, NODE, tool="gh",
                                                     expected=True)
             off = store_tier.node_expectation_set(conn, AGENT, NODE, capability="whatsapp",
-                                                  connection="main", expected=False)
+                                                  connection=CONN[("whatsapp", "main")],
+                                                  expected=False)
             store_tier.node_expectation_set(conn, PEER, NODE, tool="claude", expected=False)
         assert (on, again["changed"], off["before"]) == (
             {"before": None, "after": True, "changed": True}, False, None)
         mine = store_tier.node_expectations(conn, AGENT, [NODE, OTHER])
         assert [(r["node"], r["tool"], r["expected"], r["updated_by"])
                 for r in mine["sign_ins"]] == [(NODE, "gh", True, "owner")]
-        assert [(r["capability"], r["connection"], r["expected"])
+        assert [(r["capability"], LABEL[r["connection_id"]], r["expected"])
                 for r in mine["sessions"]] == [("whatsapp", "main", False)]
         with conn.transaction():
             back = store_tier.node_expectation_set(conn, AGENT, NODE, tool="gh", expected=None)
@@ -291,7 +315,8 @@ def test_the_owners_words_follow_the_registry_id_and_go_with_the_node(nodes):
         with conn.transaction():
             store_tier.node_expectation_set(conn, AGENT, NODE, tool="gh", expected=True)
             store_tier.node_expectation_set(conn, AGENT, NODE, capability="telegram",
-                                            connection="main", expected=True)
+                                            connection=CONN[("telegram", "main")],
+                                            expected=True)
             conn.execute("UPDATE nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
                          (NODE,))
         moved = store_tier.node_expectations(conn, AGENT, ["aaaaaaaaaaaa"])
@@ -513,14 +538,15 @@ def test_a_store_at_the_logs_step_takes_only_the_session_reasons_step(store, mon
 def test_a_session_that_is_down_says_why_and_a_row_without_a_reason_reads_as_before(nodes):
     with _conn() as conn:
         with conn.transaction():
-            store_tier.node_sessions_put(conn, AGENT, NODE, "telegram", [
+            store_tier.node_sessions_put(conn, AGENT, NODE, "telegram", _ids("telegram", [
                 ("personal", False, None, "key_missing", ["TELEGRAM_API_HASH"]),
                 ("spare", False, None, "not_signed_in", None),
                 ("third", False, None, "session_missing", None),
-                ("work", True, "100", None, None)])
-            store_tier.node_sessions_put(conn, AGENT, NODE, "whatsapp", [("main", False, None)])
+                ("work", True, "100", None, None)]))
+            store_tier.node_sessions_put(conn, AGENT, NODE, "whatsapp",
+                                         _ids("whatsapp", [("main", False, None)]))
         rows = store_tier.node_sessions(conn, AGENT, [NODE])
-    assert [(r["capability"], r["connection"], r["live"], r["account"], r["reason"],
+    assert [(r["capability"], LABEL[r["connection_id"]], r["live"], r["account"], r["reason"],
              r["reason_keys"]) for r in rows] == [
         ("telegram", "personal", False, None, "key_missing", ["TELEGRAM_API_HASH"]),
         ("telegram", "spare", False, None, "not_signed_in", None),
@@ -532,7 +558,7 @@ def test_a_session_that_is_down_says_why_and_a_row_without_a_reason_reads_as_bef
                 ("main", False, None, "key_missing", None),
                 ("main", False, None, "not_signed_in", ["TELEGRAM_API_HASH"])):
         with _conn() as conn, pytest.raises(store_tier.StoreError) as raised:
-            store_tier.node_sessions_put(conn, AGENT, NODE, "telegram", [bad])
+            store_tier.node_sessions_put(conn, AGENT, NODE, "telegram", _ids("telegram", [bad]))
         assert raised.value.slug == "bad_state"
     import psycopg
     for live, reason, keys in ((True, "not_signed_in", None), (False, "logged_out", None),
@@ -541,9 +567,9 @@ def test_a_session_that_is_down_says_why_and_a_row_without_a_reason_reads_as_bef
                                (False, "not_signed_in", ["TELEGRAM_API_HASH"])):
         with _conn() as conn, pytest.raises(psycopg.errors.CheckViolation):
             conn.execute("INSERT INTO node_sessions (agent_id, node,"
-                         " capability, connection, live, reason, reason_keys)"
-                         " VALUES (%s, %s, 'telegram', 'main', %s, %s, %s)",
-                         (AGENT, NODE, live, reason, keys))
+                         " capability, connection_id, live, reason, reason_keys)"
+                         " VALUES (%s, %s, 'telegram', %s, %s, %s, %s)",
+                         (AGENT, NODE, CONN[("telegram", "main")], live, reason, keys))
 
 
 def test_a_store_at_the_session_reasons_step_takes_only_the_node_disabled_step(store, monkeypatch):

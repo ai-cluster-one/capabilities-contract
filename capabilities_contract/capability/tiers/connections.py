@@ -164,16 +164,18 @@ def _grant_gate(reg: dict, cid: str) -> None:
     entry = (reg.get("withheld") or {}).get(cid)
     if entry is None:
         return
+    label = (reg.get("labels") or {}).get(cid)
+    named = f"{cid!r}" + (f" ({label})" if label and label != cid else "")
     if entry.get("scope") == "project":
-        message = f"connection {cid!r} is disabled in this project"
+        message = f"connection {named} is disabled in this project"
     elif _machine_read():
-        message = (f"connection {cid!r} is switched off on this machine by "
+        message = (f"connection {named} is switched off on this machine by "
                    f"its grant")
     elif _project_root() is None:
-        message = (f"connection {cid!r} is declared globally and there is no "
+        message = (f"connection {named} is declared globally and there is no "
                    f"project here to grant it in")
     else:
-        message = (f"connection {cid!r} is declared outside this project and "
+        message = (f"connection {named} is declared outside this project and "
                    f"this project has not granted it")
     _die(4, "connection_not_granted", message, _grant_hint(cid))
 
@@ -239,11 +241,13 @@ def _connections_composed() -> dict:
                           if entry.get("machine_read")})
     return {
         "default": default,
-        "connections": {cid: {**entry["value"], "allow_write": entry["allow_write"]}
+        "connections": {cid: {**entry["value"], "allow_write": entry["allow_write"],
+                              "id": cid, "label": entry.get("label") or cid}
                         for cid, entry in usable.items()},
         "sources": sources,
         "withheld": {cid: {"scope": entry["scope"][0]}
                      for cid, entry in withheld.items()},
+        "labels": {cid: entry.get("label") or cid for cid, entry in effective.items()},
     }
 
 
@@ -267,7 +271,8 @@ def _inventory_connections(machine_read: bool | None = None) -> dict:
     return {"default": default,
             "connections": {
                 cid: {**entry["value"], "allow_write": entry["allow_write"],
-                      "granted": bool(entry["enabled"])}
+                      "granted": bool(entry["enabled"]), "id": cid,
+                      "label": entry.get("label") or cid}
                 for cid, entry in effective.items()}}
 
 
@@ -287,12 +292,61 @@ def _connections_registry() -> tuple[dict | None, Path | str | None]:
 
 
 def _connection_labels() -> dict:
-    """What each connection is called where that is not its id, by id: the
-    label `connection rename` gave it, which the store keeps beside the id."""
+    """What each connection the store holds is called, by its id: the word it
+    was added under, or the label `connection rename` gave it. A connection
+    kept in files is called by its id and is not listed."""
     try:
         return _records().connection_labels(NAME)
     except StoreError as e:
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _connection_label(cid: str) -> str:
+    """What connection `cid` is called: its label in the store, else its id,
+    which is what a connection kept in files is called."""
+    return _connection_labels().get(cid) or cid
+
+
+def _connection_former_name(cid: str) -> str | None:
+    """The name connection `cid` of this capability was keyed by before the
+    store gave every connection an id, as the store's pre-image of that
+    cutover keeps it; None for a connection kept in files, on a store made
+    after the cutover, and where the pre-image holds no row for it."""
+    try:
+        held = getattr(_records(), "connection_former_name", None)
+        return held(NAME, cid) if held is not None and cid else None
+    except StoreError:
+        return None
+
+
+def _connection_state_dir(base, cid: str) -> "Path":
+    """Where this capability keeps state for connection `cid` under `base`:
+    `base / cid`. Where that does not exist and state was made under the name
+    the connection had before its id (`_connection_former_name`), that path is
+    renamed to `base / cid` first - once, on the same filesystem, never over a
+    path that exists - and one line on stderr says what moved; where both
+    exist, `base / cid` is the one used and stderr says so."""
+    import os
+    import sys
+    from pathlib import Path
+    base = Path(base)
+    target = base / cid
+    former = _connection_former_name(cid)
+    if not former or former == cid or former in (".", "..") or "/" in former:
+        return target
+    old = base / former
+    if not (old.exists() or old.is_symlink()):
+        return target
+    if target.exists() or target.is_symlink():
+        sys.stderr.write(f"{NAME}: connection {cid} keeps its state at {target}; {old}, "
+                         f"made under its former name {former!r}, is left as it is\n")
+        sys.stderr.flush()
+        return target
+    os.rename(old, target)
+    sys.stderr.write(f"{NAME}: moved {old} to {target}: connection {former!r} is keyed by "
+                     f"its id {cid} now\n")
+    sys.stderr.flush()
+    return target
 
 
 def _labelled(wanted: str | None) -> str | None:
@@ -305,9 +359,10 @@ def _labelled(wanted: str | None) -> str | None:
 
 
 def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
-    """flag → default pointer → sole entry → die 6. The flag names a
-    connection by its id or by its label. A connection's own
-    `address` field selects it too (used where a
+    """flag → default pointer → sole entry → die 6: (the connection's id, its
+    entry, which carries `id` and `label` beside its fields). The flag names a
+    connection by its id, else by its label; the default pointer may hold
+    either. A connection's own `address` field selects it too (used where a
     connection carries a human-recognizable address; absent fields never match).
 
     A connection the project was never granted is refused here rather than
@@ -317,35 +372,55 @@ def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict 
         _die(6, "connections_required",
              f"{NAME} requires an explicit connections registry")
     conns = reg["connections"]
+    withheld = reg.get("withheld") or {}
+    # A registry the capability composed itself carries no labels; they are
+    # read only once a word names no id.
+    labels = reg.get("labels") or {}
+
+    def named(word: str) -> str | None:
+        if word in conns or word in withheld:
+            return word
+        held = labels if "labels" in reg else _connection_labels()
+        return next((cid for cid, label in held.items()
+                     if label == word and (cid in conns or cid in withheld)), None)
+
+    def chosen(cid: str) -> tuple[str, dict | None]:
+        entry = conns[cid]
+        if isinstance(entry, dict):
+            entry.setdefault("id", cid)
+            entry.setdefault("label", labels.get(cid) or cid)
+        return cid, entry
+
+    def known() -> str:
+        return ", ".join(cid if (labels.get(cid) or cid) == cid
+                         else f"{labels[cid]} ({cid})" for cid in conns)
+
     if wanted:
-        if wanted in conns:
-            return wanted, conns[wanted]
-        if wanted not in (reg.get("withheld") or {}):
-            named = _labelled(wanted)
-            if named is not None:
-                if named in conns:
-                    return named, conns[named]
-                _grant_gate(reg, named)
+        cid = named(wanted)
+        if cid is not None:
+            if cid in conns:
+                return chosen(cid)
+            _grant_gate(reg, cid)
         for cid, entry in conns.items():
             if (entry or {}).get("address", "").lower() == wanted.lower():
-                return cid, entry
+                return chosen(cid)
         _grant_gate(reg, wanted)
         _die(6, "unknown_connection", f"no connection matches {wanted!r}",
-             f"known: {', '.join(conns)}")
+             f"known: {known()}")
     default = reg.get("default")
     if default:
-        if default not in conns:
-            _grant_gate(reg, default)
+        cid = named(default)
+        if cid is None or cid not in conns:
+            _grant_gate(reg, cid or default)
             _die(6, "bad_default", f"default points to unknown connection {default!r}",
-                 f"known: {', '.join(conns)}")
-        return default, conns[default]
+                 f"known: {known()}")
+        return chosen(cid)
     if len(conns) == 1:
-        cid = next(iter(conns))
-        return cid, conns[cid]
+        return chosen(next(iter(conns)))
     _die(6, "ambiguous_connection",
          f"registry defines {len(conns)} connections and no default; "
          f"pass --connection <id>",
-         f"known: {', '.join(conns)}")
+         f"known: {known()}")
 
 
 def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
@@ -483,6 +558,8 @@ def _record_identity(cid: str, ident, display_name: str | None = None) -> bool:
         return False
     try:
         adapter = _records()
+        # The connection is named by its id; a label names it too.
+        cid = adapter._word_id(NAME, cid) if hasattr(adapter, "_word_id") else cid
         scopes = ["project", "global"] if _project_root() is not None else ["global"]
         for scope in scopes:
             held = adapter.resolve_scope(NAME, "connection", scope).get(cid)
@@ -785,7 +862,10 @@ def _declared_values(declared: list, argv_values: dict, stdin: bool,
 
 
 def _connection_env_name(field: dict, cid: str) -> str:
-    """The env key a secret field's value is written under for one connection."""
+    """The env key a secret field's value is written under for one connection,
+    its template's `{ID}` filled from `cid`: the label a connection is added
+    under, which is its id in files. The key is kept in the connection's spec
+    when it is added, so nothing recomputes it later."""
     import re as _re
     ident = _re.sub(r"[^A-Z0-9]", "_", cid.upper())
     template = field.get("env") or (
@@ -1020,13 +1100,16 @@ def _cmd_connection(argv: list[str]) -> None:
                  f"`capabilities set {NAME} grant {cid} '{{\"enabled\": false}}'` "
                  "run in that project")
         others = {}
+        label = _connection_label(cid)
+        mine = {field["key"]: _connection_field_keys(field, cid)
+                for field in declared if field.get("secret")}
         try:
             for other, row in adapter.resolve_scope(NAME, "connection", scope).items():
                 if other != cid:
                     others[other] = row.get("value") or {}
             pointer = adapter.resolve_scope(NAME, "setting", scope).get("connection.default")
             adapter.delete(NAME, "connection", cid, scope=scope)
-            was_default = bool(pointer and pointer.get("value") == cid)
+            was_default = bool(pointer and pointer.get("value") in (cid, label))
             if was_default:
                 adapter.delete(NAME, "setting", "connection.default", scope=scope)
             source = adapter.scope_source(NAME, "connection", scope)
@@ -1038,7 +1121,7 @@ def _cmd_connection(argv: list[str]) -> None:
             if not isinstance(env_key, str) or not env_key:
                 continue
             shared = any(entry.get(field["key"]) == env_key for entry in others.values())
-            if env_key == _connection_env_name(field, cid) and not shared:
+            if env_key in mine.get(field["key"], ()) and not shared:
                 own.append(env_key)
             else:
                 kept.append(env_key)
@@ -1049,8 +1132,8 @@ def _cmd_connection(argv: list[str]) -> None:
         # The machine's scope writes no vault; a project's own secret may be in either.
         unsealed, unread = _vault_unseal(own) if scope == "project" else ([], None)
         kept += [key for key in own if key not in removed and key not in unsealed]
-        out = {"ok": True, "action": "remove", "connection": cid, "scope": scope,
-               "registry": source, "default_cleared": was_default,
+        out = {"ok": True, "action": "remove", "connection": cid, "label": label,
+               "scope": scope, "registry": source, "default_cleared": was_default,
                "credentials": str(credentials) if removed else None,
                "secrets_removed": removed, "vault_removed": unsealed,
                "secrets_kept": kept}
@@ -1089,6 +1172,17 @@ def _cmd_connection(argv: list[str]) -> None:
                  "on stdin")
     entry = dict(existing)
     secrets: dict = {}
+    # A new connection is called by the word it is added under, and its env
+    # keys are filled from that label; one that exists keeps its own keys.
+    label = _connection_label(cid) if held is not None else cid
+
+    def own_key(field: dict) -> str:
+        held_key = existing.get(field["key"])
+        if held is not None and isinstance(held_key, str) \
+                and held_key in _connection_field_keys(field, cid):
+            return held_key
+        return _connection_env_name(field, label)
+
     for field in declared:
         key = field["key"]
         if key in named:
@@ -1100,13 +1194,13 @@ def _cmd_connection(argv: list[str]) -> None:
             elif field.get("secret"):
                 # Always this connection's own key: a key the entry named
                 # before may be shared with another connection.
-                env_key = _connection_env_name(field, cid)
+                env_key = own_key(field)
                 secrets[env_key] = value
                 entry[key] = env_key
             else:
                 entry[key] = value
         elif key not in entry and field.get("secret") and field.get("required"):
-            env_key = _connection_env_name(field, cid)
+            env_key = own_key(field)
             if _resolve_env_key(env_key)[0]:
                 entry[key] = env_key
         elif key not in entry and field.get("default") is not None and field.get("required"):
@@ -1155,9 +1249,11 @@ def _cmd_connection(argv: list[str]) -> None:
         if scope == "project" and adapter.mode_of("connection") == "store":
             # A connection added in a project in store mode is the project's
             # own, written with its grant.
-            adapter.set(NAME, "connection", cid, entry, scope=scope, own=True)
+            written = adapter.set(NAME, "connection", cid, entry, scope=scope, own=True)
         else:
-            adapter.set(NAME, "connection", cid, entry, scope=scope)
+            written = adapter.set(NAME, "connection", cid, entry, scope=scope)
+        # The store mints a new connection's id; in files the id is the key.
+        cid = written if isinstance(written, str) and written else cid
         if default:
             adapter.set(NAME, "setting", "connection.default", cid, scope=scope)
         source = adapter.scope_source(NAME, "connection", scope)
@@ -1177,11 +1273,11 @@ def _cmd_connection(argv: list[str]) -> None:
             row["value"] = value
         report.append(row)
     out = {"ok": True, "action": "add" if held is None else "update",
-           "connection": cid, "scope": scope, "registry": source,
+           "connection": cid, "label": label, "scope": scope, "registry": source,
            "credentials": secrets_in if secrets and secrets_in == str(credentials) else None,
            "secrets_in": secrets_in, "default": default, "fields": report,
            "identity": _connection_identity(entry),
-           "next": f"`{NAME} doctor --connection {cid}` proves it"}
+           "next": f"`{NAME} doctor --connection {label}` proves it"}
     if vault_skipped:
         out["vault_skipped"] = vault_skipped
     if sealing.get("shared"):
@@ -1194,7 +1290,7 @@ def _cmd_connection(argv: list[str]) -> None:
     if methods:
         out["link"] = [m.get("id") for m in methods]
         out["next"] = (f"link it with one of `{NAME} manifest`'s connections.link "
-                       f"methods, adding --connection {cid}")
+                       f"methods, adding --connection {label}")
     if root is not None:
         # Whether this project may use what was just written: a project in
         # store mode keeps even its own connection usable only through a grant.
@@ -1270,11 +1366,22 @@ def _connection_rewrite(cid: str, fields: dict) -> bool:
     return False
 
 
+def _connection_field_keys(field: dict, cid: str) -> set:
+    """The env keys that are connection `cid`'s own for one secret field: the
+    one its template gives for the connection's label, and for the name it
+    was keyed by before its id, where it had one (`_connection_former_name`)."""
+    words = {_connection_label(cid) if cid else cid}
+    former = _connection_former_name(cid)
+    if former:
+        words.add(former)
+    return {_connection_env_name(field, word) for word in words if word}
+
+
 def _connection_own_keys(cid: str) -> set:
-    """The env keys that are connection `cid`'s alone: the one each declared
-    secret field is written under for it (`_connection_env_name`)."""
-    return {_connection_env_name(field, cid)
-            for field in globals().get("CONN_FIELDS") or [] if field.get("secret")}
+    """The env keys that are connection `cid`'s alone: the ones each declared
+    secret field is written under for it (`_connection_field_keys`)."""
+    return {key for field in globals().get("CONN_FIELDS") or [] if field.get("secret")
+            for key in _connection_field_keys(field, cid)}
 
 
 def _cmd_connection_seal(argv: list[str], usage: str) -> None:
@@ -1345,13 +1452,14 @@ def _cmd_connection_seal(argv: list[str], usage: str) -> None:
     hook = globals().get("_connection_prefill")
     try:
         for cid, entry in sorted(usable.items()):
-            res = {"shared": False, "sealed": {}, "unchanged": [], "unresolved": [],
-                   "from": {}, "unpublished": []}
+            res = {"label": entry.get("label") or cid, "shared": False, "sealed": {},
+                   "unchanged": [], "unresolved": [], "from": {}, "unpublished": []}
             results[cid] = res
             grantees = _shared_grantees(cid)
             res["shared"] = grantees is not None
             others = sorted(set(grantees or []) - {agent}) if share else []
-            spec = {k: v for k, v in entry.items() if k not in ("allow_write", "granted")}
+            spec = {k: v for k, v in entry.items()
+                    if k not in ("allow_write", "granted", "id", "label")}
             offered = (hook(cid, spec) or {}) if callable(hook) else {}
             fields = {k: v for k, v in (offered.get("fields") or {}).items() if k not in spec}
             values = dict(offered.get("secrets") or {})
