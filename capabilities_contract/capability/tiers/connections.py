@@ -223,7 +223,8 @@ def _connections_composed() -> dict:
     usable = {cid: e for cid, e in effective.items() if e["enabled"]}
     withheld = {cid: e for cid, e in effective.items() if not e["enabled"]}
     if not usable:
-        named = ", ".join(sorted(withheld))
+        # Named by label, the word a person reads; files call one by its key.
+        named = ", ".join(sorted(entry.get("label") or cid for cid, entry in withheld.items()))
         if machine:
             refusal = (f"every {NAME} connection this machine declares is "
                        f"switched off by its grant: {named}")
@@ -477,7 +478,11 @@ def _doctor_gate(report: dict, wanted: str | None) -> None:
         if miss:
             problems[cid] = miss
     if problems:
-        detail = "; ".join(f"{c}: {', '.join(ks)}" for c, ks in sorted(problems.items()))
+        # Named by label, the word a person reads; a connection kept in files is
+        # called by its key.
+        labels = _connection_labels()
+        detail = "; ".join(f"{labels.get(c) or c}: {', '.join(ks)}"
+                           for c, ks in sorted(problems.items()))
         unread = sorted({_VAULT_UNREAD[k] for ks in problems.values() for k in ks
                          if k in _VAULT_UNREAD})
         if unread:

@@ -371,6 +371,30 @@ def test_a_connection_added_under_a_word_is_called_by_it_and_named_by_its_id_or_
         probe["_select_connection"](reg, "nowhere")
 
 
+
+def test_doctors_readiness_gate_names_each_connection_by_its_label(probe, capsys):
+    with _connect() as conn:
+        migrate(conn, "demo", [], major=1, minor=0)
+    work = probe["adapter"].set("demo", "connection", "work", {}, own=True)
+    report = {"connections": {work: {"keys": [
+        {"key": "DEMO_WORK_TOKEN", "required": True, "set": False}]}}}
+    with pytest.raises(SystemExit):
+        probe["_doctor_gate"](report, None)
+    said = "".join(capsys.readouterr())
+    assert "work: DEMO_WORK_TOKEN" in said and work not in said, said
+
+
+def test_a_refusal_naming_withheld_connections_names_them_by_label(probe, capsys):
+    with _connect() as conn:
+        migrate(conn, "demo", [], major=1, minor=0)
+    adapter = probe["adapter"]
+    work = adapter.set("demo", "connection", "work", {}, own=True)
+    adapter.set("demo", "grant", "work", {"enabled": False})
+    with pytest.raises(SystemExit):
+        probe["_connections_registry"]()
+    said = "".join(capsys.readouterr())
+    assert "withheld: work" in said and work not in said, said
+
 def test_an_identifier_written_for_a_connection_holds_its_id(probe, monkeypatch):
     with _connect() as conn:
         migrate(conn, "demo", [], major=1, minor=0)
