@@ -712,7 +712,7 @@ def _auth_gate() -> None:
         rule = allowed.get(NAME, allowed.get("*"))
         if _auth_capability_allowed(rule):
             verbs = _auth_rule_verbs(rule)
-            verb = sys.argv[1] if len(sys.argv) > 1 else "help"
+            verb = _invoked_verb() or "help"
             if verbs is None or verb in verbs or (
                     verb in _AUTH_CONTRACT_VERBS and not _reveals()):
                 return

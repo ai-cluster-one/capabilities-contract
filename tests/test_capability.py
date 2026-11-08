@@ -377,3 +377,32 @@ def test_a_bad_further_owner_is_refused(store, tmp_path, monkeypatch, excepthook
     with pytest.raises(SystemExit) as stop:
         namespace["_cmd_migrate"]([])
     assert stop.value.code == 6 and "bad_owner_tables" in capsys.readouterr().err
+
+
+def test_a_verb_list_judges_the_verb_named_after_a_connection_selection(
+        monkeypatch, excepthook, capsys):
+    """A request whose authority limits it to listed verbs runs a listed verb
+    and refuses another wherever `--connection <id>` stands before it."""
+    monkeypatch.setenv("CAPABILITIES_AUTH_CONTEXT", json.dumps({
+        "source": "chat", "chat_id": "1", "sender_role": "member",
+        "allowed_capabilities": {"probe": {"allow": True, "verbs": ["download"]}}}))
+    namespace = _declarations()
+    bind(namespace, "core")
+
+    def gate(*argv) -> int | None:
+        monkeypatch.setattr(sys, "argv", ["probe", *argv])
+        try:
+            namespace["_auth_gate"]()
+        except SystemExit as stop:
+            return stop.code
+        return None
+
+    for argv in (("download", "1"), ("--connection", "bot", "download", "1"),
+                 ("--connection=bot", "download", "1")):
+        assert gate(*argv) is None, argv
+    capsys.readouterr()
+    for argv in (("send", "x"), ("--connection", "bot", "send", "x"),
+                 ("--connection=bot", "send", "x")):
+        assert gate(*argv) == 4, argv
+        err = capsys.readouterr().err
+        assert "verb_not_authorized" in err and "`probe send`" in err, err
