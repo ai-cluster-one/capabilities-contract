@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, NamedTuple
 
-from capabilities_contract.db import _connection_ids, _core
+from capabilities_contract.db import _connection_ids, _core, _keys
 from capabilities_contract.db._changes import CHANNEL_TABLE
 from capabilities_contract.db._connect import _psycopg, bind_search_path, bound_schema
 from capabilities_contract.db._errors import DbError
@@ -86,6 +86,17 @@ class Step:
     def checksum(self) -> str:
         return hashlib.sha256(self.sql.encode("utf-8")).hexdigest()
 
+    # A step also reads as the `(step id, sql)` pair it stands beside in a list of
+    # steps, so code that takes a step apart by position reads either alike.
+    def __iter__(self):
+        return iter((self.id, self.sql))
+
+    def __getitem__(self, index):
+        return (self.id, self.sql)[index]
+
+    def __len__(self) -> int:
+        return 2
+
 
 @dataclass
 class MigrateResult:
@@ -107,13 +118,16 @@ class MigrateResult:
 # owner `capabilities` (schema version 1.23 or older) to the core in place, and
 # makes them on a store that holds none (`_core`); the second gives every
 # connection its opaque id and moves every core reference to it
-# (`_connection_ids`). While empty, nothing runs for the core and nothing is
+# (`_connection_ids`); the third keys every agent and node reference by what
+# its parent takes with it, guards the ids and makes a parent's delete
+# deliberate (`_keys`). While empty, nothing runs for the core and nothing is
 # written for it.
 CORE_STEPS: tuple[Step, ...] = (
     Step(_core.CORE_STEP_ID, _core.CORE_STEP_SQL, major=_core.CORE_MAJOR),
     Step(_connection_ids.STEP_ID, _connection_ids.STEP_SQL, major=_connection_ids.MAJOR),
+    Step(_keys.STEP_ID, _keys.STEP_SQL, major=_keys.MAJOR),
 )
-CORE_VERSION = (_connection_ids.MAJOR, _connection_ids.MINOR)
+CORE_VERSION = (_keys.MAJOR, _keys.MINOR)
 
 # The pre-image the connection id step leaves: each connection's id beside the
 # capability, the name it was keyed by before core 3.0 and the label it had.

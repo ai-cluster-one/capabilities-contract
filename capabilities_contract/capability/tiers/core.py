@@ -2108,6 +2108,13 @@ def _plan_store() -> None:
                      schema = None):
         if not isinstance(conn, _PlanConnection):
             return real_migrate(conn, owner, steps, major=major, minor=minor, schema=schema)
+        # As a migration does, the core's pending steps are planned before any
+        # other owner's, whose steps may reference the core's tables and functions.
+        from capabilities_contract.db import _migrate as core_ledger
+        if owner != core_ledger.CORE_OWNER and core_ledger.CORE_STEPS:
+            plan_migrate(conn, core_ledger.CORE_OWNER, core_ledger.CORE_STEPS,
+                         major=core_ledger.CORE_VERSION[0], minor=core_ledger.CORE_VERSION[1],
+                         schema=schema)
         steps = list(steps)
         found = held(conn, owner, steps, major, minor, schema)
         if found.state in ("checksum_mismatch", "schema_too_new"):

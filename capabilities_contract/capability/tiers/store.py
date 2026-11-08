@@ -341,7 +341,7 @@ NODE_LOG_MANAGER = "manager"
 NODE_LOG_LINES = 100
 NODE_LOG_LINE_CHARS = 500
 NODE_LOG_MASK = "***"
-STORE_TABLES_VERSION = (3, 0)
+STORE_TABLES_VERSION = (4, 0)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -2623,7 +2623,13 @@ class StoreRecords(FileRecords):
                              f"{capability} connection {word!r} is agent {held}'s own, "
                              "so only that agent removes it",
                              "remove it in that agent's project")
-        return conn.execute("DELETE FROM connections WHERE id = %s", (cid,)).rowcount > 0
+        # A connection is deleted on purpose, named in store.deleting_connection,
+        # and what it holds goes with it: its grants, node sessions, settings and
+        # every row a capability keeps of it.
+        conn.execute("SELECT set_config('store.deleting_connection', %s, true)", (cid,))
+        gone = conn.execute("DELETE FROM connections WHERE id = %s", (cid,)).rowcount > 0
+        conn.execute("SELECT set_config('store.deleting_connection', '', true)")
+        return gone
 
     def connection_labels(self, capability: str) -> dict[str, str]:
         """What each connection of `capability` the store holds is called, by

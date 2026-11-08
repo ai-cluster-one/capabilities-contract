@@ -24,6 +24,7 @@ from capabilities_contract.db import (
     DbError,
     _migrate,
     connect,
+    deleting,
     disconnect,
     migrate,
 )
@@ -99,7 +100,7 @@ def _moved(conn, monkeypatch, schema=None):
     with monkeypatch.context() as patched:
         patched.setenv(UPGRADE_ENV, "1")
         result = migrate(conn, "demo", [], major=1, minor=0, schema=schema)
-    assert result.core.applied == ["0040-connection-ids"]
+    assert result.core.applied == [step.id for step in _migrate.CORE_STEPS[1:]]
     return dict(_rows(conn, "SELECT capability || '/' || label, id FROM connections"))
 
 
@@ -223,6 +224,7 @@ def test_every_core_reference_holds_the_connection_id_and_goes_with_it(store, mo
         # A node keeps itself when its Coolify connection goes; every other row
         # naming a connection goes with it.
         with conn.transaction():
+            deleting(conn, "connections", box, home)
             conn.execute("DELETE FROM connections WHERE id = %s", (box,))
             conn.execute("DELETE FROM connections WHERE id = %s", (home,))
         assert _rows(conn, "SELECT id, coolify_connection_id, coolify_server FROM nodes"
@@ -347,7 +349,20 @@ def probe(store, tmp_path, monkeypatch):
     sys.excepthook = saved
 
 
-def test_a_connection_added_under_a_word_is_called_by_it_and_named_by_its_id_or_label(probe):
+@pytest.fixture()
+def registered(probe):
+    """The probe's project agent registered on the store's core: a row of the
+    store names only an agent the store holds."""
+    conn = _connect()
+    migrate(conn, "demo", [], major=1, minor=0)
+    with conn.transaction():
+        conn.execute("INSERT INTO agents (id, kind) VALUES (%s, 'agent') "
+                     "ON CONFLICT (id) DO NOTHING", (AGENT,))
+    conn.close()
+    return probe
+
+
+def test_a_connection_added_under_a_word_is_called_by_it_and_named_by_its_id_or_label(probe, registered):
     with _connect() as conn:
         migrate(conn, "demo", [], major=1, minor=0)
     adapter = probe["adapter"]
@@ -372,7 +387,7 @@ def test_a_connection_added_under_a_word_is_called_by_it_and_named_by_its_id_or_
 
 
 
-def test_doctors_readiness_gate_names_each_connection_by_its_label(probe, capsys):
+def test_doctors_readiness_gate_names_each_connection_by_its_label(probe, registered, capsys):
     with _connect() as conn:
         migrate(conn, "demo", [], major=1, minor=0)
     work = probe["adapter"].set("demo", "connection", "work", {}, own=True)
@@ -384,7 +399,7 @@ def test_doctors_readiness_gate_names_each_connection_by_its_label(probe, capsys
     assert "work: DEMO_WORK_TOKEN" in said and work not in said, said
 
 
-def test_a_refusal_naming_withheld_connections_names_them_by_label(probe, capsys):
+def test_a_refusal_naming_withheld_connections_names_them_by_label(probe, registered, capsys):
     with _connect() as conn:
         migrate(conn, "demo", [], major=1, minor=0)
     adapter = probe["adapter"]
@@ -395,7 +410,7 @@ def test_a_refusal_naming_withheld_connections_names_them_by_label(probe, capsys
     said = "".join(capsys.readouterr())
     assert "withheld: work" in said and work not in said, said
 
-def test_an_identifier_written_for_a_connection_holds_its_id(probe, monkeypatch):
+def test_an_identifier_written_for_a_connection_holds_its_id(probe, registered, monkeypatch):
     with _connect() as conn:
         migrate(conn, "demo", [], major=1, minor=0)
     adapter = probe["adapter"]

@@ -8,6 +8,7 @@ Importing this module does not import psycopg; `connect`, `batch` and `migrate` 
 from capabilities_contract.db._changes import FOLLOW_INTERVAL_SECONDS, Follower, announce
 from capabilities_contract.db._connect import batch, connect, disconnect
 from capabilities_contract.db._errors import DbError
+from capabilities_contract.db._keys import DELETING_SETTINGS, deleting
 from capabilities_contract.db._migrate import (
     CONNECTION_NAMES_TABLE,
     STORE_MAJOR,
@@ -34,6 +35,7 @@ from capabilities_contract.db._setting import (
 
 __all__ = [
     "CONNECTION_NAMES_TABLE",
+    "DELETING_SETTINGS",
     "DEFAULT_SCHEMA",
     "FOLLOW_INTERVAL_SECONDS",
     "KEYS",
@@ -51,6 +53,7 @@ __all__ = [
     "announce",
     "batch",
     "connect",
+    "deleting",
     "disconnect",
     "migrate",
     "moved_stub",

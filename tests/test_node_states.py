@@ -6,10 +6,11 @@ from __future__ import annotations
 
 import time
 
+import psycopg
 import pytest
 
 from capabilities_contract.capability import store as store_tier
-from capabilities_contract.db import _legacy, connect, disconnect, migrate
+from capabilities_contract.db import _legacy, connect, deleting, disconnect, migrate
 from capabilities_contract.db import _migrate as _migrate_module
 
 NODE = "0a0b0c0d0e0f"
@@ -219,23 +220,26 @@ def test_a_write_replaces_one_capabilitys_sessions_and_a_prune_drops_only_its_ow
     assert [(r["capability"], r["live"]) for r in peer] == [("whatsapp", True)]
 
 
-def test_both_tables_follow_the_registry_id_and_go_with_the_node(nodes):
+def test_both_tables_keep_the_registry_id_and_go_with_the_node(nodes):
     with _conn() as conn:
         with conn.transaction():
             store_tier.node_state_put(conn, NODE, cpu_count=1)
             store_tier.node_logins_put(conn, AGENT, NODE, {})
             store_tier.node_sessions_put(conn, AGENT, NODE, "whatsapp",
                                          _ids("whatsapp", [("main", True, None)]))
-            conn.execute("UPDATE nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
-                         (NODE,))
-        assert [r["node"] for r in store_tier.node_states(conn, ["aaaaaaaaaaaa"])] == [
-            "aaaaaaaaaaaa"]
-        assert [r["node"] for r in store_tier.node_logins(conn, AGENT, ["aaaaaaaaaaaa"])] == [
-            "aaaaaaaaaaaa"]
-        assert [r["node"] for r in store_tier.node_sessions(conn, AGENT, ["aaaaaaaaaaaa"])] \
-            == ["aaaaaaaaaaaa"]
+            with pytest.raises(psycopg.errors.CheckViolation, match="keeps its id"):
+                with conn.transaction():
+                    conn.execute("UPDATE nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
+                                 (NODE,))
+        assert [r["node"] for r in store_tier.node_states(conn, [NODE])] == [
+            NODE]
+        assert [r["node"] for r in store_tier.node_logins(conn, AGENT, [NODE])] == [
+            NODE]
+        assert [r["node"] for r in store_tier.node_sessions(conn, AGENT, [NODE])] \
+            == [NODE]
         with conn.transaction():
-            conn.execute("DELETE FROM nodes WHERE id = 'aaaaaaaaaaaa'")
+            deleting(conn, "nodes", NODE)
+            conn.execute("DELETE FROM nodes WHERE id = %s", (NODE,))
         assert conn.execute("SELECT (SELECT count(*) FROM node_states)"
                             " + (SELECT count(*) FROM node_logins)"
                             " + (SELECT count(*) FROM node_sessions)"
@@ -310,19 +314,22 @@ def test_the_owners_word_is_set_changed_and_taken_back_per_agent_and_node(nodes)
                 store_tier.node_expectation_set(conn, AGENT, NODE, expected=True, **bad)
 
 
-def test_the_owners_words_follow_the_registry_id_and_go_with_the_node(nodes):
+def test_the_owners_words_keep_the_registry_id_and_go_with_the_node(nodes):
     with _conn() as conn:
         with conn.transaction():
             store_tier.node_expectation_set(conn, AGENT, NODE, tool="gh", expected=True)
             store_tier.node_expectation_set(conn, AGENT, NODE, capability="telegram",
                                             connection=CONN[("telegram", "main")],
                                             expected=True)
-            conn.execute("UPDATE nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
-                         (NODE,))
-        moved = store_tier.node_expectations(conn, AGENT, ["aaaaaaaaaaaa"])
+            with pytest.raises(psycopg.errors.CheckViolation, match="keeps its id"):
+                with conn.transaction():
+                    conn.execute("UPDATE nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
+                                 (NODE,))
+        moved = store_tier.node_expectations(conn, AGENT, [NODE])
         assert [len(moved["sign_ins"]), len(moved["sessions"])] == [1, 1]
         with conn.transaction():
-            conn.execute("DELETE FROM nodes WHERE id = 'aaaaaaaaaaaa'")
+            deleting(conn, "nodes", NODE)
+            conn.execute("DELETE FROM nodes WHERE id = %s", (NODE,))
         assert conn.execute(
             "SELECT (SELECT count(*) FROM node_login_expectations)"
             " + (SELECT count(*) FROM node_session_expectations)"
@@ -426,14 +433,17 @@ def test_an_update_run_is_asked_taken_up_and_ended_one_at_a_time_per_node(nodes)
         assert state == "failed" and reason.startswith("interrupted")
         assert {r["node"] for r in store_tier.node_updates(conn, [NODE, OTHER])} == {
             NODE, OTHER}
-        # The runs follow the registry's id and go with the node.
+        # The runs keep the registry's id, which never changes, and go with the node.
         with conn.transaction():
-            conn.execute("UPDATE nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
-                         (NODE,))
-        assert [r["state"] for r in store_tier.node_updates(conn, ["aaaaaaaaaaaa"])] == [
+            with pytest.raises(psycopg.errors.CheckViolation, match="keeps its id"):
+                with conn.transaction():
+                    conn.execute("UPDATE nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
+                                 (NODE,))
+        assert [r["state"] for r in store_tier.node_updates(conn, [NODE])] == [
             "running"]
         with conn.transaction():
-            conn.execute("DELETE FROM nodes WHERE id = 'aaaaaaaaaaaa'")
+            deleting(conn, "nodes", NODE)
+            conn.execute("DELETE FROM nodes WHERE id = %s", (NODE,))
         assert conn.execute("SELECT count(*) FROM node_updates"
                             " WHERE node <> %s", (OTHER,)).fetchone()[0] == 0
 
@@ -511,13 +521,16 @@ def test_log_lines_go_with_their_service_their_agents_link_and_their_node(nodes)
         assert store_tier.node_logs(conn, GONE, [NODE]) == []
         assert len(store_tier.node_logs(conn, PEER, [NODE])) == 3
         with conn.transaction():
-            conn.execute("UPDATE nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
-                         (OTHER,))
-        assert [r["node"] for r in store_tier.node_logs(conn, AGENT, ["aaaaaaaaaaaa"])] == [
-            "aaaaaaaaaaaa"]
+            with pytest.raises(psycopg.errors.CheckViolation, match="keeps its id"):
+                with conn.transaction():
+                    conn.execute("UPDATE nodes SET id = 'aaaaaaaaaaaa' WHERE id = %s",
+                                 (OTHER,))
+        assert [r["node"] for r in store_tier.node_logs(conn, AGENT, [OTHER])] == [
+            OTHER]
         with conn.transaction():
-            conn.execute("DELETE FROM nodes WHERE id = 'aaaaaaaaaaaa'")
-        assert store_tier.node_logs(conn, AGENT, ["aaaaaaaaaaaa"]) == []
+            deleting(conn, "nodes", OTHER)
+            conn.execute("DELETE FROM nodes WHERE id = %s", (OTHER,))
+        assert store_tier.node_logs(conn, AGENT, [OTHER]) == []
 
 
 def test_a_store_at_the_logs_step_takes_only_the_session_reasons_step(store, monkeypatch):
