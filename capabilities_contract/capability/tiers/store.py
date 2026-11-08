@@ -2626,9 +2626,13 @@ class StoreRecords(FileRecords):
         # A connection is deleted on purpose, named in store.deleting_connection,
         # and what it holds goes with it: its grants, node sessions, settings and
         # every row a capability keeps of it.
-        conn.execute("SELECT set_config('store.deleting_connection', %s, true)", (cid,))
+        from capabilities_contract import db
+        # The store's deferred triggers run at COMMIT and read the setting then,
+        # so they run here: the earlier statements' outside it, the cascade's
+        # inside it.
+        db.deleting(conn, "connections", cid)
         gone = conn.execute("DELETE FROM connections WHERE id = %s", (cid,)).rowcount > 0
-        conn.execute("SELECT set_config('store.deleting_connection', '', true)")
+        db.deleting(conn, "connections")
         return gone
 
     def connection_labels(self, capability: str) -> dict[str, str]:

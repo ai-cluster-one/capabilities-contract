@@ -446,4 +446,8 @@ def deleting(conn, parent: str, *ids: str) -> None:
     before its `DELETE`; outside a transaction it holds for no statement."""
     setting = DELETING_SETTINGS[parent]
     named = [i for i in ids if i]
+    # Deferred triggers (notifications) run at COMMIT and read the setting
+    # then: the pending ones run now, so the statements before a delete notify
+    # outside the setting and the cascade's before it is cleared, inside it.
+    conn.execute("SET CONSTRAINTS ALL IMMEDIATE")
     conn.execute("SELECT set_config(%s, %s, true)", (setting, ",".join(named)))

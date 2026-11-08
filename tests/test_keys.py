@@ -110,6 +110,38 @@ def test_a_history_guard_admits_the_cascade_and_nothing_else(conn):
         (AGENT, None)]
 
 
+def test_a_deferred_notification_of_the_cascade_is_quiet_and_one_before_it_is_not(conn):
+    # A notify trigger the store defers to COMMIT reads the setting there, after
+    # the removal verb has cleared it: deleting() runs it before.
+    migrate(conn, "core", _migrate.CORE_STEPS, major=4, minor=0)
+    _seed(conn)
+    with conn.transaction():
+        conn.execute("CREATE TABLE demo_pins (id int PRIMARY KEY, "
+                     "node text REFERENCES nodes (id) ON DELETE SET NULL)")
+        conn.execute("CREATE FUNCTION demo_pins_notify() RETURNS trigger LANGUAGE plpgsql "
+                     "AS $$ BEGIN IF store_state_deleting() THEN RETURN NULL; END IF; "
+                     "PERFORM pg_notify('demo_pins', coalesce(new.node, 'none')); "
+                     "RETURN NULL; END $$")
+        conn.execute("CREATE CONSTRAINT TRIGGER demo_pins_notify AFTER INSERT OR UPDATE "
+                     "ON demo_pins DEFERRABLE INITIALLY DEFERRED FOR EACH ROW "
+                     "EXECUTE FUNCTION demo_pins_notify()")
+        conn.execute("INSERT INTO demo_pins VALUES (1, %s)", (NODE,))
+    listener = connect(application_name="capabilities-contract-tests")
+    try:
+        listener.execute("LISTEN demo_pins")
+        listener.commit()
+        with conn.transaction():
+            conn.execute("UPDATE demo_pins SET node = node")
+            deleting(conn, "nodes", NODE)
+            conn.execute("DELETE FROM nodes WHERE id = %s", (NODE,))
+            deleting(conn, "nodes")
+        heard = [n.payload for n in listener.notifies(timeout=1)]
+    finally:
+        listener.close()
+    assert heard == [NODE]
+    assert conn.execute("SELECT node FROM demo_pins").fetchone()[0] is None
+
+
 def test_the_step_settles_what_names_a_missing_agent_or_node(conn, monkeypatch):
     with monkeypatch.context() as patched:
         patched.setattr(_migrate, "CORE_STEPS", CORE_3)
