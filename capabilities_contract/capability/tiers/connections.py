@@ -302,6 +302,18 @@ def _connection_labels() -> dict:
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
 
 
+def _connection_created() -> dict:
+    """When the store made each connection's row, by its id, as ISO text: None
+    for a connection that predates the store recording it. A connection kept
+    in files has no row and is not listed, and a store that cannot answer
+    lists none, so the report says null rather than failing."""
+    try:
+        held = getattr(_records(), "connection_created", None)
+        return held(NAME) if held is not None else {}
+    except StoreError:
+        return {}
+
+
 def _connection_label(cid: str) -> str:
     """What connection `cid` is called: its label in the store, else its id,
     which is what a connection kept in files is called."""

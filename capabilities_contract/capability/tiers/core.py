@@ -2227,8 +2227,10 @@ def _cmd_connections_reported() -> None:
     beside it, so a reader sees why no connection may write; in a machine read
     each connection the machine lent is named as the machine's, read-only.
     Each connection carries `identity`, who it is as its record says, read
-    without a round-trip, and `label`, what it is called: the label
-    `connection rename` gave it, else its id."""
+    without a round-trip, `label`, what it is called: the label
+    `connection rename` gave it, else its id, and `created_at`, when the
+    store made its row (ISO text), null for a connection kept in files or
+    older than the store recording it."""
     import contextlib
     import io
     captured = io.StringIO()
@@ -2258,6 +2260,11 @@ def _cmd_connections_reported() -> None:
         for cid, entry in conns.items():
             if isinstance(entry, dict):
                 entry["label"] = labels.get(cid) or cid
+    if "_connection_created" in globals() and conns:
+        created = _connection_created()
+        for cid, entry in conns.items():
+            if isinstance(entry, dict):
+                entry["created_at"] = created.get(cid)
     if read_only_switch():
         for entry in conns.values():
             if isinstance(entry, dict):

@@ -341,7 +341,7 @@ NODE_LOG_MANAGER = "manager"
 NODE_LOG_LINES = 100
 NODE_LOG_LINE_CHARS = 500
 NODE_LOG_MASK = "***"
-STORE_TABLES_VERSION = (4, 0)
+STORE_TABLES_VERSION = (4, 1)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -1620,6 +1620,14 @@ class FileRecords(Records):
         rows = self._global_rows()
         return rows.connection_labels(capability) if rows is not None else {}
 
+    def connection_created(self, capability: str) -> dict[str, str | None]:
+        """When the store made the row of each connection it holds, by id, as
+        ISO text; None for a row older than the store recording it. Files
+        record no such moment: a connection there is not listed; where the
+        store's rows are the global layer, theirs are answered."""
+        rows = self._global_rows()
+        return rows.connection_created(capability) if rows is not None else {}
+
     def _word_id(self, capability: str, word: Any) -> Any:
         """The id of the connection `word` names by its label, where it names
         none by its id; `word` itself otherwise."""
@@ -2645,6 +2653,21 @@ class StoreRecords(FileRecords):
             rows = self._read("SELECT id, label FROM connections WHERE capability = %s "
                               "ORDER BY label", (capability,))
             held = {cid: label for cid, label in rows}
+            self._cache[key] = (time.monotonic(), held)
+        return held
+
+    def connection_created(self, capability: str) -> dict[str, str | None]:
+        """When the store made the row of each connection of `capability` it
+        holds, by its id, as ISO text; None for a row older than core 4.1. Read
+        through the row's JSON, so a store whose core is older still answers,
+        every row None."""
+        _store_check("capability", capability, CAPABILITY_RE)
+        key = ("created", capability)
+        held = self._fresh(key)
+        if held is None:
+            rows = self._read("SELECT c.id, to_jsonb(c) ->> 'created_at' FROM connections c "
+                              "WHERE c.capability = %s", (capability,))
+            held = {cid: created for cid, created in rows}
             self._cache[key] = (time.monotonic(), held)
         return held
 
