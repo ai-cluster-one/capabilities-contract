@@ -775,18 +775,61 @@ def _require_project_enabled_for_service() -> Path:
     return root
 
 
-def _read_only_gate(action: str) -> None:
+def _read_only_gate(action: str, archived: bool = True) -> None:
     """Refuse `action` when this process runs under the read-only switch.
 
     The switch is decided by the store tier's `read_only_switch`; this is the
     one refusal every writer that consults it gives, so a caller branches on one
-    code, and that code is distinct from a connection's own read-only grant."""
+    code, and that code is distinct from a connection's own read-only grant.
+
+    Every writer that consults it is also refused where the agent this
+    process runs for is archived (`_archived_gate`), unless `archived` is
+    False: `_gate` passes False for the writes that act on the machine's store
+    or for a machine service, and refuses a project's service activation
+    itself."""
     if read_only_switch():
         _die(4, "read_only_switch",
              f"{action} is refused: {READ_ONLY_ENV} is set, so {NAME} may read "
              "but change nothing in this process",
              "Do not lift the switch yourself — ask the user; the change has to "
              f"run in a process without {READ_ONLY_ENV}.")
+    if archived:
+        _archived_gate(action)
+
+
+def _archived_gate(action: str) -> None:
+    """Refuse `action`, a write, where the agent this project runs for is
+    archived (`agents.archived_at`), exit 4 `agent_archived`. A project with no
+    id, with no store, whose store does not answer, holds no row for the agent
+    or predates the mark (core 4.2) is not refused here: the mark is read
+    through the row's JSON, and a write the store cannot take fails there."""
+    root = _project_root()
+    ident = _project_id_state_at(root)["id"] if root is not None else None
+    if not ident:
+        return
+    try:
+        conn, _schema = _store_connect(root, NAME, _PROBE_TIMEOUT)
+    except StoreError:
+        return
+    import psycopg
+    try:
+        mark = agent_archived(conn, ident)
+    except psycopg.Error:
+        mark = None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if mark:
+        by = f" by {mark['archived_by']}" if mark.get("archived_by") else ""
+        _die(4, "agent_archived",
+             f"{action} is refused: agent {ident} is archived (since "
+             f"{mark['archived_at']}{by}), so {NAME} may read but change or start "
+             "nothing for it",
+             "Do not restore it yourself — ask the user; `capabilities agent restore "
+             f"{ident}` clears the mark. Reading, help, doctor and stopping a service "
+             "still work.")
 
 
 def _system_agent_gate(action: str) -> None:
@@ -881,6 +924,16 @@ def _gate() -> None:
     Under the read-only switch a bundled service is neither set up nor started
     nor handed a new declaration.
 
+    Where the agent the project runs for is archived, a write is refused, exit
+    4 `agent_archived` (`_archived_gate`): a write is what the read-only switch
+    refuses. Here that is setting up, starting, running or reloading the
+    project's service and joining a machine service; every other write - a
+    verb in WRITE_VERBS through `_write_gate`, a record write, a capability's
+    own - is refused where it consults `_read_only_gate`. Reading, help,
+    doctor, discovery and stopping or leaving a service are no writes; a
+    machine service's own call (`--machine`), `migrate` and machine
+    administration act for no agent and are not refused.
+
     A service that declares `machine` takes `--machine` on its service verbs;
     such a call resolves no project and reads no policy row, because the
     machine service checks each opted-in project's own policy before every
@@ -914,22 +967,25 @@ def _gate() -> None:
         _machine_gate()
     if verb == "migrate" and service_action == "files":
         if sys.argv[3:4] == ["write"]:
-            _read_only_gate(f"`{NAME} migrate files write`")
+            _read_only_gate(f"`{NAME} migrate files write`", archived=False)
         return
     if tables_migrate:
         if service_action != "status":
-            _read_only_gate(f"`{NAME} migrate`")
+            _read_only_gate(f"`{NAME} migrate`", archived=False)
         return
     service_contract = globals().get("SERVICE")
     service_call = isinstance(service_contract, dict) and verb == "service"
     machine_service = service_call and isinstance(service_contract.get("machine"), dict)
     if service_call and (service_action in {"init", "start", "run", "reload"}
                          or (machine_service and service_action in {"join", "leave"})):
-        _read_only_gate(f"`{NAME} service {service_action}`")
+        _read_only_gate(f"`{NAME} service {service_action}`", archived=False)
     if machine_service and service_action != "join" and "--machine" in sys.argv[3:]:
         return
     if not safe and _machine_administration():
         return
+    if service_call and (service_action in {"init", "start", "run", "reload"}
+                         or (machine_service and service_action == "join")):
+        _archived_gate(f"`{NAME} service {service_action}`")
     if service_call and (service_action in {"init", "start", "run"}
                          or (machine_service and service_action == "join")):
         _require_project_enabled_for_service()

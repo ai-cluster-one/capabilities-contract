@@ -25,7 +25,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, NamedTuple
 
-from capabilities_contract.db import _connection_created, _connection_ids, _core, _keys
+from capabilities_contract.db import (
+    _agent_archived,
+    _connection_created,
+    _connection_ids,
+    _core,
+    _keys,
+)
 from capabilities_contract.db._changes import CHANNEL_TABLE
 from capabilities_contract.db._connect import _psycopg, bind_search_path, bound_schema
 from capabilities_contract.db._errors import DbError
@@ -121,15 +127,18 @@ class MigrateResult:
 # (`_connection_ids`); the third keys every agent and node reference by what
 # its parent takes with it, guards the ids and makes a parent's delete
 # deliberate (`_keys`); the fourth, a minor step, records when the store made
-# each connection's row (`_connection_created`). While empty, nothing runs for
-# the core and nothing is written for it.
+# each connection's row (`_connection_created`); the fifth, a minor step, lets
+# an agent be archived and refuses starting anything for it then
+# (`_agent_archived`). While empty, nothing runs for the core and nothing is
+# written for it.
 CORE_STEPS: tuple[Step, ...] = (
     Step(_core.CORE_STEP_ID, _core.CORE_STEP_SQL, major=_core.CORE_MAJOR),
     Step(_connection_ids.STEP_ID, _connection_ids.STEP_SQL, major=_connection_ids.MAJOR),
     Step(_keys.STEP_ID, _keys.STEP_SQL, major=_keys.MAJOR),
     Step(_connection_created.STEP_ID, _connection_created.STEP_SQL),
+    Step(_agent_archived.STEP_ID, _agent_archived.STEP_SQL),
 )
-CORE_VERSION = (_connection_created.MAJOR, _connection_created.MINOR)
+CORE_VERSION = (_agent_archived.MAJOR, _agent_archived.MINOR)
 
 # The pre-image the connection id step leaves: each connection's id beside the
 # capability, the name it was keyed by before core 3.0 and the label it had.

@@ -37,7 +37,7 @@ def test_a_store_at_core_4_0_takes_the_step_without_the_upgrade_and_old_rows_sta
         conn.execute("INSERT INTO connections (capability, label, spec) "
                      "VALUES ('demo', 'old', '{}')")
     monkeypatch.delenv(_migrate.UPGRADE_ENV, raising=False)
-    result = migrate(conn, "core", _migrate.CORE_STEPS, major=4, minor=1)
+    result = migrate(conn, "core", _migrate.CORE_STEPS[:4], major=4, minor=1)
     assert result.applied == ["0042-connection-created-at"]
     assert (result.major, result.minor) == (4, 1)
     assert _created(conn, "old") is None

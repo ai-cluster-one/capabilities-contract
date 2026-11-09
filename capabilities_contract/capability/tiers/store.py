@@ -341,7 +341,7 @@ NODE_LOG_MANAGER = "manager"
 NODE_LOG_LINES = 100
 NODE_LOG_LINE_CHARS = 500
 NODE_LOG_MASK = "***"
-STORE_TABLES_VERSION = (4, 1)
+STORE_TABLES_VERSION = (4, 2)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -4409,6 +4409,24 @@ def agent_kind(conn: Any, agent_id: str) -> str | None:
     if row is None:
         return None
     return row[0] or "agent"
+
+
+def agent_archived(conn: Any, agent_id: str) -> dict[str, str | None] | None:
+    """When and by whom the agent was archived, `{archived_at, archived_by}`
+    as its registry row holds them (ISO text): None where it is not archived,
+    where the store holds no such row, and where its core predates the mark
+    (4.2), since the row is read through its JSON."""
+    import psycopg
+    try:
+        row = conn.execute(f"SELECT to_jsonb(a) ->> 'archived_at', to_jsonb(a) ->> 'archived_by'"
+                           f" FROM {STORE_AGENTS_TABLE} a WHERE id = %s",
+                           (agent_id,)).fetchone()
+    except psycopg.errors.UndefinedTable:
+        conn.rollback()
+        return None
+    if row is None or row[0] is None:
+        return None
+    return {"archived_at": row[0], "archived_by": row[1]}
 
 
 def open_records(envelope: Path | str, global_dir: Path | str,

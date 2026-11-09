@@ -5,6 +5,7 @@ and at which store major, and announce and follow changes by polling.
 Importing this module does not import psycopg; `connect`, `batch` and `migrate` do.
 """
 
+from capabilities_contract.db._agent_archived import AGENT_ARCHIVED_CODE, AGENT_ARCHIVED_SQLSTATE
 from capabilities_contract.db._changes import FOLLOW_INTERVAL_SECONDS, Follower, announce
 from capabilities_contract.db._connect import batch, connect, disconnect
 from capabilities_contract.db._errors import DbError
@@ -34,6 +35,8 @@ from capabilities_contract.db._setting import (
 )
 
 __all__ = [
+    "AGENT_ARCHIVED_CODE",
+    "AGENT_ARCHIVED_SQLSTATE",
     "CONNECTION_NAMES_TABLE",
     "DELETING_SETTINGS",
     "DEFAULT_SCHEMA",
