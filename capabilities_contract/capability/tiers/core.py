@@ -2388,9 +2388,15 @@ def _manifest_core() -> dict:
     adds to its manifest - a service, a contribution - starts from this, so the
     shared part has one home. A capability that keeps tables also names the
     store major its shared database library reads and every owner its
-    `migrate` migrates, in order, its own last."""
+    `migrate` migrates, in order, its own last. A capability's fixed human
+    name, `TITLE`, and the Lucide name of its line icon, `LUCIDE_ICON`, are
+    carried as `title` and `lucide_icon` where it declares them."""
     from capabilities_contract.db import STORE_MAJOR
-    return {"name": NAME, "summary": SUMMARY,
+    return {"name": NAME,
+            **({"title": globals()["TITLE"]} if globals().get("TITLE") else {}),
+            **({"lucide_icon": globals()["LUCIDE_ICON"]}
+               if globals().get("LUCIDE_ICON") else {}),
+            "summary": SUMMARY,
             "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
             "docs": {"base": DOCS_BASE,
                      "topics": [entry["topic"] for entry in _guide_menu()]},

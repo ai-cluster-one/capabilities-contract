@@ -322,6 +322,16 @@ def test_the_manifest_names_the_store_major_when_the_capability_keeps_tables(
     assert "store_major" not in without["_manifest_core"]()
 
 
+def test_the_manifest_carries_the_title_and_lucide_icon_a_capability_declares(
+        tmp_path, monkeypatch, excepthook):
+    declared = _quarantined(tmp_path, monkeypatch, TITLE="Probe", LUCIDE_ICON="list-checks")
+    manifest = declared["_manifest_core"]()
+    assert (manifest["title"], manifest["lucide_icon"]) == ("Probe", "list-checks")
+    bare = _quarantined(tmp_path, monkeypatch)
+    assert "title" not in bare["_manifest_core"]()
+    assert "lucide_icon" not in bare["_manifest_core"]()
+
+
 def _migrating(tmp_path, monkeypatch, **extra) -> tuple[dict, list]:
     """A capability keeping tables in the test store, its answers caught."""
     namespace = _quarantined(tmp_path, monkeypatch, TABLES=True, **extra)
