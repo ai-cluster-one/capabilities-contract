@@ -2390,13 +2390,19 @@ def _manifest_core() -> dict:
     store major its shared database library reads and every owner its
     `migrate` migrates, in order, its own last. A capability's fixed human
     name, `TITLE`, and the Lucide name of its line icon, `LUCIDE_ICON`, are
-    carried as `title` and `lucide_icon` where it declares them."""
+    carried as `title` and `lucide_icon` where it declares them, and its
+    title and summary in other languages, `TRANSLATIONS` - an object keyed by
+    language code, each an object of `title` and `description` - as
+    `translations` where it declares them."""
     from capabilities_contract.db import STORE_MAJOR
     return {"name": NAME,
             **({"title": globals()["TITLE"]} if globals().get("TITLE") else {}),
             **({"lucide_icon": globals()["LUCIDE_ICON"]}
                if globals().get("LUCIDE_ICON") else {}),
             "summary": SUMMARY,
+            **({"translations": {code: dict(texts) for code, texts
+                                 in globals()["TRANSLATIONS"].items()}}
+               if globals().get("TRANSLATIONS") else {}),
             "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
             "docs": {"base": DOCS_BASE,
                      "topics": [entry["topic"] for entry in _guide_menu()]},
