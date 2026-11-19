@@ -659,6 +659,11 @@ def _auth_capability_allowed(rule) -> bool:
 _AUTH_CONTRACT_VERBS = frozenset(
     {"help", "guide", "ids", "connections", "refs", "stub", "manifest"})
 
+# Verbs a request reaches for a capability its authority does not grant: they
+# read the capability's reference and act on nothing, as project policy lets
+# them through for a capability it does not enable.
+_AUTH_REFERENCE_VERBS = frozenset({"help", "guide", "stub", "manifest"})
+
 
 def _reveals() -> bool:
     """Whether this call prints a connection's value in the clear. It is the
@@ -723,6 +728,8 @@ def _auth_gate() -> None:
     else:
         _die(4, "auth_context_invalid",
              "runtime authority context has invalid allowed_capabilities")
+    if (_invoked_verb() or "help") in _AUTH_REFERENCE_VERBS:
+        return
     _die(4, "capability_not_authorized",
          f"{NAME} is not authorized for this {source} request",
          f"role={role}; chat_id={chat}; adjust runtime authority policy instead of bypassing the gate")

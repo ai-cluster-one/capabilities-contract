@@ -425,3 +425,34 @@ def test_a_verb_list_judges_the_verb_named_after_a_connection_selection(
         assert gate(*argv) == 4, argv
         err = capsys.readouterr().err
         assert "verb_not_authorized" in err and "`probe send`" in err, err
+
+
+def test_a_capability_the_authority_does_not_grant_still_answers_its_reference(
+        monkeypatch, excepthook, capsys):
+    """A request whose authority omits a capability reads its help, guide, stub
+    and manifest, and every other verb of it stays refused."""
+    namespace = _declarations()
+    bind(namespace, "core")
+
+    def gate(*argv) -> int | None:
+        monkeypatch.setattr(sys, "argv", ["probe", *argv])
+        try:
+            namespace["_auth_gate"]()
+        except SystemExit as stop:
+            return stop.code
+        return None
+
+    for allowed in ({"other": True}, ["other"], {"probe": False}):
+        monkeypatch.setenv("CAPABILITIES_AUTH_CONTEXT", json.dumps({
+            "source": "chat", "chat_id": "1", "sender_role": "member",
+            "allowed_capabilities": allowed}))
+        for argv in ((), ("help",), ("guide", "service"), ("stub",),
+                     ("manifest", "--json"), ("--connection", "bot", "help")):
+            assert gate(*argv) is None, (allowed, argv)
+        capsys.readouterr()
+        for argv in (("send", "x"), ("ids", "list"), ("connections",),
+                     ("refs",), ("doctor",), ("--connection", "bot", "send")):
+            assert gate(*argv) == 4, (allowed, argv)
+            assert "capability_not_authorized" in capsys.readouterr().err, argv
+    monkeypatch.delenv("CAPABILITIES_AUTH_CONTEXT")
+    assert gate("send", "x") is None
