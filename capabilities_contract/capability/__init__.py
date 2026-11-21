@@ -82,6 +82,12 @@ connections mode (`connections_mode`), so no help body states that home itself.
 Last it appends the project's identifiers as a labelled
 section rendered by `_render_ids_markdown` (the same format the manager's
 `capabilities ids <NAME>` produces, so one home for the rendering).
+A capability that also declares `HELP_VERBS`, a dict from each verb path to
+that verb's whole contract text, takes the layered help instead: `HELP` (or
+the docstring) is its menu, followed by the contract verbs' menu lines, the
+pointer to `help <verb>` and the identifiers; `help <verb>` prints that verb's
+page, the contract verbs' pages rendered here; and an unknown verb exits 6
+`unknown_verb` pointing at the menu.
 
 `_contract`'s `inventory` verb calls `_inventory(network)` only when the
 capability declares `INVENTORY`; that builder is per-capability and stays in

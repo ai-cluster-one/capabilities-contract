@@ -1465,9 +1465,10 @@ def _connections_home_section() -> str:
 def _cmd_help() -> None:
     """Bare top-level help: the CLI's HELP body (module-level `HELP` if
     defined, else the module docstring), then where this project keeps the
-    capability's connections, then the project's Identifiers section. Only
-    fires when no extra args follow — per-verb help stays untouched so
-    `<NAME> help <subcommand>` is not intercepted."""
+    capability's connections, then the project's Identifiers section. For a
+    capability that declares `HELP_VERBS` the body is its menu, followed by
+    the contract verbs' menu lines and the Identifiers section; the
+    declared sections are then the pages of `help <verb>`."""
     g = globals()
     text = g.get("HELP") or g.get("__doc__") or ""
     if text.startswith("\n"):
@@ -1475,6 +1476,13 @@ def _cmd_help() -> None:
     sys.stdout.write(text)
     if text and not text.endswith("\n"):
         sys.stdout.write("\n")
+    if _layered_help():
+        # The menu: the declared and connections sections are verb pages here.
+        sys.stdout.write(_contract_menu())
+        section = _identifiers_section()
+        if section:
+            sys.stdout.write(section)
+        return
     home = _connections_home_section()
     if home:
         sys.stdout.write(home)
@@ -1484,6 +1492,205 @@ def _cmd_help() -> None:
     section = _identifiers_section()
     if section:
         sys.stdout.write(section)
+
+
+# ---------------------------------------------------------------- layered help
+#
+# SHEBANG.md, "Agent-first help is the surface": `<NAME> help` is a short,
+# complete menu and `<NAME> help <verb>` gives one verb's whole contract. A
+# capability takes this shape by declaring `HELP_VERBS`, a dict from a verb
+# path ("add", "cards create") to that verb's whole contract text, beside a
+# `HELP` (or docstring) that is its menu. The contract verbs' own pages and
+# their menu lines are rendered here, so no capability writes them. A
+# capability that declares no `HELP_VERBS` answers `help` as it always has.
+
+def _layered_help() -> bool:
+    return isinstance(globals().get("HELP_VERBS"), dict)
+
+
+def _contract_menu() -> str:
+    """The menu lines of the contract verbs this capability carries, its
+    guides, and the pointer to the verb layer."""
+    g = globals()
+    width = 30
+    rows = [(f"{NAME} help [<verb>]", "this menu, or one verb's whole contract"),
+            (f"{NAME} doctor", "is it ready here: credentials, reachability, identity")]
+    if "_resolve_env_key" in g:
+        rows.append((f"{NAME} connections",
+                     "each connection and where its values resolve from; local"))
+    else:
+        rows.append((f"{NAME} connections", "reports no connections; it has none"))
+    parts = _declared_parts()
+    if parts["connection"]:
+        rows.append((f"{NAME} connection add|remove|seal|rename",
+                     "write one connection from its declared fields"))
+    if parts["setup"]:
+        rows.append((f"{NAME} setup [show]|set|unset", "this machine's prerequisites"))
+    if parts["settings"]:
+        rows.append((f"{NAME} settings [show]|get|set|unset|put",
+                     "its settings documents, read and written"))
+    rows += [(f"{NAME} stub", "the one-line awareness text"),
+             (f"{NAME} manifest", "the machine-readable declaration, as JSON"),
+             (f"{NAME} ids list|get|set|rm", "this project's identifiers for it"),
+             (f"{NAME} refs [show <name>]", "this project's reference files for it"),
+             (f"{NAME} inventory", "what it holds in this project; local")]
+    if _tables_declared():
+        rows.append((f"{NAME} migrate [status]", "its tables in the store: apply or report"))
+    topics = [entry["topic"] for entry in _guide_menu()]
+    rows.append((f"{NAME} guide [<topic>]",
+                 ("guides: " + ", ".join(topics)) if topics else "it ships no guides"))
+    out = "\n## Contract verbs\n\n"
+    for left, right in rows:
+        out += f"  {left.ljust(width)} {right}\n" if len(left) < width \
+            else f"  {left}  {right}\n"
+    out += (f"\nRun `{NAME} help <verb>` for one verb's whole contract: its arguments,\n"
+            "flags, output and exit codes.\n")
+    return out
+
+
+def _contract_pages() -> dict[str, str]:
+    """The whole contract of each contract verb this capability carries."""
+    g = globals()
+    parts = _declared_parts()
+    pages = {
+        "help": (
+            f"{NAME} help [<verb> ...]\n\n"
+            f"  Bare, the menu: every verb of {NAME} on one line saying what it answers,\n"
+            "  the contract verbs, the guides, and this project's identifiers for it.\n"
+            "  With a verb path, that verb's whole contract: its arguments, flags,\n"
+            "  output and exit codes. A path that names a group of verbs lists them.\n"
+            "  Reads nothing remote and passes the policy gate before enable.\n\n"
+            "  Exit codes: 0 answered; 6 unknown_verb for a path that names no verb,\n"
+            "  with nothing on stdout and the hint to run the bare menu.\n\n"
+            f"  Example: {NAME} help doctor\n"),
+        "doctor": (
+            f"{NAME} doctor [--connection <id>]\n\n"
+            "  Proves this capability is ready in the project it runs in: the cheapest\n"
+            "  real round-trip, per connection, proving the credentials resolve, the\n"
+            "  system answers and who it answers as. --connection <id|label> asks for\n"
+            "  one connection. Readiness is judged through the same resolution the\n"
+            f"  work verbs use (`{NAME} connections`). Where something needs a person -\n"
+            "  a value held twice with two values, a failed update - one line\n"
+            "  {\"supervisor\": {...}} follows on stderr.\n\n"
+            "  Output: one JSON object on stdout. Exit codes: 0 ready; 2 credentials\n"
+            "  missing or refused; 4 policy - not enabled in this project; 5 the system\n"
+            "  did not answer; 6 input, connections_required where a connection is\n"
+            "  needed and none is declared.\n"),
+        "connections": (
+            f"{NAME} connections\n"
+            f"{NAME} connections show <id> --reveal <KEY>\n\n"
+            "  The resolution report: every connection, every value it names, the tier\n"
+            "  and source it resolved from, secrets masked, its label, identity, write\n"
+            "  grant and the capability's policy state. Local only: no call to any\n"
+            "  system a connection names. `connections show` prints one value raw and\n"
+            "  in the clear, and nothing else; it passes the gate as an operational\n"
+            "  verb.\n\n"
+            "  Output: one JSON object on stdout. Exit codes: 0; 3 not_set for a key\n"
+            "  that holds no value; 4 policy; 6 connections_required where none is\n"
+            "  declared, unknown_field for an undeclared key, unknown_connection.\n"),
+        "stub": (
+            f"{NAME} stub\n\n"
+            "  The one-line awareness text the composed context carries, ending in the\n"
+            f"  pointer to `{NAME} help`. Plain text on stdout. Exit code 0.\n"),
+        "manifest": (
+            f"{NAME} manifest [--json]\n\n"
+            "  The machine-readable declaration the manager reads: name, title,\n"
+            "  summary, credential scope and keys, write verbs, guides, state, tables,\n"
+            "  inventory, service and context contribution. JSON on stdout; --json is\n"
+            "  accepted for explicitness. Exit code 0.\n"),
+        "guide": (
+            f"{NAME} guide\n"
+            f"{NAME} guide <topic>\n\n"
+            "  Bare, the menu of the guides it ships: a JSON list of {topic, title,\n"
+            "  preview, command}. With a topic, that guide's body, fetched live from\n"
+            "  the published docs and cached; when the docs do not answer, the cached\n"
+            "  copy is served with a warning on stderr.\n\n"
+            "  Exit codes: 0; 3 not_found for a topic it does not ship; 5\n"
+            "  network_error when the docs do not answer and nothing is cached.\n"),
+        "ids": (
+            f"{NAME} ids list\n"
+            f"{NAME} ids get <label>\n"
+            f"{NAME} ids set <label> <value> [--note <text>] [--global]\n"
+            f"{NAME} ids set <label> --connection <id|label> [--note <text>] [--global]\n"
+            f"{NAME} ids rm <label> [--global]\n\n"
+            "  The project's identifiers for this capability: durable, non-secret\n"
+            "  lookups (ids, codes, labels, account handles) worth not rediscovering.\n"
+            "  `list` answers the whole {label: {value, note}} object, `get` one raw\n"
+            "  value. `set` reads <value> as JSON, else as text; with --connection the\n"
+            "  identifier holds that connection's id. --global writes the machine's\n"
+            "  instead of this project's. Never a secret.\n\n"
+            "  Exit codes: 0; 3 not_found for an unknown label; 4 under the read-only\n"
+            "  switch for set and rm; 6 input.\n"),
+        "refs": (
+            f"{NAME} refs\n"
+            f"{NAME} refs show <name>\n\n"
+            "  Bare, the JSON list of this project's reference files for it, each\n"
+            "  {name, description, key} with its path or source, from front-matter.\n"
+            "  `show` prints one reference's body.\n\n"
+            "  Exit codes: 0; 3 not_found for an unknown name; 6 input.\n"),
+        "inventory": (
+            f"{NAME} inventory [--network] [--json]\n\n"
+            "  What this capability holds in this project, in the shape every\n"
+            "  capability shares: {capability, project, network, metrics, items,\n"
+            "  service, deferred}. Bare it is local, secret-free and changes nothing;\n"
+            "  --network consents to reach the remote system for detail a local read\n"
+            "  cannot supply, which is otherwise named under `deferred`. --json is\n"
+            "  accepted; the output is always JSON.\n\n"
+            "  Exit codes: 0; 6 input for an unknown option.\n"),
+    }
+    if parts["connection"] or parts["link"]:
+        pages["connection"] = (parts["connection"] + parts["link"] + parts["secrets"]).lstrip("\n")
+    if parts["setup"]:
+        pages["setup"] = (parts["setup"] + parts["secrets"]).lstrip("\n")
+    if parts["settings"]:
+        pages["settings"] = parts["settings"].lstrip("\n")
+    if "_resolve_env_key" in g:
+        pages["connections"] += _connections_home_section() + parts["secrets"]
+    if _tables_declared():
+        pages["migrate"] = (
+            f"{NAME} migrate\n"
+            f"{NAME} migrate status\n"
+            f"{NAME} migrate files plan|write|verify\n\n"
+            "  `migrate` applies its pending steps to its tables in the machine's\n"
+            "  store, under the store's lock; `migrate status` reports where they\n"
+            "  stand, without a lock, changing nothing. The manager runs it on install\n"
+            "  and update, and a service when it starts. `migrate files` moves its own\n"
+            "  configuration files of a project into the store for `capabilities\n"
+            "  migrate`.\n\n"
+            "  Output: one JSON object on stdout. Exit codes: 0; 5 the store did not\n"
+            "  answer; 6 input, or a step the store refuses.\n")
+    return pages
+
+
+def _help_pages() -> dict[str, str]:
+    """Every verb page: the contract's, with the capability's own text for a
+    contract verb following the contract's, and the capability's own verbs."""
+    pages = _contract_pages()
+    for key, text in (globals().get("HELP_VERBS") or {}).items():
+        path = " ".join(str(key).split())
+        text = str(text).strip("\n") + "\n"
+        pages[path] = (pages[path].rstrip("\n") + "\n\n" + text) if path in pages else text
+    return pages
+
+
+def _cmd_help_verb(path: list[str]) -> None:
+    """`<NAME> help <verb path>`: the longest declared path the words begin
+    with, else the verbs of the group they name, else the menu's pointer."""
+    pages = _help_pages()
+    for n in range(len(path), 0, -1):
+        key = " ".join(path[:n])
+        if key in pages:
+            sys.stdout.write(pages[key]); return
+    asked = " ".join(path)
+    group = sorted(k for k in pages if k.startswith(asked + " "))
+    if group:
+        out = f"{NAME} {asked}: run `{NAME} help {asked} <verb>` for one of\n\n"
+        for key in group:
+            first = pages[key].strip("\n").splitlines()[0]
+            out += f"  {first}\n"
+        sys.stdout.write(out); return
+    _die(6, "unknown_verb", f"{NAME} has no verb {asked!r}",
+         f"run `{NAME} help` for the menu of every verb")
 
 
 def _field_line(field: dict, scoped: bool = False) -> str:
@@ -1537,8 +1744,16 @@ def _declared_section() -> str:
     """The verbs the contract answers from this capability's declarations -
     `connection`, `setup`, `settings` and the linking methods - rendered from
     the declarations themselves, so help and behaviour cannot part."""
+    parts = _declared_parts()
+    return "".join(parts[k] for k in ("connection", "setup", "secrets", "link", "settings"))
+
+
+def _declared_parts() -> dict[str, str]:
+    """`_declared_section` in its parts, keyed by what each one documents, so
+    the layered help gives each to the verb page it belongs to."""
     conns = _connections_declaration()
     settings = _settings_declaration()
+    parts = {"connection": "", "setup": "", "secrets": "", "link": "", "settings": ""}
     out = ""
     if conns and conns.get("fields") is not None:
         out += (f"\n## Connections, written through the contract\n\n"
@@ -1628,6 +1843,7 @@ def _declared_section() -> str:
                 "      value exits 3 not_set, with nothing on stdout.\n")
         out += "  Fields:\n" + ("".join(_field_line(f) for f in conns["fields"])
                                 or "    none - an entry carries no fields of its own\n")
+    parts["connection"], out = out, ""
     if conns and conns.get("setup"):
         out += (f"\n## Machine setup, written through the contract\n\n"
                 f"  {NAME} setup [show] [--reveal <KEY>] | setup set [--machine] [--file] "
@@ -1646,8 +1862,10 @@ def _declared_section() -> str:
                 "      is taken only from the JSON object on stdin. --machine writes as\n"
                 "      administration of the machine: from anywhere, with no policy read.\n")
         out += "".join(_field_line(f) for f in conns["setup"])
+    parts["setup"], out = out, ""
     if conns is not None:
         out += _secret_resolution_section()
+    parts["secrets"], out = out, ""
     if conns and conns.get("link"):
         out += ("\n## Linking a connection\n\n"
                 "  Each method runs with --connection <id> added, speaks JSON lines on stdout -\n"
@@ -1659,6 +1877,7 @@ def _declared_section() -> str:
         for method in conns["link"]:
             out += (f"  {' '.join(method.get('argv') or [])}\n"
                     f"      {method.get('label', '')}: {method.get('help', '')}\n")
+    parts["link"], out = out, ""
     if settings:
         out += (f"\n## Settings, read and written through the contract\n\n"
                 f"  {NAME} settings [show] [--scope S]\n"
@@ -1679,7 +1898,8 @@ def _declared_section() -> str:
                     + "\n")
         if settings["keys"]:
             out += "  Declared keys:\n" + "".join(_field_line(k, scoped=True) for k in settings["keys"])
-    return out
+    parts["settings"] = out
+    return parts
 
 
 def _cmd_ids(argv: list[str]) -> None:
@@ -3138,9 +3358,10 @@ def _contract(argv: list[str]) -> None:
     """Dispatch the contract verbs; domain verbs fall through to the CLI's own
     parser. Runs after _gate(), before any credential is resolved.
 
-    `help` is a contract verb only when bare (no extra args) — the top-level
-    dump plus the Identifiers section. `<NAME> help <subcommand>` falls
-    through to the CLI so per-verb help stays clean.
+    `help` is a contract verb when bare (no extra args) — the top-level
+    body plus the Identifiers section. `<NAME> help <verb>` is one too for a
+    capability that declares `HELP_VERBS` (the layered help); for any other
+    it falls through to the CLI's own parser.
 
     `doctor` falls through too, with the one question it may raise armed for
     the process's exit, wherever a `--connection <id>` selection stands."""
@@ -3191,6 +3412,8 @@ def _contract(argv: list[str]) -> None:
         _cmd_setup(argv[1:])
     elif cmd == "help" and len(argv) == 1:
         _cmd_help()
+    elif cmd == "help" and _layered_help():
+        _cmd_help_verb(argv[1:])
     else:
         return
     sys.exit(0)
