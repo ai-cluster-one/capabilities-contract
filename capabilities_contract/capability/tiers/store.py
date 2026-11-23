@@ -1726,7 +1726,9 @@ class FileRecords(Records):
         rows = self._store_kept(collection, key, target_scope)
         if rows is not None:
             # The row goes, and so does a legacy file's entry of the same name,
-            # which would otherwise answer again where the store holds none.
+            # which would otherwise answer again where the store holds none;
+            # a connection's row takes its entries under its id and its label
+            # with it (`_write_dropping`).
             gone = rows.delete(capability, collection, key)
             return self._file_delete(self.global_dir, capability, collection, key) or gone
         root = self.envelope if target_scope == "project" else self.global_dir
@@ -2036,6 +2038,9 @@ class StoreRecords(FileRecords):
         self._failure: StoreError | None = None
         self._failed_at = 0.0
         self._cache: dict[tuple[str, str], tuple[float, Any]] = {}
+        # The shared connections the running write removed, whose entries the
+        # config home's file drops once it is done (`_write_dropping`).
+        self._dropped_shared: list[tuple[str, tuple[str, str]]] = []
         # Why this adapter could not ask the store whether the agent's records
         # moved into it. Its settings are then not read from files, which
         # would be stale for an agent that did.
@@ -2641,7 +2646,30 @@ class StoreRecords(FileRecords):
         db.deleting(conn, "connections", cid)
         gone = conn.execute("DELETE FROM connections WHERE id = %s", (cid,)).rowcount > 0
         db.deleting(conn, "connections")
+        if gone and held is None:
+            # A shared row is the machine's connection, which the config home's
+            # file may still declare under its id or its label; that entry
+            # would answer again for the key the store no longer holds, so it
+            # goes too, once the row has (`_write_dropping`).
+            self._dropped_shared.append((capability, (cid, _label)))
         return gone
+
+    def _write_dropping(self, work: Any) -> bool:
+        """Run a write that may remove connections (`_drop_connection`), then
+        take out of the config home's file every entry of a shared connection
+        it removed, keyed by the connection's id or its label."""
+        self._dropped_shared = []
+        try:
+            done = bool(self._write(work))
+        except BaseException:
+            self._dropped_shared = []
+            raise
+        dropped, self._dropped_shared = self._dropped_shared, []
+        for capability, names in dropped:
+            for name in dict.fromkeys(names):
+                if name:
+                    self._file_delete(self.global_dir, capability, "connection", name)
+        return done
 
     def connection_labels(self, capability: str) -> dict[str, str]:
         """What each connection of `capability` the store holds is called, by
@@ -2980,6 +3008,7 @@ class StoreRecords(FileRecords):
         elif collection == "connection":
             def work(conn: Any) -> bool:
                 return self._drop_connection(conn, capability, key, self.project_id)
+            return self._write_dropping(work)
         elif collection == "grant":
             def work(conn: Any) -> bool:
                 return conn.execute(
@@ -3395,6 +3424,7 @@ class GlobalRows(StoreRecords):
         elif collection == "connection":
             def work(conn: Any) -> bool:
                 return self._drop_connection(conn, capability, key, None)
+            return self._write_dropping(work)
         elif collection == "grant":
             def work(conn: Any) -> bool:
                 cid = connection_id_for(conn, capability, key)
@@ -4216,7 +4246,13 @@ class AgentRecords(StoreRecords):
                         f"{key!r}, which every node shares",
                         f"remove it on the master {self.agent.get('master')}")
                 return self._drop_connection(conn, capability, key, agent)
-            return bool(self._write(work))
+            gone = self._write_dropping(work)
+            if agent is not None:
+                return gone
+            # At the machine's scope the config home's entry of that name goes
+            # too, also where the store holds no row of it, as for a project
+            # whose records are files.
+            return self._file_delete(self.global_dir, capability, collection, key) or gone
         return bool(self._write(lambda conn: conn.execute(
             sql, (*target, self._landing(conn, scope, wanted, None, own[0], agent, own[1],
                                           own[2]))).rowcount > 0))

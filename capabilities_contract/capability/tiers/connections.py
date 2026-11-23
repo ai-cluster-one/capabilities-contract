@@ -560,13 +560,27 @@ def _connection_identity(entry: dict | None) -> dict | None:
     return None
 
 
+def _filed_only(adapter, scope: str, cid: str) -> bool:
+    """Whether connection `cid` resolves at `scope` only from the config home's
+    file while the store's rows are the machine's layer: the store holds no
+    row of it, so writing it back would add it to the store as a connection of
+    its own, a removed one included. Such an entry is left as it is."""
+    if scope != "global" or not hasattr(adapter, "record_source"):
+        return False
+    return (str(adapter.scope_source(NAME, "connection", "global")).startswith("store:")
+            and not str(adapter.record_source(NAME, "connection", "global", cid)
+                        ).startswith("store:"))
+
+
 def _record_identity(cid: str, ident, display_name: str | None = None) -> bool:
     """Record who connection `cid` is, as login or doctor just proved it.
 
     Written to the connection's own record, at the scope that holds it, and
     only where it changes. Never fails the verb that proved it: under the
-    read-only switch, for a connection no record here holds, or where the
-    records refuse the write, nothing is written and False is answered."""
+    read-only switch, for a connection no record here holds or only the config
+    home's file holds once the store's rows are the machine's layer
+    (`_filed_only`), or where the records refuse the write, nothing is
+    written and False is answered."""
     try:
         value = _identity_value(ident, display_name)
     except ValueError:
@@ -582,6 +596,8 @@ def _record_identity(cid: str, ident, display_name: str | None = None) -> bool:
             held = adapter.resolve_scope(NAME, "connection", scope).get(cid)
             if held is None:
                 continue
+            if _filed_only(adapter, scope, cid):
+                return False
             entry = dict(held.get("value") or {})
             if entry.get(IDENTITY_KEY) == value:
                 return True
@@ -997,7 +1013,10 @@ def _cmd_connection(argv: list[str]) -> None:
     """`connection add <id>` writes one connection from its declared fields,
     its secrets into the agent's vault, or the scope's credentials file at the
     machine's scope, with --file, or where no vault here takes them;
-    `connection remove <id>` takes it out again with the secrets it wrote."""
+    `connection remove <id>` takes it out again, named by its id or its label,
+    with the secrets it wrote: a machine connection's row with its entry in the
+    config home's file, and what the capability's `_connection_removed(id,
+    entry, scope)` hook keeps of it on this machine."""
     usage = (f"{NAME} connection add <id> [--project|--global|--machine] [--default] "
              "[--replace] [--file] [--field KEY=VALUE ...] [--env KEY=ENV_KEY ...] [--stdin] "
              "[--identity ID [--display-name TEXT]] | "
@@ -1092,10 +1111,23 @@ def _cmd_connection(argv: list[str]) -> None:
                  "run `capabilities init` first")
     adapter = _records()
     try:
+        if sub == "remove" and scope == "global" and hasattr(adapter, "global_kept"):
+            # Asked as the write it is: a configured store that did not answer
+            # is refused here, rather than its connections read from the
+            # config home's files, which know none of them by its id.
+            adapter.global_kept()
         held = adapter.resolve_scope(NAME, "connection", scope).get(cid)
         if held is None and _labelled(cid) is not None:
             cid = _labelled(cid)
             held = adapter.resolve_scope(NAME, "connection", scope).get(cid)
+        filed = getattr(adapter, "_file_entries", None)
+        if held is None and sub == "remove" and scope == "global" and filed is not None:
+            # A machine connection only the config home's file declares, where
+            # the store's rows are what this project reads in its place: the
+            # entry is still the machine's, and removing it is what keeps it
+            # from answering anywhere else.
+            entry = filed(adapter.global_dir, NAME, "connection").get(cid)
+            held = {"value": entry} if entry is not None else None
     except StoreError as e:
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
     existing = dict((held or {}).get("value") or {})
@@ -1156,6 +1188,13 @@ def _cmd_connection(argv: list[str]) -> None:
                "secrets_kept": kept}
         if unread and kept:
             out["vault_not_read"] = unread
+        # What the capability keeps on this machine for the connection beside
+        # its record is the capability's to name and take away:
+        # `_connection_removed(id, entry, scope)` answers the paths it removed.
+        hook = globals().get("_connection_removed")
+        if callable(hook):
+            out["state_removed"] = [str(path) for path in
+                                    hook(cid, dict(existing, id=cid, label=label), scope) or []]
         _emit(out)
         return
 
@@ -1364,13 +1403,17 @@ def _own_report() -> dict:
 
 def _connection_rewrite(cid: str, fields: dict) -> bool:
     """Write `fields` into connection `cid`'s own record, at the scope that
-    holds it, where they change it; whether the record holds them now."""
+    holds it, where they change it; whether the record holds them now. One
+    only the config home's file holds once the store's rows are the machine's
+    layer is not written (`_filed_only`)."""
     adapter = _records()
     scopes = ["project", "global"] if _project_root() is not None else ["global"]
     for scope in scopes:
         held = adapter.resolve_scope(NAME, "connection", scope).get(cid)
         if held is None:
             continue
+        if _filed_only(adapter, scope, cid):
+            return False
         entry = dict(held.get("value") or {})
         if all(entry.get(k) == v for k, v in fields.items()):
             return True
