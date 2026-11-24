@@ -341,7 +341,7 @@ NODE_LOG_MANAGER = "manager"
 NODE_LOG_LINES = 100
 NODE_LOG_LINE_CHARS = 500
 NODE_LOG_MASK = "***"
-STORE_TABLES_VERSION = (4, 2)
+STORE_TABLES_VERSION = (4, 3)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -480,9 +480,10 @@ def service_instance_drop(conn: Any, project_id: str, capability: str, node: str
         (project_id, capability, node)).rowcount)
 
 
-NODE_STATE_COLUMNS = ("load_1", "load_5", "load_15", "cpu_count", "memory_used_bytes",
-                      "memory_limit_bytes", "disk_used_bytes", "disk_total_bytes",
-                      "booted_at", "boot_line", "image_version", "reported_at", "fresh_until")
+NODE_STATE_COLUMNS = ("load_1", "load_5", "load_15", "cpu_count", "cpu_percent",
+                      "memory_used_bytes", "memory_limit_bytes", "disk_used_bytes",
+                      "disk_total_bytes", "booted_at", "boot_line", "image_version",
+                      "reported_at", "fresh_until")
 NODE_LOGIN_COLUMNS = tuple(f"{tool}_{part}" for tool in NODE_STATE_TOOLS
                            for part in ("login", "account"))
 NODE_LOGIN_NEED_COLUMNS = tuple(f"{tool}_needed" for tool in NODE_STATE_TOOLS)
@@ -515,14 +516,16 @@ def _node_text(value: Any) -> str | None:
 
 
 def node_state_put(conn: Any, node: str, *, load: Sequence[float] | None = None,
-                   cpu_count: int | None = None, memory_used_bytes: int | None = None,
+                   cpu_count: int | None = None, cpu_percent: float | None = None,
+                   memory_used_bytes: int | None = None,
                    memory_limit_bytes: int | None = None,
                    disk_used_bytes: int | None = None, disk_total_bytes: int | None = None,
                    booted_at: Any = None, boot_line: str | None = None,
                    image_version: str | None = None,
                    fresh_seconds: float = NODE_STATE_FRESH_SECONDS) -> dict[str, Any]:
     """Write the whole row of what `node` says of itself now; `reported_at` is
-    the store's now and `fresh_until` that and `fresh_seconds`. Text is one
+    the store's now and `fresh_until` that and `fresh_seconds`. `cpu_percent`
+    is the share of the node's whole allotted CPU in use, 0 to 100. Text is one
     line of at most NODE_STATE_TEXT_CHARS characters, and an empty string is
     written as nothing. Answers {reported_at, fresh_until}."""
     if not fresh_seconds > 0:
@@ -530,8 +533,11 @@ def node_state_put(conn: Any, node: str, *, load: Sequence[float] | None = None,
     loads = list(load) if load is not None else [None, None, None]
     if len(loads) != 3:
         raise StoreError("bad_state", "a node's load is three averages: 1, 5 and 15 minutes")
-    values = [*loads, cpu_count, memory_used_bytes, memory_limit_bytes, disk_used_bytes,
-              disk_total_bytes, booted_at, _node_text(boot_line), _node_text(image_version)]
+    if cpu_percent is not None and not 0 <= cpu_percent <= 100:
+        raise StoreError("bad_state", "a node's CPU in use is a percent from 0 to 100")
+    values = [*loads, cpu_count, cpu_percent, memory_used_bytes, memory_limit_bytes,
+              disk_used_bytes, disk_total_bytes, booted_at, _node_text(boot_line),
+              _node_text(image_version)]
     written = NODE_STATE_COLUMNS[:-2]
     row = conn.execute(
         f"INSERT INTO node_states (node, {', '.join(written)}, reported_at,"
@@ -640,11 +646,15 @@ def node_states(conn: Any, nodes: Sequence[str]) -> list[dict[str, Any]]:
     """The state rows of `nodes`, by node, each with `reachable` - whether its
     fresh_until is still ahead of the store's now - and `uptime_seconds`, the
     store's now less booted_at, and the update availability the node last
-    checked (NODE_UPDATE_OFFER_COLUMNS). A node with no row is not answered."""
+    checked (NODE_UPDATE_OFFER_COLUMNS). A node with no row is not answered.
+    `cpu_percent` is read through the row's JSON, so a store whose core is
+    older than 4.3 still answers, with it None."""
     columns = (*NODE_STATE_COLUMNS, *NODE_UPDATE_OFFER_COLUMNS)
+    selected = ", ".join("(to_jsonb(s) ->> 'cpu_percent')::double precision"
+                         if column == "cpu_percent" else column for column in columns)
     found = conn.execute(
-        f"SELECT node, {', '.join(columns)}, fresh_until > now(),"
-        " extract(epoch FROM now() - booted_at) FROM node_states"
+        f"SELECT node, {selected}, fresh_until > now(),"
+        " extract(epoch FROM now() - booted_at) FROM node_states s"
         " WHERE node = ANY (%s) ORDER BY node", (list(nodes),)).fetchall()
     out = []
     for row in found:

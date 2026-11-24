@@ -31,6 +31,7 @@ from capabilities_contract.db import (
     _connection_ids,
     _core,
     _keys,
+    _node_cpu_percent,
 )
 from capabilities_contract.db._changes import CHANNEL_TABLE
 from capabilities_contract.db._connect import _psycopg, bind_search_path, bound_schema
@@ -129,7 +130,8 @@ class MigrateResult:
 # deliberate (`_keys`); the fourth, a minor step, records when the store made
 # each connection's row (`_connection_created`); the fifth, a minor step, lets
 # an agent be archived and refuses starting anything for it then
-# (`_agent_archived`). While empty, nothing runs for the core and nothing is
+# (`_agent_archived`); the sixth, a minor step, lets a node say how much of
+# its CPU is in use (`_node_cpu_percent`). While empty, nothing runs for the core and nothing is
 # written for it.
 CORE_STEPS: tuple[Step, ...] = (
     Step(_core.CORE_STEP_ID, _core.CORE_STEP_SQL, major=_core.CORE_MAJOR),
@@ -137,8 +139,9 @@ CORE_STEPS: tuple[Step, ...] = (
     Step(_keys.STEP_ID, _keys.STEP_SQL, major=_keys.MAJOR),
     Step(_connection_created.STEP_ID, _connection_created.STEP_SQL),
     Step(_agent_archived.STEP_ID, _agent_archived.STEP_SQL),
+    Step(_node_cpu_percent.STEP_ID, _node_cpu_percent.STEP_SQL),
 )
-CORE_VERSION = (_agent_archived.MAJOR, _agent_archived.MINOR)
+CORE_VERSION = (_node_cpu_percent.MAJOR, _node_cpu_percent.MINOR)
 
 # The pre-image the connection id step leaves: each connection's id beside the
 # capability, the name it was keyed by before core 3.0 and the label it had.

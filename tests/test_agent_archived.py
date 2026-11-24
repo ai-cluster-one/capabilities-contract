@@ -29,6 +29,7 @@ from capabilities_contract.db import (
 )
 
 CORE_4_1 = _migrate.CORE_STEPS[:4]
+CORE_4_2 = _migrate.CORE_STEPS[:5]
 AGENT = "000000000a01"
 OTHER = "000000000a02"
 KEEPER = "000000000a03"
@@ -37,7 +38,7 @@ NODE = "00000000ee01"
 
 def _core(major=4, minor=2, steps=None):
     with connect(application_name="setup", transaction=True) as conn:
-        result = migrate(conn, "core", steps or _migrate.CORE_STEPS, major=major, minor=minor)
+        result = migrate(conn, "core", steps or CORE_4_2, major=major, minor=minor)
         conn.commit()
     disconnect()
     return result
@@ -94,7 +95,7 @@ def test_a_store_at_core_4_1_takes_the_step_without_the_upgrade_and_a_4_1_reader
     monkeypatch.delenv(_migrate.UPGRADE_ENV, raising=False)
     result = _core()
     assert result.applied == ["0043-agent-archived"]
-    assert (result.major, result.minor) == (4, 2) == _migrate.CORE_VERSION
+    assert (result.major, result.minor) == (4, 2)
     assert _sql("SELECT archived_at, archived_by FROM agents") == [(None, None)]
     with monkeypatch.context() as patched:
         patched.setattr(_migrate, "CORE_STEPS", CORE_4_1)
