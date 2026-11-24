@@ -22,6 +22,20 @@ the XChaCha20-Poly1305 key, the agent id and the name bound as before. The row i
 agent's like any other, recorded under the agent's key fingerprint, and only the
 agent's key opens it (`unseal` reads either format).
 
+Every entry a release of this library writes is sealed in format 3: to the agent's
+public key with sender authentication (libsodium's Box agreement, `crypto_box_beforenm`,
+keying XChaCha20-Poly1305), the sender's public key carried in the entry. The agent's
+own entries are sent by itself; an entry anyone else writes is sent by the platform,
+whose keypair the capabilities manager keeps in a file of its own machine
+(`capabilities_contract.platform`) and whose public key the store publishes. An agent
+opens a format 3 entry only where it was sent by itself or by the platform key it
+pinned: the pin is an entry of its own vault (`PIN_NAME`), sealed by its own key so only
+a holder of the key writes it, taken the first time a process holding the key sees a
+published platform key - a key read from the store alone is never trusted. Format 1
+keeps opening; format 2 opens only while the agent holds no pin, so once it does, a row
+anyone with the store's login wrote opens nothing. Where the agent holds a pin, each of
+its own writes also leaves the platform a copy, sent by the agent.
+
 `Reader` is how a process resolves vault values: it reads the agent's sealed rows and
 the vault's channel version in one round trip (or is handed them by the round trip that
 reads the agent's connections), opens only the names asked for, keeps what it opened in
@@ -55,6 +69,11 @@ NONCE_BYTES = 24
 # agent's own key, or for its public sealing key by a writer without the key.
 SEALED_FORMAT = 1
 SEALED_FORMAT_PUBLIC = 2
+# Sealed to the agent's public key by a sender that authenticates itself: the
+# format every write of this release makes.
+SEALED_FORMAT_BOX = 3
+# The entry of an agent's own vault that pins the platform's public key.
+PIN_NAME = "CAPABILITIES_PLATFORM_PIN"
 PUBLIC_BYTES = 32
 PUBLIC_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,254}")
@@ -69,6 +88,7 @@ _AAD_PREFIX = b"capabilities-vault/v1\0"
 _FINGERPRINT_PREFIX = b"capabilities-vault-key/v1\0"
 _PUBLIC_SECRET_PREFIX = b"capabilities-vault-public/v1\0"
 _PUBLIC_SEAL_PREFIX = b"capabilities-vault-public-seal/v1\0"
+_BOX_AAD_PREFIX = b"capabilities-vault-box/v1\0"
 
 
 class VaultError(DbError):
@@ -214,13 +234,89 @@ def _aad(agent_id: str, name: str) -> bytes:
 
 
 def seal(key: bytes, agent_id: str, name: str, value: str) -> bytes:
-    """`value` sealed for `name` of `agent_id`: the format byte, the nonce, then
-    the ciphertext with its tag."""
+    """`value` sealed for `name` of `agent_id` by the agent itself: format 3,
+    sent by and to the public key `key` gives (`seal_box`)."""
+    return seal_box(_public_secret(key), public_key(key), agent_id, name, value)
+
+
+def seal_symmetric(key: bytes, agent_id: str, name: str, value: str) -> bytes:
+    """`value` sealed under `key` itself, format 1: the format byte, the nonce,
+    then the ciphertext with its tag. No release writes it any more; it is
+    what an older one wrote, and still opens."""
     nacl = _nacl()
     nonce = _secrets.token_bytes(NONCE_BYTES)
     sealed = nacl.crypto_aead_xchacha20poly1305_ietf_encrypt(
         value.encode("utf-8"), _aad(agent_id, check_name(name)), nonce, key)
     return bytes([SEALED_FORMAT]) + nonce + sealed
+
+
+def _box_key(secret: bytes, public: bytes) -> bytes:
+    """The key the holder of X25519 `secret` and the holder of the secret of
+    `public` agree on (libsodium's `crypto_box_beforenm`); VaultError
+    `bad_public_key` for a point that agrees on nothing."""
+    nacl = _nacl()
+    if len(public) != PUBLIC_BYTES:
+        raise VaultError("bad_public_key", "a public key is 32 bytes")
+    try:
+        return nacl.crypto_box_beforenm(public, secret)
+    except Exception:  # nacl.exceptions.CryptoError: a low-order point
+        raise VaultError("bad_public_key", "a public key agrees on nothing") from None
+
+
+def _box_aad(scope: str, name: str, sender: bytes, recipient: bytes) -> bytes:
+    return (_BOX_AAD_PREFIX + scope.encode() + b"\0" + name.encode() + b"\0"
+            + sender + recipient)
+
+
+def seal_box(sender_secret: bytes, recipient: bytes, scope: str, name: str,
+             value: str) -> bytes:
+    """`value` sealed for `name` of `scope` (an agent id, or the scope of a
+    platform copy) from the holder of X25519 `sender_secret` to the holder of
+    the secret of `recipient`: the format byte, the sender's public key, the
+    nonce, then the ciphertext with its tag. Only the two of them open it, and
+    whoever opens it learns who sent it."""
+    nacl = _nacl()
+    sender = nacl.crypto_scalarmult_base(sender_secret)
+    nonce = _secrets.token_bytes(NONCE_BYTES)
+    sealed = nacl.crypto_aead_xchacha20poly1305_ietf_encrypt(
+        value.encode("utf-8"), _box_aad(scope, check_name(name), sender, recipient),
+        nonce, _box_key(sender_secret, recipient))
+    return bytes([SEALED_FORMAT_BOX]) + sender + nonce + sealed
+
+
+def box_sender(blob: bytes) -> bytes | None:
+    """The public key of whoever sent a format 3 entry, None for any other."""
+    blob = bytes(blob)
+    if blob[:1] != bytes([SEALED_FORMAT_BOX]) or len(blob) < 1 + PUBLIC_BYTES + NONCE_BYTES:
+        return None
+    return blob[1:1 + PUBLIC_BYTES]
+
+
+def open_box(secret: bytes, scope: str, name: str, blob: bytes,
+             senders: Iterable[bytes], recipient: bytes | None = None) -> str | None:
+    """The value of a format 3 entry for `name` of `scope`, opened with X25519
+    `secret`, or None: where it does not open, or where its sender is not one
+    of `senders`. `recipient` is the public key it was sealed to, the one
+    `secret` gives unless the sender opens what it sent."""
+    nacl = _nacl()
+    blob = bytes(blob)
+    sender = box_sender(blob)
+    if sender is None or sender not in {bytes(s) for s in senders if s}:
+        return None
+    own = nacl.crypto_scalarmult_base(secret)
+    recipient = own if recipient is None else recipient
+    peer = sender if recipient == own else recipient
+    nonce = blob[1 + PUBLIC_BYTES:1 + PUBLIC_BYTES + NONCE_BYTES]
+    try:
+        plain = nacl.crypto_aead_xchacha20poly1305_ietf_decrypt(
+            blob[1 + PUBLIC_BYTES + NONCE_BYTES:], _box_aad(scope, name, sender, recipient),
+            nonce, _box_key(secret, peer))
+    except Exception:  # nacl.exceptions.CryptoError, or a point that agrees on nothing
+        return None
+    try:
+        return plain.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def _public_seal_key(shared: bytes, ephemeral: bytes, public: bytes) -> bytes:
@@ -269,12 +365,32 @@ def _unseal_public(key: bytes, agent_id: str, name: str, blob: bytes) -> str | N
         return None
 
 
-def unseal(key: bytes, agent_id: str, name: str, blob: bytes) -> str | None:
+class _Strict:
+    def __repr__(self) -> str:
+        return "STRICT"
+
+
+# What a caller that does not know whether the agent holds a pin passes: only
+# what the agent's key alone can have written opens.
+STRICT: Any = _Strict()
+
+
+def unseal(key: bytes, agent_id: str, name: str, blob: bytes,
+           pin: bytes | _Strict | None = STRICT) -> str | None:
     """The value `blob` holds, or None where it does not open under `key` for
-    this agent and name: sealed under the key itself, or for the public
-    sealing key it gives."""
+    this agent and name. `pin` is the platform public key the agent pinned
+    (`pin_of`), None where it holds no pin, STRICT where the caller does not
+    know: format 1 always opens; format 3 opens where the agent sent it, or
+    the pinned platform key did; format 2 opens only where `pin` is None."""
     blob = bytes(blob)
+    if blob[:1] == bytes([SEALED_FORMAT_BOX]):
+        senders = [public_key(key)]
+        if isinstance(pin, bytes):
+            senders.append(pin)
+        return open_box(_public_secret(key), agent_id, name, blob, senders)
     if blob[:1] == bytes([SEALED_FORMAT_PUBLIC]):
+        if pin is not None:
+            return None
         return _unseal_public(key, agent_id, name, blob)
     if len(blob) < 1 + NONCE_BYTES or blob[0] != SEALED_FORMAT:
         return None
@@ -378,25 +494,165 @@ def put_for(conn: Any, agent_id: str, key_fingerprint: str, public: bytes, name:
          key_fingerprint, updated_by))
 
 
-def put(conn: Any, key: bytes, agent_id: str, name: str, value: str,
-        updated_by: str | None = None) -> None:
-    """Seal `value` under `key` and keep it as `name`, replacing what was there."""
+def put_row(conn: Any, agent_id: str, name: str, blob: bytes, key_fingerprint: str,
+            updated_by: str | None = None) -> None:
+    """Keep the sealed `blob` as `name` of the agent's vault, recorded under the
+    fingerprint of the agent key it opens under, replacing what was there."""
     conn.execute(
         "INSERT INTO secrets (agent_id, name, ciphertext, key_fingerprint, "
         "updated_by) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (agent_id, name) DO UPDATE "
         "SET ciphertext = excluded.ciphertext, key_fingerprint = excluded.key_fingerprint, "
         "updated_at = now(), updated_by = excluded.updated_by",
-        (agent_id, check_name(name), seal(key, agent_id, name, value),
-         fingerprint(key), updated_by))
+        (agent_id, check_name(name), blob, key_fingerprint, updated_by))
+
+
+def put(conn: Any, key: bytes, agent_id: str, name: str, value: str,
+        updated_by: str | None = None) -> None:
+    """Seal `value` as the agent itself and keep it as `name`, replacing what
+    was there; where the agent pins a platform key (`take_pin`), leave the
+    platform its copy, sent by the agent."""
+    if check_name(name) == PIN_NAME:
+        raise VaultError("bad_secret_name", f"{PIN_NAME} is the vault's own pin of the "
+                         "platform key, not a secret", "choose another name")
+    put_row(conn, agent_id, name, seal(key, agent_id, name, value), fingerprint(key),
+            updated_by)
+    pin = take_pin(conn, key, agent_id, updated_by=updated_by)
+    if pin is not None:
+        put_copy_row(conn, seal_box(_public_secret(key), pin, copy_scope(agent_id=agent_id),
+                                    name, value), name, agent_id=agent_id,
+                     updated_by=updated_by)
 
 
 def remove(conn: Any, agent_id: str, names: Iterable[str]) -> list[str]:
-    """Remove the named rows, which needs no key; the names that were there."""
+    """Remove the named rows, which needs no key, and the platform's copies of
+    them; the names that were there."""
+    import psycopg
     wanted = [check_name(n) for n in names]
     found = conn.execute(
         "DELETE FROM secrets WHERE agent_id = %s AND name = ANY(%s) "
         "RETURNING name", (agent_id, wanted)).fetchall()
+    try:
+        with conn.transaction():
+            conn.execute("DELETE FROM platform_secrets WHERE agent_id = %s "
+                         "AND name = ANY(%s)", (agent_id, wanted))
+    except psycopg.errors.UndefinedTable:
+        pass
     return sorted(name for (name,) in found)
+
+
+# --- The pin of the platform's key, and the platform's copies -----------------
+
+
+def copy_scope(agent_id: str | None = None, connection_id: str | None = None) -> str:
+    """What a platform copy is bound to as associated data: the agent whose
+    own entry it copies, or the shared connection whose secret it is."""
+    if (agent_id is None) == (connection_id is None):
+        raise VaultError("bad_copy", "a platform copy is of one agent or one connection")
+    return f"platform/agent/{agent_id}" if agent_id else f"platform/connection/{connection_id}"
+
+
+def put_copy_row(conn: Any, blob: bytes, name: str, *, agent_id: str | None = None,
+                 connection_id: str | None = None, updated_by: str | None = None) -> bool:
+    """Keep `blob` as the platform's copy of `name` of one agent's own vault or
+    of one shared connection, replacing what was there: False where the store
+    keeps no copies (its core is older than 4.4)."""
+    import psycopg
+    copy_scope(agent_id, connection_id)
+    column = "agent_id" if agent_id else "connection_id"
+    try:
+        with conn.transaction():
+            conn.execute(
+                f"INSERT INTO platform_secrets ({column}, name, ciphertext, updated_by) "
+                f"VALUES (%s, %s, %s, %s) ON CONFLICT ({column}, name) "
+                f"WHERE {column} IS NOT NULL DO UPDATE SET ciphertext = excluded.ciphertext, "
+                "updated_at = now(), updated_by = excluded.updated_by",
+                (agent_id or connection_id, check_name(name), blob, updated_by))
+    except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
+        return False
+    return True
+
+
+def platform_published(conn: Any) -> bytes | None:
+    """The platform's public key as the store publishes it, None where it
+    publishes none or predates the column. Read inside the caller's
+    transaction, under a savepoint of its own."""
+    import psycopg
+    try:
+        with conn.transaction():
+            found = conn.execute("SELECT platform_public_key FROM store_state").fetchall()
+    except (psycopg.errors.UndefinedColumn, psycopg.errors.UndefinedTable):
+        return None
+    return parse_public(found[0][0]) if found else None
+
+
+def _open_pin(key: bytes, agent_id: str, blob: bytes) -> bytes | None:
+    """The platform key a pin entry holds, where the agent's key alone could
+    have written it."""
+    text = unseal(key, agent_id, PIN_NAME, blob)
+    return parse_public(text) if text else None
+
+
+def pin_of(key: bytes, agent_id: str, found_rows: Iterable[Any]) -> bytes | None:
+    """The platform public key the agent pinned, from its vault's rows (dicts
+    as `rows` answers them, or (name, ciphertext, key_fingerprint, ...)
+    tuples), None where it pinned none its key opens."""
+    current = fingerprint(key)
+    for row in found_rows:
+        name, blob, fp = ((row["name"], row["ciphertext"], row["key_fingerprint"])
+                          if isinstance(row, Mapping) else (row[0], row[1], row[2]))
+        if name == PIN_NAME and fp == current:
+            return _open_pin(key, agent_id, bytes(blob))
+    return None
+
+
+def write_pin(conn: Any, key: bytes, agent_id: str, platform: bytes,
+              updated_by: str | None = None) -> None:
+    """Pin `platform` as the platform key the agent trusts, sealed by the
+    agent's own key, which only a holder of the key writes."""
+    put_row(conn, agent_id, PIN_NAME, seal(key, agent_id, PIN_NAME, encode_key(platform)),
+            fingerprint(key), updated_by)
+
+
+def take_pin(conn: Any, key: bytes, agent_id: str,
+             updated_by: str | None = None) -> bytes | None:
+    """The platform key the agent pinned; where it pinned none and the store
+    publishes one, that one, pinned now - the first sight of it by a process
+    holding the key. None where there is none to pin."""
+    found = conn.execute(
+        "SELECT name, ciphertext, key_fingerprint FROM secrets WHERE agent_id = %s "
+        "AND name = %s", (agent_id, PIN_NAME)).fetchall()
+    pinned = pin_of(key, agent_id, found)
+    if pinned is not None:
+        return pinned
+    published = platform_published(conn)
+    if published is None:
+        return None
+    write_pin(conn, key, agent_id, published, updated_by=updated_by)
+    return published
+
+
+def reseal(conn: Any, key: bytes, agent_id: str,
+           updated_by: str | None = None) -> dict[str, list[str]]:
+    """Seal again in format 3, as the agent itself, every entry of its vault
+    an older release wrote (format 1, and format 2 while the agent holds no
+    pin), with the same key and value: {resealed, unreadable} by name. An
+    entry under another key, or one that does not open, is left as it is."""
+    current = fingerprint(key)
+    held = rows(conn, agent_id)
+    pin = pin_of(key, agent_id, held)
+    out: dict[str, list[str]] = {"resealed": [], "unreadable": []}
+    for row in held:
+        name, blob = row["name"], row["ciphertext"]
+        if name == PIN_NAME or blob[:1] == bytes([SEALED_FORMAT_BOX]):
+            continue
+        value = unseal(key, agent_id, name, blob, pin) if row["key_fingerprint"] == current \
+            else None
+        if value is None:
+            out["unreadable"].append(name)
+            continue
+        put(conn, key, agent_id, name, value, updated_by=updated_by)
+        out["resealed"].append(name)
+    return out
 
 
 def sealed_under_other(conn: Any, agent_id: str, key_fingerprint: str) -> int:
@@ -485,24 +741,34 @@ def write(project_root: Path | str | None, agent_id: str, values: Mapping[str, s
 UNPUBLISHED_HINT = ("an agent's public sealing key is published by the first command "
                     "that uses its key against the store in its folder: "
                     "`capabilities connections seal` there")
+PLATFORM_HINT = ("a shared connection's value is written on the machine that holds the "
+                 "platform key, where the capabilities manager delivers it to every agent "
+                 "granted it: give it there, or run `capabilities secrets migrate` there "
+                 "to take it from the vaults that hold it")
 
 
 def share(project_root: Path | str | None, writer: str | None, values: Mapping[str, str],
           agents: Iterable[str], *, replace: bool = True,
           application_name: str = "capabilities",
           updated_by: str | None = None) -> dict[str, Any]:
-    """Seal each of `values` into the vault of every one of `agents`, in one
-    transaction: the writer's own (`writer`, where it is one of them) under the
-    key `project_root` resolves, every other agent's for its published public
-    sealing key, so no key but the writer's is needed. With `replace` false a
-    name an agent's vault already holds under its present key is left as it
-    is, so running it again changes nothing. Answers {sealed: {agent: {name:
-    "created" | "replaced"}}, unchanged: {agent: [name]}, unpublished: [agent],
-    unregistered: [agent], hint}: an agent whose row publishes no public key is
-    named, never skipped in silence. VaultError as `write` raises it, for the
-    writer's own key, and `vault_unwritable`."""
+    """Seal each of `values` into the writer's own vault (`writer`, where it is
+    one of `agents`) under the key `project_root` resolves, in one
+    transaction. Another agent's vault is written only by the platform
+    (`capabilities_contract.platform`), from its own copy: `agents` naming any
+    other is refused, VaultError `shared_by_platform`, with nothing written.
+    With `replace` false a name the vault already holds under its present key
+    is left as it is, so running it again changes nothing. Answers {sealed:
+    {agent: {name: "created" | "replaced"}}, unchanged: {agent: [name]},
+    unpublished: [], unregistered: [agent]}. VaultError as `write` raises it,
+    for the writer's own key, and `vault_unwritable`."""
     names = [check_name(name) for name in values]
     targets = sorted(set(agents))
+    others = [agent for agent in targets if agent != writer]
+    if others:
+        raise VaultError("shared_by_platform",
+                         f"a value for agent(s) {', '.join(others)} is not this agent's to "
+                         "seal: another agent's vault is written only by the platform",
+                         PLATFORM_HINT)
     key = agent_key(project_root) if writer in targets else None
     if writer in targets and key is None:
         raise VaultError("key_missing", f"this agent has no {KEY_ENV} here",
@@ -594,6 +860,8 @@ class Reader:
         self.problem: str | None = None
         self._failure: VaultError | None = None
         self._failed_at = 0.0
+        self._public = public_key(key)
+        self._pinned: Any = STRICT
 
     @property
     def loaded(self) -> bool:
@@ -605,7 +873,10 @@ class Reader:
         for row in found_rows:
             name, blob, fp = row[0], row[1], row[2]
             sealed[name] = (bytes(blob), fp)
+        if (self._sealed or {}).get(PIN_NAME) != sealed.get(PIN_NAME):
+            self._opened.clear()  # what opens depends on the pin
         self._sealed = sealed
+        self._pinned = STRICT
         versions = [row[0] for row in found_version]
         self._version = versions[0] if versions else 0
         self._checked = time.monotonic()
@@ -674,10 +945,36 @@ class Reader:
         except psycopg.Error as exc:
             raise self._unreadable(exc) from None
 
+    def _pin(self) -> bytes | None:
+        """The platform key the agent pinned, from the rows read, None where it
+        pinned none its key opens."""
+        if self._pinned is STRICT:
+            held = (self._sealed or {}).get(PIN_NAME)
+            self._pinned = (_open_pin(self._key, self.agent_id, held[0])
+                            if held is not None and held[1] == self.key_fingerprint else None)
+        return self._pinned
+
+    def _take_pin(self) -> bytes | None:
+        """Pin the platform key the store publishes, on first sight of an entry
+        another than the agent sent; None where none is published or the
+        store cannot be written."""
+        try:
+            with self._connect() as conn, conn.transaction():
+                pin = take_pin(conn, self._key, self.agent_id)
+        except Exception:  # an outage, a read-only login: the entry stays unopened
+            return None
+        if pin is not None:
+            self._pinned = pin
+            self._opened.clear()
+        return pin
+
     def get(self, name: str) -> str | None:
-        """The value of `name`, None where the vault holds none this key opens;
-        VaultError `vault_unreadable` where the store could not be read."""
+        """The value of `name`, None where the vault holds none this key opens
+        from a sender it trusts; VaultError `vault_unreadable` where the store
+        could not be read."""
         self._refresh()
+        if name == PIN_NAME:
+            return None
         held = (self._sealed or {}).get(name)
         if held is None:
             return None
@@ -686,7 +983,12 @@ class Reader:
             return None
         opened = self._opened.get(name)
         if opened is None or opened[0] != blob:
-            opened = (blob, unseal(self._key, self.agent_id, name, blob))
+            value = unseal(self._key, self.agent_id, name, blob, self._pin())
+            sender = box_sender(blob)
+            if (value is None and self._pin() is None and sender is not None
+                    and sender != self._public and self._take_pin() is not None):
+                value = unseal(self._key, self.agent_id, name, blob, self._pin())
+            opened = (blob, value)
             self._opened[name] = opened
         return opened[1]
 

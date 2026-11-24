@@ -619,11 +619,14 @@ def _record_identity(cid: str, ident, display_name: str | None = None) -> bool:
 # the script declares (CONN_FIELDS, SETUP_FIELDS), a secret arrives on standard
 # input and never on argv, and it is sealed into the agent's vault, never into
 # a record. A connection the store shares (its owner null) carries its secret
-# in the vault of every agent granted it: the writer seals it under its own key
-# and for each other grantee's public sealing key. A file takes it only when
-# asked (--file), at the machine's scope where no grantee's vault takes it, or
-# where no vault here takes it: the project's .env.local, or the capability's
-# credentials.env in the user's config home.
+# in the vault of every agent granted it, and only the platform writes those:
+# where this machine holds the platform key its secret becomes the platform's
+# copy, delivered from there to every grantee (`capabilities_contract.platform`),
+# and where it does not, writing it is refused with where to write it instead.
+# A file takes it only when asked (--file), at the machine's scope for a
+# connection the store does not share yet, or where no vault here takes it:
+# the project's .env.local, or the capability's credentials.env in the user's
+# config home.
 
 def _vault_agent() -> tuple[str | None, str | None]:
     """(the agent whose vault a secret written here goes into, None), or (None,
@@ -682,16 +685,51 @@ def _vault_share(agent: str | None, secrets: dict, agents: list,
 
 
 def _shared_report(done: dict) -> dict:
-    """What sealing a shared connection's secret answers: the agents it was
-    sealed for, and each grantee whose public sealing key is not published,
-    with how it is."""
+    """What writing a shared connection's secret answers: the agents the
+    platform delivered it to, and each grantee it could not seal for, with
+    why and how that is mended."""
     out = {"sealed_for": sorted(done.get("sealed") or {}),
-           "unpublished": list(done.get("unpublished") or [])}
-    if done.get("unregistered"):
-        out["unregistered"] = list(done["unregistered"])
+           "unpublished": [r["agent"] for r in done.get("refused") or []
+                           if r.get("code") == "agent_unpublished"],
+           "by": "platform"}
+    refused = [r for r in done.get("refused") or [] if r.get("code") != "agent_unpublished"]
+    if refused:
+        out["refused"] = refused
     if out["unpublished"]:
-        out["hint"] = done.get("hint")
+        out["hint"] = _platform_module().vault.UNPUBLISHED_HINT
     return out
+
+
+def _platform_module():
+    """The library's platform, or None where this release carries none."""
+    try:
+        from capabilities_contract import platform as _platform
+    except ImportError:
+        return None
+    return _platform
+
+
+def _platform_share(secrets: dict, cid: str, report: dict | None = None,
+                    replace: bool = True) -> dict:
+    """Write a shared connection's secret as the platform's copy and have the
+    platform deliver it to every agent granted it, where this machine holds
+    the platform key; refuse with where to write it where it does not, so
+    nothing is written."""
+    _platform = _platform_module()
+    if _platform is None:
+        _die(6, "vault_unavailable", "this capability's library cannot write a shared "
+             "connection's secret", f"`capabilities update {NAME}` brings the library that does")
+    try:
+        done = _platform.share_connection(_project_root(), cid, secrets, replace=replace,
+                                          application_name=NAME, updated_by=_vault_writer())
+    except _platform.VaultError as e:
+        _die(5 if e.slug == "vault_unwritable" else 6, e.slug,
+             f"{NAME} connection {cid}'s secret is not written: {e.message}", e.hint)
+    for key in secrets:
+        _VAULT_UNREAD.pop(key, None)
+    if report is not None:
+        report["shared"] = _shared_report(done)
+    return done
 
 
 def _vault_seal(secrets: dict, cid: str | None = None,
@@ -700,8 +738,10 @@ def _vault_seal(secrets: dict, cid: str | None = None,
     are, or (None, why not) with nothing sealed. The vault is read before every
     file of the cascade, so a key a file also sets resolves from the vault from
     then on. For a connection the store shares, every agent granted it gets
-    the secret in its vault too, sealed for its public key; `report`, where
-    given, takes `shared`, the agents it reached and those it could not."""
+    the secret in its vault too, written by the platform from its own copy
+    (`_platform_share`), which refuses where this machine holds no platform
+    key; `report`, where given, takes `shared`, the agents it reached and
+    those it could not."""
     agent, why = _vault_agent()
     if agent is None:
         return None, why
@@ -711,17 +751,12 @@ def _vault_seal(secrets: dict, cid: str | None = None,
         return None, "this capability's library carries no vault"
     if not hasattr(_vault, "write"):
         return None, "this capability's library cannot write the vault"
-    grantees = _shared_grantees(cid)
+    if _shared_grantees(cid) is not None:
+        _platform_share(secrets, cid, report)
+        return "platform", None
     try:
-        if grantees and hasattr(_vault, "share"):
-            done = _vault_share(agent, secrets, sorted({agent, *grantees}))
-            if agent not in done.get("sealed", {}):
-                return None, f"agent {agent} could not be sealed for"
-            if report is not None:
-                report["shared"] = _shared_report(done)
-        else:
-            _vault.write(_project_root(), agent, secrets, application_name=NAME,
-                         updated_by=_vault_writer())
+        _vault.write(_project_root(), agent, secrets, application_name=NAME,
+                     updated_by=_vault_writer())
     except _vault.VaultError as e:
         return None, e.message
     for key in secrets:
@@ -730,31 +765,14 @@ def _vault_seal(secrets: dict, cid: str | None = None,
 
 
 def _machine_seal(secrets: dict, cid: str, report: dict) -> str | None:
-    """At the machine's scope, seal a shared connection's secret for every
-    agent granted it, where the store shares it and grants it to any:
-    "vault:<agent>,..." once sealed, else None, and the file takes it as
-    before. `report` takes `shared`."""
-    grantees = _shared_grantees(cid)
-    if not grantees:
+    """At the machine's scope, write a connection the store shares through
+    the platform (`_platform_share`), which delivers it to every agent
+    granted it: "platform" once written; None for a connection the store does
+    not share, and the file takes it as before. `report` takes `shared`."""
+    if _shared_grantees(cid) is None:
         return None
-    try:
-        from capabilities_contract import vault as _vault
-    except ImportError:
-        return None
-    if not hasattr(_vault, "share"):
-        return None
-    agent = _vault_agent()[0] if _project_root() is not None else None
-    if agent is not None and not _vault.key_source(_project_root())[0]:
-        agent = None
-    try:
-        done = _vault_share(agent, secrets, sorted(grantees))
-    except _vault.VaultError as e:
-        report["vault_skipped"] = e.message
-        return None
-    report["shared"] = _shared_report(done)
-    if not done.get("sealed"):
-        return None
-    return ",".join(f"vault:{a}" for a in sorted(done["sealed"]))
+    _platform_share(secrets, cid, report)
+    return "platform"
 
 
 def _vault_unseal(keys: list) -> tuple[list, str | None]:
@@ -1453,16 +1471,17 @@ def _cmd_connection_seal(argv: list[str], usage: str) -> None:
     connection's, and is left there (`not_sealed`). What the capability's
     `_connection_prefill` hook asks of a connection naming none of its own (an
     app of its own) is written into its record first. With --share a
-    connection the store shares is sealed for every other agent granted it
-    too, for its public sealing key, from what it resolves here, vault
-    included - but only under a key that is the connection's own
-    (`_connection_env_name`): a vault answers for every connection of its
-    agent, so a name another connection or a setup field may read is never
-    written into another agent's vault (`not_shared`). Nothing a vault
-    already holds is written over, so running it again changes nothing; a
-    grantee whose public key is not published is named, never skipped in
-    silence. A file is never changed: once the vault holds a value the
-    cascade reads it first."""
+    connection the store shares becomes the platform's copy, from what it
+    resolves here, vault included, and the platform delivers it to every
+    agent granted it - where this machine holds the platform key, and
+    `refused` says where to run it where it does not - but only under a key
+    that is the connection's own (`_connection_env_name`): a vault answers
+    for every connection of its agent, so a name another connection or a
+    setup field may read is never written into another agent's vault
+    (`not_shared`). Nothing a vault or the platform already holds is written
+    over, so running it again changes nothing; a grantee whose public key is
+    not published is named, never skipped in silence. A file is never
+    changed: once the vault holds a value the cascade reads it first."""
     share = "--share" in argv
     words = [w for w in argv if w != "--share"]
     flags = [w for w in words if w.startswith("--")]
@@ -1509,6 +1528,40 @@ def _cmd_connection_seal(argv: list[str], usage: str) -> None:
             unpublished.setdefault(whom, set()).add(cid)
             res["unpublished"] = sorted(set(res["unpublished"]) | {whom})
 
+    _platform = _platform_module()
+
+    def platform_into(res: dict, cid: str, values: dict) -> bool:
+        """A shared connection's values made the platform's copies, where this
+        machine holds the platform key, and delivered to every agent granted
+        it: whether every grantee holds them now. Where the platform key is
+        not here nothing is written, and `refused` says where to write it."""
+        try:
+            if _platform is None:
+                raise _vault.VaultError("platform_key_missing", "this capability's library "
+                                        "carries no platform", _vault.PLATFORM_HINT)
+            done = _platform.share_connection(_project_root(), cid, values, replace=False,
+                                              application_name=NAME,
+                                              updated_by=_vault_writer())
+        except _vault.VaultError as e:
+            if e.slug == "vault_unwritable":
+                raise
+            res["refused"] = {"code": e.slug, "message": e.message, "hint": e.hint}
+            return False
+        for whom, names in (done.get("sealed") or {}).items():
+            changed = [n for n, outcome in names.items() if outcome != "unchanged"]
+            if changed:
+                res["sealed"][whom] = sorted(set(res["sealed"].get(whom, [])) | set(changed))
+            res["unchanged"] = sorted(set(res["unchanged"])
+                                      | {n for n, o in names.items() if o == "unchanged"})
+        for row in done.get("refused") or []:
+            if row.get("code") == "agent_unpublished":
+                unpublished.setdefault(row["agent"], set()).add(cid)
+                res["unpublished"] = sorted(set(res["unpublished"]) | {row["agent"]})
+            else:
+                res.setdefault("not_delivered", []).append(row)
+        res["platform"] = done.get("copies") or {}
+        return not done.get("refused")
+
     hook = globals().get("_connection_prefill")
     try:
         for cid, entry in sorted(usable.items()):
@@ -1517,7 +1570,6 @@ def _cmd_connection_seal(argv: list[str], usage: str) -> None:
             results[cid] = res
             grantees = _shared_grantees(cid)
             res["shared"] = grantees is not None
-            others = sorted(set(grantees or []) - {agent}) if share else []
             spec = {k: v for k, v in entry.items()
                     if k not in ("allow_write", "granted", "id", "label")}
             offered = (hook(cid, spec) or {}) if callable(hook) else {}
@@ -1526,11 +1578,16 @@ def _cmd_connection_seal(argv: list[str], usage: str) -> None:
             if (fields or values) and (grantees is None or share):
                 # A connection's record changes only once every agent it is
                 # granted to holds what the change names.
-                done = _vault_share(agent, values, [agent, *others], replace=False) \
-                    if values else {}
-                sealed_into(res, done)
+                if not values:
+                    whole = True
+                elif grantees is None:
+                    done = _vault_share(agent, values, [agent], replace=False)
+                    sealed_into(res, done)
+                    whole = not done.get("unregistered")
+                else:
+                    whole = platform_into(res, cid, values)
                 res["from"].update({key: "machine" for key in values})
-                if not done.get("unpublished") and not done.get("unregistered"):
+                if whole:
                     if _connection_rewrite(cid, fields):
                         res["spec"] = fields
                 else:
@@ -1559,13 +1616,12 @@ def _cmd_connection_seal(argv: list[str], usage: str) -> None:
             if own:
                 sealed_into(res, _vault_share(agent, own, [agent], replace=False))
             grantees = _shared_grantees(cid)
-            others = sorted(set(grantees or []) - {agent}) if share else []
-            if everyone and others:
+            if everyone and share and grantees is not None:
                 mine = _connection_own_keys(cid)
                 res["not_shared"] = sorted(key for key in everyone if key not in mine)
                 everyone = {k: v for k, v in everyone.items() if k in mine}
-            if everyone and others:
-                sealed_into(res, _vault_share(agent, everyone, others, replace=False))
+                if everyone:
+                    platform_into(res, cid, everyone)
             res["unresolved"] = sorted(set(res["unresolved"]))
             res["not_sealed"] = sorted(set(res["not_sealed"]))
     except _vault.VaultError as e:
@@ -1578,6 +1634,8 @@ def _cmd_connection_seal(argv: list[str], usage: str) -> None:
                            for whom, cids in sorted(unpublished.items())]}
     if unpublished:
         out["hint"] = _vault.UNPUBLISHED_HINT
+    elif any(res.get("refused") for res in results.values()):
+        out["hint"] = _vault.PLATFORM_HINT
     _emit(out)
 
 

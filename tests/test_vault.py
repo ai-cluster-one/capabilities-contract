@@ -287,53 +287,193 @@ def test_a_value_sealed_for_the_public_key_opens_only_under_the_agents_key():
     assert vault.public_text(key) != vault.encode_key(key)
     blob = vault.seal_for(public, AGENT, "API_TOKEN", "tok-1")
     assert blob[0] == vault.SEALED_FORMAT_PUBLIC and b"tok-1" not in blob
-    assert vault.unseal(key, AGENT, "API_TOKEN", blob) == "tok-1"
-    assert vault.unseal(key, "prj_000000000002", "API_TOKEN", blob) is None
-    assert vault.unseal(key, AGENT, "OTHER", blob) is None
-    assert vault.unseal(vault.parse_key(vault.generate_key()), AGENT, "API_TOKEN", blob) is None
+    assert vault.unseal(key, AGENT, "API_TOKEN", blob, None) == "tok-1"
+    assert vault.unseal(key, "prj_000000000002", "API_TOKEN", blob, None) is None
+    assert vault.unseal(key, AGENT, "OTHER", blob, None) is None
+    assert vault.unseal(vault.parse_key(vault.generate_key()), AGENT, "API_TOKEN", blob,
+                        None) is None
     assert vault.parse_public("short") is None
+    # Anyone may have written it, so it opens only while the agent pins no platform key.
+    assert vault.unseal(key, AGENT, "API_TOKEN", blob, b"\x01" * 32) is None
+    assert vault.unseal(key, AGENT, "API_TOKEN", blob) is None
 
 
 PEER = "prj_000000000002"
 LATE = "prj_000000000003"
 
 
-def test_share_seals_for_each_grantee_its_key_opens_and_names_one_not_published(
-        vaulted, tmp_path):
-    writer_text, peer_text, late_text = (vault.generate_key() for _ in range(3))
-    peer_key, late_key = vault.parse_key(peer_text), vault.parse_key(late_text)
+def test_share_seals_the_writers_own_and_refuses_another_agents_vault(vaulted, tmp_path):
     with connect(application_name="setup", transaction=True) as conn, conn.transaction():
-        conn.execute("INSERT INTO agents (id) VALUES (%s), (%s)", (PEER, LATE))
-        vault.record_key(conn, PEER, vault.fingerprint(peer_key))
-        assert vault.publish(conn, PEER, peer_key) is True
-        assert vault.publish(conn, PEER, peer_key) is False
-        vault.record_key(conn, LATE, vault.fingerprint(late_key))
-    root = _agent_root(tmp_path, writer_text, vaulted)
-    done = vault.share(root, AGENT, {"API_TOKEN": "tok-1"}, [AGENT, PEER, LATE],
-                       replace=False, updated_by="me@node")
-    assert done["sealed"] == {AGENT: {"API_TOKEN": "created"}, PEER: {"API_TOKEN": "created"}}
-    assert done["unpublished"] == [LATE] and done["hint"]
-    peer_root = tmp_path / "peer"
-    peer_root.mkdir()
-    (peer_root / ".env.local").write_text(f"{vault.KEY_ENV}={peer_text}\n")
-    assert vault.reader(peer_root, PEER).get("API_TOKEN") == "tok-1"
-    assert vault.reader(root, AGENT).get("API_TOKEN") == "tok-1"
-    # The writer's key was published as it sealed its own.
+        conn.execute("INSERT INTO agents (id) VALUES (%s)", (PEER,))
+    root = _agent_root(tmp_path, vault.generate_key(), vaulted)
+    with pytest.raises(vault.VaultError) as refused:
+        vault.share(root, AGENT, {"API_TOKEN": "tok-1"}, [AGENT, PEER])
+    assert refused.value.slug == "shared_by_platform" and refused.value.hint
     with connect(application_name="reader", transaction=True) as conn:
-        found = vault.recipients(conn, [AGENT, PEER, LATE])
-    assert found[AGENT][1] == vault.public_key(vault.parse_key(writer_text))
-    assert found[LATE] == (vault.fingerprint(late_key), None)
-    again = vault.share(root, AGENT, {"API_TOKEN": "tok-2"}, [AGENT, PEER], replace=False)
-    assert again["sealed"] == {} and again["unchanged"] == {AGENT: ["API_TOKEN"],
-                                                            PEER: ["API_TOKEN"]}
-    rotated = vault.share(root, AGENT, {"API_TOKEN": "tok-2"}, [AGENT, PEER])
-    assert rotated["sealed"][PEER] == {"API_TOKEN": "replaced"}
-    deadline = time.monotonic() + vault.CHECK_SECONDS + 1.0
-    while vault.reader(peer_root, PEER).get("API_TOKEN") != "tok-2":
-        assert time.monotonic() < deadline, "the rotated value did not reach the grantee"
+        assert vault.rows(conn, PEER) == [] and vault.rows(conn, AGENT) == []
+    done = vault.share(root, AGENT, {"API_TOKEN": "tok-1"}, [AGENT], replace=False)
+    assert done["sealed"] == {AGENT: {"API_TOKEN": "created"}}
+    assert vault.reader(root, AGENT).get("API_TOKEN") == "tok-1"
+
+
+# --- The platform -----------------------------------------------------------------
+
+CID = "0a0b0c0d0e0f"
+
+
+def _agent(tmp_path, agent_id: str) -> tuple:
+    """An agent registered with its key published, and its folder holding the key."""
+    text = vault.generate_key()
+    key = vault.parse_key(text)
+    root = tmp_path / agent_id
+    root.mkdir()
+    (root / ".env.local").write_text(f"{vault.KEY_ENV}={text}\n")
+    with connect(application_name="setup", transaction=True) as conn, conn.transaction():
+        conn.execute("INSERT INTO agents (id) VALUES (%s) ON CONFLICT DO NOTHING", (agent_id,))
+        vault.record_key(conn, agent_id, vault.fingerprint(key))
+        vault.publish(conn, agent_id, key)
+    return root, key
+
+
+def _shared(grantees: list) -> None:
+    with connect(application_name="setup", transaction=True) as conn, conn.transaction():
+        conn.execute("INSERT INTO connections (id, capability, label, spec) "
+                     "VALUES (%s, 'demo', 'primary', '{}')", (CID,))
+        for agent in grantees:
+            conn.execute("INSERT INTO grants (agent_id, capability, connection_id, enabled) "
+                         "VALUES (%s, 'demo', %s, true)", (agent, CID))
+
+
+def _platform():
+    from capabilities_contract import platform
+    with connect(application_name="setup", transaction=True) as conn, conn.transaction():
+        return platform.ensure(conn, create_missing=True)
+
+
+def _settles(root, agent: str, name: str, wanted) -> None:
+    deadline = time.monotonic() + vault.CHECK_SECONDS + 2.0
+    while vault.reader(root, agent).get(name) != wanted:
+        assert time.monotonic() < deadline, f"{agent} did not come to read {wanted!r}"
         time.sleep(0.05)
-    # A key that changes takes its public key with it.
-    with connect(application_name="writer", transaction=True) as conn:
-        with conn.transaction():
-            vault.record_key(conn, PEER, vault.fingerprint(vault.parse_key(vault.generate_key())))
-        assert vault.recipients(conn, [PEER])[PEER][1] is None
+
+
+def test_a_shared_value_entered_once_reaches_both_grantees_its_change_too_and_a_revoke_one(
+        vaulted, tmp_path):
+    from capabilities_contract import platform
+    a_root, _a = _agent(tmp_path, AGENT)
+    p_root, _p = _agent(tmp_path, PEER)
+    _shared([AGENT, PEER])
+    with pytest.raises(vault.VaultError) as refused:
+        platform.share_connection(a_root, CID, {"DEMO_TOKEN": "tok-1"})
+    assert refused.value.slug == "platform_key_missing" and refused.value.hint
+    made = _platform()
+    assert (platform.home() / platform.KEY_FILE).stat().st_mode & 0o077 == 0
+    done = platform.share_connection(a_root, CID, {"DEMO_TOKEN": "tok-1"}, updated_by="me@node")
+    assert done["copies"] == {"DEMO_TOKEN": "created"} and done["refused"] == []
+    assert done["sealed"] == {AGENT: {"DEMO_TOKEN": "created"}, PEER: {"DEMO_TOKEN": "created"}}
+    assert vault.reader(a_root, AGENT).get("DEMO_TOKEN") == "tok-1"
+    assert vault.reader(p_root, PEER).get("DEMO_TOKEN") == "tok-1"
+    again = platform.share_connection(a_root, CID, {"DEMO_TOKEN": "tok-1"})
+    assert again["copies"] == {"DEMO_TOKEN": "unchanged"}
+    assert again["sealed"] == {AGENT: {"DEMO_TOKEN": "unchanged"},
+                               PEER: {"DEMO_TOKEN": "unchanged"}}
+    platform.share_connection(a_root, CID, {"DEMO_TOKEN": "tok-2"})
+    _settles(a_root, AGENT, "DEMO_TOKEN", "tok-2")
+    _settles(p_root, PEER, "DEMO_TOKEN", "tok-2")
+    with connect(application_name="writer", transaction=True) as conn, conn.transaction():
+        conn.execute("UPDATE grants SET enabled = false WHERE agent_id = %s", (PEER,))
+        assert platform.revoke(conn, CID, PEER) == ["DEMO_TOKEN"]
+        assert platform.connection_values(conn, made, CID) == {"DEMO_TOKEN": "tok-2"}
+    _settles(p_root, PEER, "DEMO_TOKEN", None)
+    assert vault.reader(a_root, AGENT).get("DEMO_TOKEN") == "tok-2"
+
+
+def test_an_entry_another_agent_writes_into_a_vault_is_refused(vaulted, tmp_path):
+    from capabilities_contract import platform
+    a_root, a_key = _agent(tmp_path, AGENT)
+    _p_root, p_key = _agent(tmp_path, PEER)
+    made = _platform()
+    a_public, fp = vault.public_key(a_key), vault.fingerprint(a_key)
+    forged = vault.seal_box(vault._public_secret(p_key), a_public, AGENT, "FORGED", "evil")
+    with connect(application_name="peer", transaction=True) as conn, conn.transaction():
+        vault.put_row(conn, AGENT, "FORGED", forged, fp)
+    # Sent by another agent's key: refused, and the reader pins the platform key on sight.
+    assert vault.reader(a_root, AGENT).get("FORGED") is None
+    with connect(application_name="reader", transaction=True) as conn:
+        assert vault.pin_of(a_key, AGENT, vault.rows(conn, AGENT)) == made.public
+    # Sealed anonymously once the pin exists: refused.
+    with connect(application_name="peer", transaction=True) as conn, conn.transaction():
+        vault.put_row(conn, AGENT, "ANON", vault.seal_for(a_public, AGENT, "ANON", "evil"), fp)
+    vault._READERS.clear()
+    assert vault.reader(a_root, AGENT).get("ANON") is None
+    # A pin another wrote opens nothing: the agent's key alone writes one.
+    fake = vault.seal_box(vault._public_secret(p_key), a_public, AGENT, vault.PIN_NAME,
+                          vault.public_text(p_key))
+    with connect(application_name="peer", transaction=True) as conn, conn.transaction():
+        vault.put_row(conn, AGENT, vault.PIN_NAME, fake, fp)
+    vault._READERS.clear()
+    assert vault.reader(a_root, AGENT).get("FORGED") is None
+    # What the platform sends opens.
+    with connect(application_name="platform", transaction=True) as conn, conn.transaction():
+        assert platform.deliver(conn, made, AGENT, {"GRANTED": "ok"}) == {"GRANTED": "created"}
+    vault._READERS.clear()
+    assert vault.reader(a_root, AGENT).get("GRANTED") == "ok"
+
+
+def test_the_platform_seals_nothing_for_an_agent_whose_published_key_moved(vaulted, tmp_path):
+    from capabilities_contract import platform
+    _agent(tmp_path, AGENT)
+    made = _platform()
+    with connect(application_name="platform", transaction=True) as conn, conn.transaction():
+        platform.deliver(conn, made, AGENT, {"GRANTED": "ok"})
+    swapped = vault.parse_key(vault.generate_key())
+    with connect(application_name="peer", transaction=True) as conn, conn.transaction():
+        vault.record_key(conn, AGENT, vault.fingerprint(swapped))
+        vault.publish(conn, AGENT, swapped)
+    with connect(application_name="platform", transaction=True) as conn, \
+            pytest.raises(vault.VaultError) as refused:
+        platform.deliver(conn, made, AGENT, {"GRANTED": "ok"})
+    assert refused.value.slug == "agent_key_changed" and "recover" in refused.value.hint
+
+
+def test_reseal_turns_format_1_and_2_entries_into_format_3_and_loses_none(vaulted, tmp_path):
+    root, key = _agent(tmp_path, AGENT)
+    fp = vault.fingerprint(key)
+    with connect(application_name="old", transaction=True) as conn, conn.transaction():
+        vault.put_row(conn, AGENT, "OLD_OWN", vault.seal_symmetric(key, AGENT, "OLD_OWN", "one"),
+                      fp)
+        vault.put_row(conn, AGENT, "OLD_GRANTED", vault.seal_for(
+            vault.public_key(key), AGENT, "OLD_GRANTED", "two"), fp)
+    with connect(application_name="migrate", transaction=True) as conn, conn.transaction():
+        done = vault.reseal(conn, key, AGENT)
+        again = vault.reseal(conn, key, AGENT)
+        held = {r["name"]: r["ciphertext"][0] for r in vault.rows(conn, AGENT)}
+    assert done == {"resealed": ["OLD_GRANTED", "OLD_OWN"], "unreadable": []}
+    assert again == {"resealed": [], "unreadable": []}
+    assert held == {"OLD_GRANTED": vault.SEALED_FORMAT_BOX, "OLD_OWN": vault.SEALED_FORMAT_BOX}
+    reader = vault.reader(root, AGENT)
+    assert (reader.get("OLD_OWN"), reader.get("OLD_GRANTED")) == ("one", "two")
+
+
+def test_a_dump_of_the_store_holds_no_key_and_no_value(vaulted, tmp_path):
+    from capabilities_contract import platform
+    a_root, a_key = _agent(tmp_path, AGENT)
+    _p_root, p_key = _agent(tmp_path, PEER)
+    _shared([AGENT, PEER])
+    _platform()
+    platform.share_connection(a_root, CID, {"DEMO_TOKEN": "shared-value-1"})
+    vault.write(a_root, AGENT, {"OWN_TOKEN": "own-value-1"})
+    platform_text = (platform.home() / platform.KEY_FILE).read_text().strip()
+    with connect(application_name="dump", transaction=True) as conn:
+        tables = [t for (t,) in conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = "
+            "current_schema() AND table_type = 'BASE TABLE'").fetchall()]
+        dump = b"".join(repr(conn.execute(f'SELECT * FROM "{t}"').fetchall()).encode()
+                        for t in tables)
+        copies = conn.execute("SELECT count(*) FROM platform_secrets").fetchone()[0]
+    assert copies == 2  # the shared connection's, and the agent's own
+    for secret in (vault.encode_key(a_key), vault.encode_key(p_key), platform_text):
+        assert secret.encode() not in dump
+    for raw in (a_key, p_key, vault.parse_key(platform_text)):
+        assert repr(raw).encode()[2:-1] not in dump
+    assert b"shared-value-1" not in dump and b"own-value-1" not in dump

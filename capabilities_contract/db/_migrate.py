@@ -32,6 +32,7 @@ from capabilities_contract.db import (
     _core,
     _keys,
     _node_cpu_percent,
+    _platform_key,
 )
 from capabilities_contract.db._changes import CHANNEL_TABLE
 from capabilities_contract.db._connect import _psycopg, bind_search_path, bound_schema
@@ -54,7 +55,7 @@ CORE_TABLES = (
     "node_login_expectations", "node_logs", "node_sessions", "node_session_expectations",
     "connections", "grants", "policies", "settings", "settings_changes",
     "settings_documents", "identifiers", "secrets", "service_instances", "service_leases",
-    "store_state", "reference_documents", "reference_versions", "people",
+    "store_state", "reference_documents", "reference_versions", "people", "platform_secrets",
 )
 CORE_PREIMAGE_PREFIX = "core_premig_"
 
@@ -131,7 +132,9 @@ class MigrateResult:
 # each connection's row (`_connection_created`); the fifth, a minor step, lets
 # an agent be archived and refuses starting anything for it then
 # (`_agent_archived`); the sixth, a minor step, lets a node say how much of
-# its CPU is in use (`_node_cpu_percent`). While empty, nothing runs for the core and nothing is
+# its CPU is in use (`_node_cpu_percent`); the seventh, a minor step, publishes
+# the platform's public key and keeps the platform's own copy of every secret
+# (`_platform_key`). While empty, nothing runs for the core and nothing is
 # written for it.
 CORE_STEPS: tuple[Step, ...] = (
     Step(_core.CORE_STEP_ID, _core.CORE_STEP_SQL, major=_core.CORE_MAJOR),
@@ -140,8 +143,9 @@ CORE_STEPS: tuple[Step, ...] = (
     Step(_connection_created.STEP_ID, _connection_created.STEP_SQL),
     Step(_agent_archived.STEP_ID, _agent_archived.STEP_SQL),
     Step(_node_cpu_percent.STEP_ID, _node_cpu_percent.STEP_SQL),
+    Step(_platform_key.STEP_ID, _platform_key.STEP_SQL),
 )
-CORE_VERSION = (_node_cpu_percent.MAJOR, _node_cpu_percent.MINOR)
+CORE_VERSION = (_platform_key.MAJOR, _platform_key.MINOR)
 
 # The pre-image the connection id step leaves: each connection's id beside the
 # capability, the name it was keyed by before core 3.0 and the label it had.

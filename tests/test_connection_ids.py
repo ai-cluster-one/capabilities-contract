@@ -182,6 +182,7 @@ def test_every_core_reference_holds_the_connection_id_and_goes_with_it(store, mo
                        ("node_session_expectations", "connection_id", "c"),
                        ("node_sessions", "connection_id", "c"),
                        ("nodes", "coolify_connection_id", "n"),
+                       ("platform_secrets", "connection_id", "c"),
                        ("settings", "connection_id", "c")]
         assert _rows(conn, "SELECT agent_id, connection_id FROM grants") == [(AGENT, home)]
         # A session of a connection only files hold keeps its key apart.

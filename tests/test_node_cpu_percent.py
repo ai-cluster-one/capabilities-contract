@@ -12,12 +12,13 @@ from capabilities_contract.capability import store as store_tier
 from capabilities_contract.db import _migrate, connect, disconnect, migrate
 
 CORE_4_2 = _migrate.CORE_STEPS[:5]
+CORE_4_3 = _migrate.CORE_STEPS[:6]
 NODE = "0a0b0c0d0e0f"
 
 
 def _core(major=4, minor=3, steps=None):
     with connect(application_name="setup", transaction=True) as conn:
-        result = migrate(conn, "core", steps or _migrate.CORE_STEPS, major=major, minor=minor)
+        result = migrate(conn, "core", steps or CORE_4_3, major=major, minor=minor)
         conn.commit()
     disconnect()
     return result
@@ -53,7 +54,7 @@ def test_a_store_at_core_4_2_takes_the_step_without_the_upgrade_and_old_rows_sta
     monkeypatch.delenv(_migrate.UPGRADE_ENV, raising=False)
     result = _core()
     assert result.applied == ["0044-node-cpu-percent"]
-    assert (result.major, result.minor) == (4, 3) == _migrate.CORE_VERSION
+    assert (result.major, result.minor) == (4, 3)
     with _conn() as conn, conn.transaction():
         [row] = store_tier.node_states(conn, [NODE])
         comment = conn.execute(

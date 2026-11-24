@@ -341,7 +341,7 @@ NODE_LOG_MANAGER = "manager"
 NODE_LOG_LINES = 100
 NODE_LOG_LINE_CHARS = 500
 NODE_LOG_MASK = "***"
-STORE_TABLES_VERSION = (4, 3)
+STORE_TABLES_VERSION = (4, 4)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
