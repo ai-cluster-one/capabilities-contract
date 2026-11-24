@@ -2143,6 +2143,37 @@ def _cmd_context(argv: list[str]) -> None:
 
 INVENTORY_NETWORK_MODES = ("none", "optional", "required")
 
+# What a reader drawing a capability's tile may count, and the glyph it draws
+# beside each count, both closed so a reader draws any capability's tile with
+# no knowledge of which one answered. Each kind names its usual glyph.
+TILE_KINDS = {"active": "pulse", "total": "page", "in_progress": "pulse",
+              "waiting": "hand", "documents": "page", "servers": "server",
+              "connections": "plug"}
+TILE_GLYPHS = ("pulse", "page", "hand", "server", "plug")
+
+
+def _tile(kind: str, value, label: str | None = None, *, glyph: str | None = None,
+          note: str | None = None) -> dict:
+    """One inventory metric a reader draws on the capability's tile.
+
+    `kind` is what the number counts, from `TILE_KINDS`; `glyph` is drawn
+    beside it, from `TILE_GLYPHS`, and defaults to the kind's own. `label`
+    defaults to the kind, so a reader that knows nothing of tiles still shows
+    the metric as every other one. A kind or glyph outside its set is the
+    capability's own fault and refuses the answer rather than reach a reader."""
+    if kind not in TILE_KINDS:
+        _die(6, "bad_tile", f"{NAME} counts an unknown tile kind {kind!r}",
+             f"a tile kind is one of {', '.join(TILE_KINDS)}")
+    glyph = glyph or TILE_KINDS[kind]
+    if glyph not in TILE_GLYPHS:
+        _die(6, "bad_tile", f"{NAME} draws an unknown tile glyph {glyph!r}",
+             f"a tile glyph is one of {', '.join(TILE_GLYPHS)}")
+    metric = {"label": label or kind.replace("_", " "), "value": value,
+              "kind": kind, "glyph": glyph}
+    if note:
+        metric["note"] = note
+    return metric
+
 
 def _inventory_declaration() -> dict | None:
     """The manifest's `inventory` block, derived from the INVENTORY constant.
@@ -2163,8 +2194,9 @@ def _cmd_inventory(argv: list[str]) -> None:
     `--network` is the caller's explicit consent to reach the remote system for
     detail a local read cannot supply; without it that detail is named in
     `deferred` rather than fetched, so assembling a whole project never waits
-    on a network the caller did not choose. `--json` is accepted for
-    explicitness; the output is always this JSON."""
+    on a network the caller did not choose. A metric that carries a tile
+    `kind` or `glyph` carries one from its closed set (`_tile`). `--json` is
+    accepted for explicitness; the output is always this JSON."""
     network = False
     for arg in argv:
         if arg == "--network":
@@ -2182,6 +2214,9 @@ def _cmd_inventory(argv: list[str]) -> None:
         for field in ("metrics", "items", "deferred"):
             report[field] = list(built.get(field) or [])
         report["service"] = built.get("service")
+        for metric in report["metrics"]:
+            if isinstance(metric, dict) and ("kind" in metric or "glyph" in metric):
+                _tile(metric.get("kind"), None, glyph=metric.get("glyph"))
     _emit(report)
 
 

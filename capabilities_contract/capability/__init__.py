@@ -92,7 +92,9 @@ page, the contract verbs' pages rendered here; and an unknown verb exits 6
 `_contract`'s `inventory` verb calls `_inventory(network)` only when the
 capability declares `INVENTORY`; that builder is per-capability and stays in
 the capability's own code, while the envelope, the flag parsing and the empty
-answer are shared so every capability reports in one shape.
+answer are shared so every capability reports in one shape. `_tile(kind,
+value)` builds a metric a reader draws on the capability's tile: its `kind`
+from `TILE_KINDS` and its `glyph` from `TILE_GLYPHS`, both closed.
 
 `_contract`'s `connections` verb calls `_cmd_connections`, and every capability
 defines its own `_cmd_connections` (its no-registry branch names that capability's
