@@ -29,6 +29,7 @@ from capabilities_contract.db import (
     _agent_archived,
     _connection_created,
     _connection_ids,
+    _connection_secret_keys,
     _core,
     _keys,
     _node_cpu_percent,
@@ -134,8 +135,9 @@ class MigrateResult:
 # (`_agent_archived`); the sixth, a minor step, lets a node say how much of
 # its CPU is in use (`_node_cpu_percent`); the seventh, a minor step, publishes
 # the platform's public key and keeps the platform's own copy of every secret
-# (`_platform_key`). While empty, nothing runs for the core and nothing is
-# written for it.
+# (`_platform_key`); the eighth, a minor step, records the names of the
+# secrets each connection resolves (`_connection_secret_keys`). While empty,
+# nothing runs for the core and nothing is written for it.
 CORE_STEPS: tuple[Step, ...] = (
     Step(_core.CORE_STEP_ID, _core.CORE_STEP_SQL, major=_core.CORE_MAJOR),
     Step(_connection_ids.STEP_ID, _connection_ids.STEP_SQL, major=_connection_ids.MAJOR),
@@ -144,8 +146,9 @@ CORE_STEPS: tuple[Step, ...] = (
     Step(_agent_archived.STEP_ID, _agent_archived.STEP_SQL),
     Step(_node_cpu_percent.STEP_ID, _node_cpu_percent.STEP_SQL),
     Step(_platform_key.STEP_ID, _platform_key.STEP_SQL),
+    Step(_connection_secret_keys.STEP_ID, _connection_secret_keys.STEP_SQL),
 )
-CORE_VERSION = (_platform_key.MAJOR, _platform_key.MINOR)
+CORE_VERSION = (_connection_secret_keys.MAJOR, _connection_secret_keys.MINOR)
 
 # The pre-image the connection id step leaves: each connection's id beside the
 # capability, the name it was keyed by before core 3.0 and the label it had.

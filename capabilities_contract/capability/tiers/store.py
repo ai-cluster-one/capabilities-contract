@@ -341,7 +341,7 @@ NODE_LOG_MANAGER = "manager"
 NODE_LOG_LINES = 100
 NODE_LOG_LINE_CHARS = 500
 NODE_LOG_MASK = "***"
-STORE_TABLES_VERSION = (4, 4)
+STORE_TABLES_VERSION = (4, 5)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -1192,6 +1192,12 @@ class Records:
         connection the store does not share."""
         return None
 
+    def fill_secret_keys(self, capability: str) -> int:
+        """Record the secret names of every connection of `capability` whose
+        row holds none (`StoreRecords.fill_secret_keys`); files keep no row to
+        record them in, so none is."""
+        return 0
+
     # Whether settings documents are rows of the store rather than files: true
     # only for an agent whose records moved into the store.
     settings_in_rows = False
@@ -1637,6 +1643,13 @@ class FileRecords(Records):
         store's rows are the global layer, theirs are answered."""
         rows = self._global_rows()
         return rows.connection_created(capability) if rows is not None else {}
+
+    def fill_secret_keys(self, capability: str) -> int:
+        """Record the secret names of every connection of `capability` whose
+        row holds none. Files keep no row to record them in; where the store's
+        rows are the global layer, theirs are recorded."""
+        rows = self._global_rows()
+        return rows.fill_secret_keys(capability) if rows is not None else 0
 
     def _word_id(self, capability: str, word: Any) -> Any:
         """The id of the connection `word` names by its label, where it names
@@ -2259,6 +2272,7 @@ class StoreRecords(FileRecords):
                         with conn.transaction():
                             done = work(conn)
                             committing = True
+                        self._secret_keys_flush(conn)
                         return done
                     except psycopg.OperationalError:
                         if attempt or committing or self._depth != 1 \
@@ -2616,6 +2630,7 @@ class StoreRecords(FileRecords):
                                  f"cannot be what a {capability} connection is called",
                                  "choose another word to add it under") from None
             if added is not None:
+                self._record_secret_keys(conn, capability, added[0])
                 return added[0], True
             row = self._held_connection(conn, capability, word)
         cid, held, _label = row
@@ -2630,7 +2645,91 @@ class StoreRecords(FileRecords):
         conn.execute(
             "UPDATE connections SET spec = %s::jsonb WHERE id = %s",
             (json.dumps(spec, ensure_ascii=False), cid))
+        self._record_secret_keys(conn, capability, cid)
         return cid, False
+
+    def _record_secret_keys(self, conn: Any, capability: str, cid: str) -> None:
+        """Have connection `cid`'s row, which this write changed, record the
+        names of the secrets it resolves once the write commits
+        (`_secret_keys_flush`). Only the capability the row belongs to knows
+        them, so elsewhere - the manager, another capability - nothing is
+        queued, and the store's guard leaves the row's names null."""
+        if callable(globals().get("_connection_secret_keys")) \
+                and capability == globals().get("NAME"):
+            due = self.__dict__.setdefault("_secret_keys_due", [])
+            if cid not in due:
+                due.append(cid)
+
+    def _secret_keys_flush(self, conn: Any) -> None:
+        """Record the names of the secrets each connection a committed write
+        changed resolves (`_secret_keys_write`). It runs after the write, on
+        no open transaction, because the capability's report that names them
+        reads the store itself; a write held in a caller's transaction leaves
+        them to the next `connections`. Never fails the write."""
+        due, self._secret_keys_due = getattr(self, "_secret_keys_due", []), []
+        if not due or not self._owns_conn or self._depth != 1:
+            return
+        try:
+            self._secret_keys_write(conn, due)
+        except Exception:
+            pass
+
+    def _secret_keys_write(self, conn: Any, due: Sequence[str]) -> int:
+        """Record in the rows of the connections `due` the names of the
+        secrets each resolves, as this capability's own `connections` report
+        names them (`_connection_secret_keys`, the connections tier's): each
+        computed from its row as read, with no transaction open, and written
+        in a statement of its own, only where the row's spec and label are
+        still the ones it was computed from. The store's guard clears the
+        names when an update changes the spec or the label without setting
+        them, and never clears what a write of the names alone sets. How many
+        rows were recorded; none on a store whose core predates the names
+        (4.5)."""
+        compute = globals().get("_connection_secret_keys")
+        if not callable(compute) or not due:
+            return 0
+        rows = self._read_on(conn, (
+            "SELECT c.id, c.label, c.spec FROM connections c "
+            "WHERE c.id = ANY(%s) AND to_jsonb(c) ? 'secret_keys'"), (list(due),))
+        found = []
+        for cid, label, spec in rows:
+            keys = compute(cid, label, spec if isinstance(spec, dict) else {})
+            if keys is not None:
+                found.append((list(keys), cid, json.dumps(spec, ensure_ascii=False), label))
+        if not found:
+            return 0
+        recorded = 0
+        with conn.transaction():
+            for keys, cid, spec, label in found:
+                recorded += conn.execute(
+                    "UPDATE connections SET secret_keys = %s::text[] WHERE id = %s "
+                    "AND spec = %s::jsonb AND label IS NOT DISTINCT FROM %s",
+                    (keys, cid, spec, label)).rowcount
+        return recorded
+
+    def fill_secret_keys(self, capability: str) -> int:
+        """Record the secret names of every connection of `capability` whose
+        row holds none (`_secret_keys_write`): one the store held before it
+        recorded them, or one a writer that does not know them wrote. How many
+        rows were recorded; 0 under the read-only switch, outside the
+        capability the rows belong to, and on a store whose core predates the
+        names."""
+        _store_check("capability", capability, CAPABILITY_RE)
+        if read_only_switch() or capability != globals().get("NAME") \
+                or not callable(globals().get("_connection_secret_keys")):
+            return 0
+        # Read through the row's JSON, so a store whose core predates the
+        # names answers none rather than failing.
+        due = [cid for (cid,) in self._read(
+            "SELECT c.id FROM connections c WHERE c.capability = %s "
+            "AND to_jsonb(c) -> 'secret_keys' = 'null'::jsonb", (capability,))]
+        if not due:
+            return 0
+        conn = self._begin()
+        try:
+            return self._secret_keys_write(conn, due)
+        finally:
+            self._end()
 
     def _drop_connection(self, conn: Any, capability: str, word: str,
                          agent: str | None) -> bool:
@@ -2763,6 +2862,7 @@ class StoreRecords(FileRecords):
                              f"{label!r} is already a connection's id or the label of "
                              f"another {capability} connection",
                              "choose another label") from None
+        self._record_secret_keys(conn, capability, cid)
 
     def rename_connection(self, capability: str, cid: str, label: str | None,
                           actor: str | None = None) -> None:

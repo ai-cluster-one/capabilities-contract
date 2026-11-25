@@ -2548,9 +2548,14 @@ def _cmd_connections_reported() -> None:
     without a round-trip, `label`, what it is called: the label
     `connection rename` gave it, else its id, and `created_at`, when the
     store made its row (ISO text), null for a connection kept in files or
-    older than the store recording it."""
+    older than the store recording it. Beside the report, the store is given
+    the secret names of each of the capability's connections it holds
+    without them (`_connections_fill_secret_keys`), first, so a report that
+    refuses - this project granted none of them - still leaves them recorded."""
     import contextlib
     import io
+    if "_connections_fill_secret_keys" in globals():
+        _connections_fill_secret_keys()
     captured = io.StringIO()
     try:
         with contextlib.redirect_stdout(captured):

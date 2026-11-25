@@ -292,6 +292,68 @@ def _connections_registry() -> tuple[dict | None, Path | str | None]:
     return _connections_composed(), _records().collection_source(NAME, "connection")
 
 
+def _connection_secret_keys(cid: str, label: str | None, spec: dict) -> list | None:
+    """The names of the secrets connection `cid` resolves, as this
+    capability's own `connections` report names them: the keys of its entry
+    the report marks secret, in the report's order, each once. The report is
+    run over a registry holding this one connection, as the store holds it,
+    so what the store records (`connections.secret_keys`) is the report's
+    own answer. None where the capability has no report, or the report does
+    not answer for the connection; nothing it prints is shown, and what it
+    learns of the vault is not kept."""
+    report_of = globals().get("_connections_report")
+    if not callable(report_of) or not isinstance(spec, dict):
+        return None
+    import contextlib
+    import io
+    label = label or cid
+    origin = "store"
+    registry = {"default": cid,
+                "connections": {cid: {**spec, "allow_write": bool(WRITE_DEFAULT),
+                                      "id": cid, "label": label}},
+                "sources": {cid: origin}, "withheld": {}, "labels": {cid: label}}
+    # The report reads the connection's label back where it names a key after
+    # it; it is the label given here, which a write may not have committed yet.
+    held = {name: globals().get(name)
+            for name in ("_connections_registry", "_connection_labels")}
+    unread, asked = dict(_VAULT_UNREAD), dict(_VAULT_KEYS)
+    globals()["_connections_registry"] = lambda: (registry, origin)
+    globals()["_connection_labels"] = lambda: {cid: label}
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            report = report_of()
+    except (Exception, SystemExit):
+        return None
+    finally:
+        globals().update(held)
+        _VAULT_UNREAD.clear()
+        _VAULT_UNREAD.update(unread)
+        _VAULT_KEYS.clear()
+        _VAULT_KEYS.update(asked)
+    entry = ((report or {}).get("connections") or {}).get(cid) \
+        if isinstance(report, dict) else None
+    keys = entry.get("keys") if isinstance(entry, dict) else None
+    if not isinstance(keys, list):
+        return None
+    names: list = []
+    for key in keys:
+        name = key.get("key") if isinstance(key, dict) and key.get("secret") else None
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+    return names
+
+
+def _connections_fill_secret_keys() -> None:
+    """Record the secret names of every connection of this capability the
+    store holds without them (`fill_secret_keys`): rows older than the store
+    recording them, and rows a writer that does not know them wrote. Never
+    fails the verb it runs beside."""
+    try:
+        _records().fill_secret_keys(NAME)
+    except (Exception, SystemExit):
+        pass
+
+
 def _connection_labels() -> dict:
     """What each connection the store holds is called, by its id: the word it
     was added under, or the label `connection rename` gave it. A connection
