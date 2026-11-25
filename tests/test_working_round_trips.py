@@ -13,7 +13,7 @@ import psycopg
 import pytest
 from _proxy import Proxy
 
-from capabilities_contract.db import DbError, connect, disconnect, migrate
+from capabilities_contract.db import DbError, connect, disconnect, migrate, store_major
 from capabilities_contract.db import _connect as connect_module
 
 IDLE = psycopg.pq.TransactionStatus.IDLE
@@ -141,6 +141,29 @@ def test_a_read_alone_is_one_round_trip_bound(table, tmp_path, autocommit, param
         assert row[:2] == (table.schema, "4321ms")
         assert trace.round_trips == 1, trace.sent
         assert "Query" not in trace.sent[1:] and trace.sent.count("Sync") <= 1
+
+
+@pytest.mark.parametrize("autocommit", [False, True])
+def test_an_applied_migrate_is_one_round_trip_for_the_core_and_its_owner(table, tmp_path,
+                                                                        autocommit):
+    with connect(application_name="alone", transaction=True) as conn:
+        conn.autocommit = autocommit
+        with _Trace(conn, tmp_path / "trace") as trace:
+            done = migrate(conn, "demo", [("0001", "CREATE TABLE demo_rows (id int)")],
+                           major=1, minor=0)
+        assert trace.round_trips == 1, trace.sent
+        assert (done.applied, done.skipped, done.major, done.minor) == ([], ["0001"], 1, 0)
+        assert done.core is not None and done.core.applied == [] and done.core.skipped
+        assert conn.info.transaction_status == IDLE
+
+
+def test_the_store_major_is_one_round_trip(table, tmp_path):
+    with connect(application_name="alone", transaction=True) as conn:
+        with _Trace(conn, tmp_path / "trace") as trace:
+            found = store_major(conn)
+        assert trace.round_trips == 1, trace.sent
+        assert found.major is not None
+        assert conn.info.transaction_status == IDLE
 
 
 @pytest.mark.parametrize("params", [None, (1,)])

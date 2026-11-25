@@ -311,7 +311,7 @@ def test_a_read_after_a_write_is_not_run_again(table, server):
 def test_a_migration_whose_check_lost_its_connection_asks_again(table, server,
                                                                 monkeypatch):
     from capabilities_contract.db import _migrate
-    real = _migrate._check_version
+    real = _migrate._read_alone
     cut = []
 
     def lose_it_once(conn, *args, **kwargs):
@@ -320,7 +320,7 @@ def test_a_migration_whose_check_lost_its_connection_asks_again(table, server,
             _terminate(server, cut[0])
         return real(conn, *args, **kwargs)
 
-    monkeypatch.setattr(_migrate, "_check_version", lose_it_once)
+    monkeypatch.setattr(_migrate, "_read_alone", lose_it_once)
     with connect(application_name="migrating", transaction=True) as conn:
         done = migrate(conn, "demo", [("0001", "CREATE TABLE demo_rows (id int)")],
                        major=1, minor=0)

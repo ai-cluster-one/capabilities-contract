@@ -536,8 +536,7 @@ def store_major(conn: Any, schema: str | None = None) -> StoreMajor:
              ledger=sql.SQL("{}.{}").format(sql.Identifier(schema),
                                             sql.Identifier(LEDGER_TABLE)))
     try:
-        with conn.transaction():
-            held, major, since = conn.execute(query, (CORE_OWNER, CORE_OWNER, steps)).fetchone()
+        held, major, since = _read_alone(conn, query, (CORE_OWNER, CORE_OWNER, steps))[0]
     except psycopg.errors.UndefinedTable:
         return StoreMajor(None, None)
     if not held:
@@ -545,6 +544,18 @@ def store_major(conn: Any, schema: str | None = None) -> StoreMajor:
     if major is None:
         return StoreMajor(1, None)
     return StoreMajor(major, since)
+
+
+def _read_alone(conn: Any, query: Any, params: Sequence[Any]) -> list[tuple]:
+    """The rows of one plain read. On an idle transaction connection it runs as a
+    transaction of its own, binding, read and commit in one round trip; on any
+    other connection, or inside a caller's transaction, in a transaction block
+    of its own (a savepoint of the caller's)."""
+    stands_alone = getattr(conn, "_stands_alone", None)
+    if stands_alone is not None and stands_alone(True):
+        return conn.execute(query, params).fetchall()
+    with conn.transaction():
+        return conn.execute(query, params).fetchall()
 
 
 def _check_version(conn: Any, schema: str, owner: str, major: int, minor: int,
@@ -567,8 +578,8 @@ def _check_version(conn: Any, schema: str, owner: str, major: int, minor: int,
     return stored
 
 
-def _settled(conn: Any, schema: str, owner: str, plan: list[Step], major: int, minor: int,
-             result: MigrateResult) -> bool:
+def _settled_each(conn: Any, schema: str, owner: str, plan: list[Step], major: int,
+                  minor: int, result: MigrateResult) -> bool:
     """Whether there is nothing to do: the platform tables exist, every step is
     applied with its SQL, and the store records the caller's version or a newer
     minor. Read without a lock, so a session holding one stops no caller whose
@@ -597,6 +608,65 @@ def _settled(conn: Any, schema: str, owner: str, plan: list[Step], major: int, m
                               "never edit an applied step; add a new step instead")
     result.skipped = [step.id for step in plan]
     result.major, result.minor = stored
+    return True
+
+
+def _settled(conn: Any, schema: str, owner: str, plan: list[Step], major: int, minor: int,
+             result: MigrateResult) -> bool:
+    """Whether there is nothing to do for `owner` and, for any owner but `core`,
+    for the core's own steps too, judged from one read without a lock: the
+    platform tables exist, every step is applied with its SQL, and the store
+    records each version asked for or a newer minor. Fills `result` (and
+    `result.core`) only when it answers True. Anything else - a table, step or
+    version missing, a refusal - answers False, and the locked path judges it
+    as it always has."""
+    psycopg, sql = _psycopg()
+    asked = [(owner, plan, major, minor)]
+    if owner != CORE_OWNER and CORE_STEPS:
+        asked.insert(0, (CORE_OWNER, CORE_STEPS, CORE_VERSION[0], CORE_VERSION[1]))
+    owners = [name for name, *_ in asked]
+    query = sql.SQL(
+        "SELECT to_regclass(%s) IS NOT NULL, "
+        "(SELECT coalesce(json_agg(json_build_array(owner, major, minor)), '[]'::json) "
+        "FROM {versions} WHERE owner = ANY(%s::text[])), "
+        "(SELECT coalesce(json_agg(json_build_array(owner, step, checksum)), '[]'::json) "
+        "FROM {ledger} WHERE owner = ANY(%s::text[]))"
+    ).format(versions=sql.SQL("{}.{}").format(sql.Identifier(schema),
+                                              sql.Identifier(VERSION_TABLE)),
+             ledger=sql.SQL("{}.{}").format(sql.Identifier(schema),
+                                            sql.Identifier(LEDGER_TABLE)))
+    try:
+        channel, versions, ledger = _read_alone(
+            conn, query, (f'"{schema}".{CHANNEL_TABLE}', owners, owners))[0]
+    except psycopg.errors.UndefinedTable:
+        return False
+    if not channel:
+        return False
+    stored = {name: (int(got_major), int(got_minor)) for name, got_major, got_minor in versions}
+    applied: dict[str, dict[str, str]] = {}
+    for name, step, checksum in ledger:
+        applied.setdefault(name, {})[step] = checksum
+    judged: dict[str, MigrateResult] = {}
+    for name, steps, want_major, want_minor in asked:
+        held = stored.get(name)
+        if held is None or held[0] != want_major or held < (want_major, want_minor):
+            return False
+        done = applied.get(name, {})
+        if any(done.get(step.id) != step.checksum for step in steps):
+            return False
+        found = MigrateResult(owner=name, schema=schema, skipped=[step.id for step in steps],
+                              major=held[0], minor=held[1])
+        if held[1] > want_minor:
+            found.warnings.append(
+                f"the store's {name} tables are at schema version {held[0]}.{held[1]}, "
+                f"a newer minor than the {want_major}.{want_minor} this code knows; "
+                "it works, but an update is available")
+        judged[name] = found
+    mine = judged[owner]
+    result.skipped, result.major, result.minor = mine.skipped, mine.major, mine.minor
+    result.warnings.extend(w for w in mine.warnings if w not in result.warnings)
+    if owner != CORE_OWNER and CORE_STEPS:
+        result.core = judged[CORE_OWNER]
     return True
 
 
@@ -692,6 +762,10 @@ def _migrate(conn: Any, owner: str, steps: Iterable[Step | Sequence[str]], *,
         raise DbError("connection_busy", "migrate needs an idle connection",
                       "commit or roll back before migrating")
     result = MigrateResult(owner=owner, schema=schema)
+    if _settled(conn, schema, owner, plan, major, minor, result):
+        bind_search_path(conn, schema)
+        conn.commit()
+        return result
     if owner != CORE_OWNER and CORE_STEPS:
         if empty is None:
             with conn.transaction():
@@ -702,7 +776,7 @@ def _migrate(conn: Any, owner: str, steps: Iterable[Step | Sequence[str]], *,
     ledger = sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(LEDGER_TABLE))
     versions = sql.SQL("{}.{}").format(sql.Identifier(schema), sql.Identifier(VERSION_TABLE))
 
-    settled = _settled(conn, schema, owner, plan, major, minor, result)
+    settled = _settled_each(conn, schema, owner, plan, major, minor, result)
     if not settled:
         with conn.transaction():
             if empty is None:
