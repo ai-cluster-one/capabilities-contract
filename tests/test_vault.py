@@ -397,8 +397,11 @@ def test_an_entry_another_agent_writes_into_a_vault_is_refused(vaulted, tmp_path
     forged = vault.seal_box(vault._public_secret(p_key), a_public, AGENT, "FORGED", "evil")
     with connect(application_name="peer", transaction=True) as conn, conn.transaction():
         vault.put_row(conn, AGENT, "FORGED", forged, fp)
-    # Sent by another agent's key: refused, and the reader pins the platform key on sight.
+    # Sent by another agent's key: refused.
     assert vault.reader(a_root, AGENT).get("FORGED") is None
+    with connect(application_name="platform", transaction=True) as conn, conn.transaction():
+        assert platform.write_agent_pin(conn, made, AGENT, a_key)
+    platform.record_vault_pins([AGENT])
     with connect(application_name="reader", transaction=True) as conn:
         assert vault.pin_of(a_key, AGENT, vault.rows(conn, AGENT)) == made.public
     # Sealed anonymously once the pin exists: refused.
@@ -469,6 +472,7 @@ def test_own_entries_are_format_1_and_a_delivery_format_2_beside_the_platforms_c
     made = _platform()
     vault.write(root, AGENT, {"OWN": "mine"})
     with connect(application_name="platform", transaction=True) as conn, conn.transaction():
+        assert platform.write_agent_pin(conn, made, AGENT, key)
         assert platform.deliver(conn, made, AGENT, {"GRANTED": "ok"}) == {"GRANTED": "created"}
         assert platform.deliver(conn, made, AGENT, {"GRANTED": "ok"}) == {
             "GRANTED": "unchanged"}
@@ -527,6 +531,7 @@ def test_the_platform_key_the_store_publishes_is_never_pinned_or_trusted(vaulted
     with connect(application_name="platform", transaction=True) as conn, conn.transaction():
         platform.write_agent_pin(conn, made, AGENT, key)
         platform.deliver(conn, made, AGENT, {"GRANTED": "ok"})
+    platform.record_vault_pins([AGENT])
     held = platform.home() / platform.KEY_FILE
     for machine, own in (("platform", "OWN_HERE"), ("node", "OWN_ON_NODE")):
         if machine == "node":
@@ -612,3 +617,62 @@ def test_a_dump_of_the_store_holds_no_key_and_no_value(vaulted, tmp_path):
     for raw in (a_key, p_key, vault.parse_key(platform_text)):
         assert repr(raw).encode()[2:-1] not in dump
     assert b"shared-value-1" not in dump and b"own-value-1" not in dump
+
+
+def test_a_first_pin_keeps_an_older_release_s_entries_and_a_pin_taken_away_launders_none(
+        vaulted, tmp_path):
+    """The platform's first pin of an agent closes format 2 for it, so it seals the
+    agent's format 2 entries again as its own first; a reader on the platform's
+    machine does not pin an agent the platform never pinned. A pin taken away after
+    that is written again with nothing sealed again: a format 2 entry planted
+    meanwhile never opens and never becomes the agent's own."""
+    from capabilities_contract import platform
+    root, key = _agent(tmp_path, AGENT)
+    _peer_root, attacker = _agent(tmp_path, PEER)
+    public, fp = vault.public_key(key), vault.fingerprint(key)
+    with connect(application_name="old", transaction=True) as conn, conn.transaction():
+        vault.put_row(conn, AGENT, "OLD_GRANTED", vault.seal_for(public, AGENT, "OLD_GRANTED",
+                                                                 "kept"), fp)
+    made = _platform()
+    # On the platform's machine, before the platform pinned the agent, every
+    # reader and writer leaves it unpinned and the older entry opens.
+    vault._READERS.clear()
+    assert vault.reader(root, AGENT).get("OLD_GRANTED") == "kept"
+    vault.write(root, AGENT, {"OWN": "mine"})
+    with connect(application_name="reader", transaction=True) as conn, conn.transaction():
+        assert vault.take_pin(conn, key, AGENT) is None
+        assert vault.pin_of(key, AGENT, vault.rows(conn, AGENT)) is None
+    # The platform's first pin seals it again as the agent's own, then pins.
+    with connect(application_name="platform", transaction=True) as conn, conn.transaction():
+        assert platform.write_agent_pin(conn, made, AGENT, key)
+        held = {r["name"]: r for r in vault.rows(conn, AGENT)}
+    platform.record_vault_pins([AGENT])
+    assert held["OLD_GRANTED"]["ciphertext"][0] == vault.SEALED_FORMAT
+    assert vault.pin_of(key, AGENT, held.values()) == made.public
+    vault._READERS.clear()
+    assert vault.reader(root, AGENT).get("OLD_GRANTED") == "kept"
+    # The pin taken away, a format 2 entry planted over the agent's own.
+    with connect(application_name="peer", transaction=True) as conn, conn.transaction():
+        conn.execute("DELETE FROM secrets WHERE agent_id = %s AND name = %s",
+                     (AGENT, vault.PIN_NAME))
+        vault.put_row(conn, AGENT, "OLD_GRANTED", vault.seal_for(public, AGENT, "OLD_GRANTED",
+                                                                 "evil"), fp)
+    with connect(application_name="migrate", transaction=True) as conn, conn.transaction():
+        assert vault.reseal(conn, key, AGENT) == {"resealed": [], "unreadable": ["OLD_GRANTED"]}
+    # A reader on the platform's machine writes the pin again at once, sealing nothing.
+    vault._READERS.clear()
+    assert vault.reader(root, AGENT).get("OLD_GRANTED") is None
+    with connect(application_name="reader", transaction=True) as conn:
+        held = {r["name"]: r for r in vault.rows(conn, AGENT)}
+    assert vault.pin_of(key, AGENT, held.values()) == made.public
+    assert held["OLD_GRANTED"]["ciphertext"][0] == vault.SEALED_FORMAT_PUBLIC
+    # Taken away again, the platform writes it again, sealing nothing either.
+    with connect(application_name="peer", transaction=True) as conn, conn.transaction():
+        conn.execute("DELETE FROM secrets WHERE agent_id = %s AND name = %s",
+                     (AGENT, vault.PIN_NAME))
+    with connect(application_name="platform", transaction=True) as conn, conn.transaction():
+        assert platform.write_agent_pin(conn, made, AGENT, key)
+        held = {r["name"]: r for r in vault.rows(conn, AGENT)}
+    assert held["OLD_GRANTED"]["ciphertext"][0] == vault.SEALED_FORMAT_PUBLIC
+    vault._READERS.clear()
+    assert vault.reader(root, AGENT).get("OLD_GRANTED") is None

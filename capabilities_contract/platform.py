@@ -27,6 +27,14 @@ for an agent whose published key is no longer the one it pinned (`agent_key_chan
 until a recovery pins the new one, so a writer of the store cannot swap an agent's key
 for its own and receive its grants.
 
+An agent's first pin closes format 2 for it, so the platform writes it only together
+with sealing again, as the agent, the format 2 entries an older release left it
+(`write_agent_pin`), and remembers that it did, beside its key in
+`$XDG_CONFIG_HOME/capabilities/platform/pinned.json` (`record_vault_pins`, once the
+caller's transaction commits). A pin missing for an agent the platform already pinned
+was taken away, and is written again with nothing sealed again, so a format 2 entry a
+writer of the store planted meanwhile never becomes the agent's own.
+
 Importing this module imports neither psycopg nor PyNaCl; each is imported on use.
 """
 
@@ -46,6 +54,7 @@ from capabilities_contract.vault import VaultError
 
 KEY_FILE = "key"
 PINS_FILE = "pins.json"
+PINNED_FILE = "pinned.json"
 UPDATED_BY = "platform"
 MISSING_HINT = vault.PLATFORM_HINT
 ELSEWHERE_HINT = ("the platform key lives on one machine, beside the capabilities "
@@ -187,9 +196,9 @@ def ensure(conn: Any, *, create_missing: bool = False) -> Platform:
 
 
 @contextlib.contextmanager
-def _pins_locked():
+def _pins_locked(file: str = PINS_FILE):
     import fcntl
-    path = home() / PINS_FILE
+    path = home() / file
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = path.parent / ".pins.lock"
     fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
@@ -241,6 +250,25 @@ def pin_agent(agent_id: str, public: bytes, *, replace: bool = False) -> str:
 def pinned_public(agent_id: str) -> bytes | None:
     found = pins().get(agent_id)
     return vault.parse_public(found) if found else None
+
+
+def vault_pinned(agent_id: str) -> bool:
+    """Whether the platform of this machine has pinned itself in the agent's
+    vault before (`record_vault_pins`): a pin then missing was taken away."""
+    with _pins_locked(PINNED_FILE) as held:
+        return agent_id in held
+
+
+def record_vault_pins(agent_ids: Iterable[str]) -> None:
+    """Remember that the platform's pin is in each agent's vault: called once
+    the transaction that wrote it commits, so a pin rolled back is not
+    remembered."""
+    wanted = [agent for agent in agent_ids if agent]
+    if not wanted:
+        return
+    with _pins_locked(PINNED_FILE) as held:
+        for agent in wanted:
+            held.setdefault(agent, True)
 
 
 def recipient(conn: Any, agent_id: str) -> tuple[str, bytes]:
@@ -352,7 +380,11 @@ def write_agent_pin(conn: Any, platform: Platform, agent_id: str, key: bytes,
                     updated_by: str | None = UPDATED_BY) -> bool:
     """Where the platform holds the agent's key, pin the platform key in the
     agent's vault and the agent's public key on the platform: True where the
-    agent's pin was written."""
+    agent's pin was written, which the caller remembers once its transaction
+    commits (`record_vault_pins`). An agent's first pin - none in its vault,
+    none remembered - comes with its format 2 entries sealed again as its own
+    first (`vault.reseal`), since the pin closes format 2 for it; a pin taken
+    away is written again with nothing sealed again."""
     if vault.fingerprint(key) != vault.recorded_key(conn, agent_id)[1]:
         raise VaultError("key_mismatch",
                          f"the key here is not the one agent {agent_id}'s vault is kept under")
@@ -360,8 +392,12 @@ def write_agent_pin(conn: Any, platform: Platform, agent_id: str, key: bytes,
     held = conn.execute("SELECT name, ciphertext, key_fingerprint FROM secrets "
                         "WHERE agent_id = %s AND name = %s",
                         (agent_id, vault.PIN_NAME)).fetchall()
-    if vault.pin_of(key, agent_id, held) == platform.public:
+    pinned = vault.pin_of(key, agent_id, held)
+    if pinned == platform.public:
+        record_vault_pins([agent_id])  # read before anything here wrote: committed
         return False
+    if pinned is None and not vault_pinned(agent_id):
+        vault.reseal(conn, key, agent_id, updated_by=updated_by)
     vault.write_pin(conn, key, agent_id, platform.public, updated_by=updated_by)
     return True
 

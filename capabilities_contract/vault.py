@@ -36,9 +36,11 @@ copy opens only where its sender is the agent itself or the platform key the age
 trusts; otherwise format 2 opens only while the agent holds no pin. The trusted
 platform key is the agent's pin - an entry of its own vault (`PIN_NAME`), sealed under
 its own key so only a holder of the key writes it - or the platform key file on this
-machine (`local_platform`); a process holding the key that finds the file writes the
-pin from it where the pin differs (`take_pin`). The platform key the store publishes
-is never trusted and never pinned from. Where the agent trusts a platform key, each of
+machine (`local_platform`). An agent's first pin is written by the platform where it
+holds the agent's key, together with its format 2 entries sealed again as its own
+(`platform.write_agent_pin`); after that, a process holding the key that finds the file
+writes the pin from it where the pin differs or was taken away (`take_pin`). The
+platform key the store publishes is never trusted and never pinned from. Where the agent trusts a platform key, each of
 its own writes also leaves the platform a copy, sent by the agent.
 
 `Reader` is how a process resolves vault values: it reads the agent's sealed rows and
@@ -564,7 +566,7 @@ def put(conn: Any, key: bytes, agent_id: str, name: str, value: str,
                          "platform key, not a secret", "choose another name")
     put_row(conn, agent_id, name, seal(key, agent_id, name, value), fingerprint(key),
             updated_by)
-    trusted = take_pin(conn, key, agent_id, updated_by=updated_by)
+    trusted = take_pin(conn, key, agent_id, updated_by=updated_by) or local_platform()
     if trusted is not None:
         put_copy_row(conn, seal_box(_public_secret(key), trusted,
                                     copy_scope(agent_id=agent_id), name, value),
@@ -675,21 +677,35 @@ def local_platform() -> bytes | None:
     return held.public if held is not None else None
 
 
+def _pinned_here(agent_id: str) -> bool:
+    """Whether the platform key file on this machine has pinned itself in the
+    agent's vault before (`platform.vault_pinned`), False where none is here."""
+    from capabilities_contract import platform
+    if local_platform() is None:
+        return False
+    return platform.vault_pinned(agent_id)
+
+
 def take_pin(conn: Any, key: bytes, agent_id: str,
              updated_by: str | None = None) -> bytes | None:
-    """The platform key the agent trusts: where this machine holds the
-    platform key file, its key, pinned now where the agent's pin is another
-    or none; else the one the agent pinned; None where it pinned none. The
-    platform key the store publishes is never taken."""
+    """The platform key the agent pinned, as it stands after this call: where
+    this machine holds the platform key file and the agent's pin is another,
+    or was taken away after the platform pinned it, the file's key, pinned
+    now; else the one the agent pinned; None where it pinned none. An agent
+    the platform never pinned is left unpinned here: its first pin is the
+    platform's (`platform.write_agent_pin`), which first seals again what
+    the pin would close. The platform key the store publishes is never
+    taken."""
     found = conn.execute(
         "SELECT name, ciphertext, key_fingerprint FROM secrets WHERE agent_id = %s "
         "AND name = %s", (agent_id, PIN_NAME)).fetchall()
     pinned = pin_of(key, agent_id, found)
     local = local_platform()
-    if local is None:
+    if local is None or pinned == local:
         return pinned
-    if pinned != local:
-        write_pin(conn, key, agent_id, local, updated_by=updated_by)
+    if pinned is None and not _pinned_here(agent_id):
+        return None
+    write_pin(conn, key, agent_id, local, updated_by=updated_by)
     return local
 
 
@@ -700,11 +716,16 @@ def reseal(conn: Any, key: bytes, agent_id: str,
     with the same key and value: {resealed, unreadable} by name. An entry
     beside which the platform's copy opens from the platform key the agent
     trusts is the platform's delivery and is left as it is, as is an entry
-    under another key, or one that does not open."""
+    under another key, or one that does not open. An agent whose pin the
+    platform of this machine wrote and that holds none now had it taken
+    away: its format 2 entries do not open, so one planted meanwhile is
+    never sealed as its own."""
     current = fingerprint(key)
     held = rows(conn, agent_id)
     pin = pin_of(key, agent_id, held)
-    trusted = local_platform() or pin
+    if pin is None and _pinned_here(agent_id):
+        pin = STRICT
+    trusted = local_platform() or (pin if isinstance(pin, bytes) else None)
     out: dict[str, list[str]] = {"resealed": [], "unreadable": []}
     for row in held:
         name, blob, box = row["name"], row["ciphertext"], row["box"]
@@ -1025,21 +1046,23 @@ class Reader:
 
     def _trust(self) -> bytes | None:
         """The platform key the agent trusts beside its pin: the one this
-        machine's key file holds, pinned now where the pin is another or none
-        (`take_pin`), so the reader's next load reads it; None where this
-        machine holds none. A pin that cannot be written - an outage, a
-        read-only login - leaves the file's key trusted all the same."""
+        machine's key file holds, pinned now where the pin is another or was
+        taken away (`take_pin`), so the reader's next load reads it; None
+        where this machine holds none. A pin that cannot be written - an
+        outage, a read-only login - leaves the file's key trusted all the
+        same."""
         if self._trusted is STRICT:
             local = local_platform()
             if local is not None and local != self._pin():
                 try:
                     with self._connect() as conn, conn.transaction():
-                        take_pin(conn, self._key, self.agent_id)
+                        pinned = take_pin(conn, self._key, self.agent_id)
                 except Exception:  # the pin waits for a writer; the file is trusted
                     pass
                 else:
-                    self._pinned = local
-                    self._opened.clear()
+                    if pinned != self._pinned:
+                        self._pinned = pinned
+                        self._opened.clear()
             self._trusted = local
         return self._trusted
 
