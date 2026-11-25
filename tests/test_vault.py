@@ -436,7 +436,8 @@ def test_the_platform_seals_nothing_for_an_agent_whose_published_key_moved(vault
     assert refused.value.slug == "agent_key_changed" and "recover" in refused.value.hint
 
 
-def test_reseal_turns_format_1_and_2_entries_into_format_3_and_loses_none(vaulted, tmp_path):
+def test_reseal_turns_format_2_entries_into_format_1_and_loses_none(vaulted, tmp_path):
+    from capabilities_contract import platform
     root, key = _agent(tmp_path, AGENT)
     fp = vault.fingerprint(key)
     with connect(application_name="old", transaction=True) as conn, conn.transaction():
@@ -448,11 +449,145 @@ def test_reseal_turns_format_1_and_2_entries_into_format_3_and_loses_none(vaulte
         done = vault.reseal(conn, key, AGENT)
         again = vault.reseal(conn, key, AGENT)
         held = {r["name"]: r["ciphertext"][0] for r in vault.rows(conn, AGENT)}
-    assert done == {"resealed": ["OLD_GRANTED", "OLD_OWN"], "unreadable": []}
+    assert done == {"resealed": ["OLD_GRANTED"], "unreadable": []}
     assert again == {"resealed": [], "unreadable": []}
-    assert held == {"OLD_GRANTED": vault.SEALED_FORMAT_BOX, "OLD_OWN": vault.SEALED_FORMAT_BOX}
+    assert held == {"OLD_GRANTED": vault.SEALED_FORMAT, "OLD_OWN": vault.SEALED_FORMAT}
     reader = vault.reader(root, AGENT)
     assert (reader.get("OLD_OWN"), reader.get("OLD_GRANTED")) == ("one", "two")
+    # What the platform delivers is its own, and is left as it is.
+    made = _platform()
+    with connect(application_name="platform", transaction=True) as conn, conn.transaction():
+        platform.deliver(conn, made, AGENT, {"GRANTED": "three"})
+        assert vault.reseal(conn, key, AGENT) == {"resealed": [], "unreadable": []}
+
+
+def test_own_entries_are_format_1_and_a_delivery_format_2_beside_the_platforms_copy(
+        vaulted, tmp_path):
+    """What this release writes opens under a release that reads only `ciphertext`."""
+    from capabilities_contract import platform
+    root, key = _agent(tmp_path, AGENT)
+    made = _platform()
+    vault.write(root, AGENT, {"OWN": "mine"})
+    with connect(application_name="platform", transaction=True) as conn, conn.transaction():
+        assert platform.deliver(conn, made, AGENT, {"GRANTED": "ok"}) == {"GRANTED": "created"}
+        assert platform.deliver(conn, made, AGENT, {"GRANTED": "ok"}) == {
+            "GRANTED": "unchanged"}
+    with connect(application_name="reader", transaction=True) as conn:
+        held = {r["name"]: r for r in vault.rows(conn, AGENT)}
+    assert set(held) == {"GRANTED", "OWN", vault.PIN_NAME}
+    assert [held[n]["ciphertext"][0] for n in ("OWN", vault.PIN_NAME)] == [vault.SEALED_FORMAT] * 2
+    assert held["OWN"]["box"] is None
+    assert held["GRANTED"]["ciphertext"][0] == vault.SEALED_FORMAT_PUBLIC
+    assert vault.box_sender(held["GRANTED"]["box"]) == made.public
+    # A reader of `ciphertext` alone, as an older release is, opens both.
+    assert vault._unseal_symmetric(key, AGENT, "OWN", held["OWN"]["ciphertext"]) == "mine"
+    assert vault._unseal_public(key, AGENT, "GRANTED", held["GRANTED"]["ciphertext"]) == "ok"
+    reader = vault.reader(root, AGENT)
+    assert (reader.get("OWN"), reader.get("GRANTED")) == ("mine", "ok")
+    # The agent's own write of the name clears the platform's copy beside it.
+    vault.write(root, AGENT, {"GRANTED": "mine-now"})
+    with connect(application_name="reader", transaction=True) as conn:
+        [row] = [r for r in vault.rows(conn, AGENT) if r["name"] == "GRANTED"]
+    assert (row["ciphertext"][0], row["box"]) == (vault.SEALED_FORMAT, None)
+    assert vault.reader(root, AGENT).get("GRANTED") == "mine-now"
+
+
+def _attack(agent: str, attacker: bytes, pin: bool = True) -> None:
+    """Another agent, holding the store's login and its own key alone: the
+    agent's pin taken out, and its own public key published as the platform's."""
+    with connect(application_name="peer", transaction=True) as conn, conn.transaction():
+        if pin:
+            conn.execute("DELETE FROM secrets WHERE agent_id = %s AND name = %s",
+                         (agent, vault.PIN_NAME))
+        conn.execute("UPDATE store_state SET platform_public_key = %s",
+                     (vault.public_text(attacker),))
+
+
+def _forge(agent: str, key: bytes, attacker: bytes, name: str, value: str) -> None:
+    with connect(application_name="peer", transaction=True) as conn, conn.transaction():
+        vault.put_row(conn, agent, name, vault.seal_box(
+            vault._public_secret(attacker), vault.public_key(key), agent, name, value),
+            vault.fingerprint(key))
+
+
+def _attacker_opens(agent: str, key: bytes, attacker: bytes) -> list:
+    with connect(application_name="peer", transaction=True) as conn:
+        found = conn.execute("SELECT name, ciphertext FROM platform_secrets "
+                             "WHERE agent_id = %s", (agent,)).fetchall()
+    opened = [vault.open_box(vault._public_secret(attacker), vault.copy_scope(agent_id=agent),
+                             name, bytes(blob), [vault.public_key(key)]) for name, blob in found]
+    return [value for value in opened if value is not None]
+
+
+def test_the_platform_key_the_store_publishes_is_never_pinned_or_trusted(vaulted, tmp_path):
+    from capabilities_contract import platform
+    root, key = _agent(tmp_path, AGENT)
+    _peer_root, attacker = _agent(tmp_path, PEER)
+    made = _platform()
+    with connect(application_name="platform", transaction=True) as conn, conn.transaction():
+        platform.write_agent_pin(conn, made, AGENT, key)
+        platform.deliver(conn, made, AGENT, {"GRANTED": "ok"})
+    held = platform.home() / platform.KEY_FILE
+    for machine, own in (("platform", "OWN_HERE"), ("node", "OWN_ON_NODE")):
+        if machine == "node":
+            held.rename(held.with_suffix(".away"))
+        _attack(AGENT, attacker)
+        _forge(AGENT, key, attacker, "FORGED", "evil")
+        vault._READERS.clear()
+        reader = vault.reader(root, AGENT)
+        assert reader.get("FORGED") is None, machine
+        vault.write(root, AGENT, {own: "mine"})
+        with connect(application_name="writer", transaction=True) as conn, conn.transaction():
+            vault.put(conn, key, AGENT, own + "_TOO", "mine-too")
+            trusted = vault.take_pin(conn, key, AGENT)
+            pin = vault.pin_of(key, AGENT, vault.rows(conn, AGENT))
+        vault._READERS.clear()
+        reader = vault.reader(root, AGENT)
+        assert (reader.get("FORGED"), reader.get(own)) == (None, "mine"), machine
+        # Where the key file is the pin is written from it; where it is not none is taken.
+        assert (pin, trusted) == ((made.public, made.public) if machine == "platform"
+                                  else (None, None)), machine
+        assert _attacker_opens(AGENT, key, attacker) == [], machine
+    # On the node, a missing pin stays missing: no copy of an own entry is written.
+    with connect(application_name="reader", transaction=True) as conn:
+        copied = {n for (n,) in conn.execute(
+            "SELECT name FROM platform_secrets WHERE agent_id = %s", (AGENT,)).fetchall()}
+    assert copied == {"OWN_HERE", "OWN_HERE_TOO"}
+
+
+def test_a_key_published_before_the_platform_exists_is_never_pinned(vaulted, tmp_path):
+    root, key = _agent(tmp_path, AGENT)
+    _peer_root, attacker = _agent(tmp_path, PEER)
+    _attack(AGENT, attacker, pin=False)
+    _forge(AGENT, key, attacker, "FORGED", "evil")
+    assert vault.reader(root, AGENT).get("FORGED") is None
+    vault.write(root, AGENT, {"OWN": "mine"})
+    with connect(application_name="reader", transaction=True) as conn:
+        found = vault.rows(conn, AGENT)
+        copies = conn.execute("SELECT count(*) FROM platform_secrets").fetchone()[0]
+    assert vault.pin_of(key, AGENT, found) is None and copies == 0
+    vault._READERS.clear()
+    assert vault.reader(root, AGENT).get("FORGED") is None
+
+
+def test_a_store_older_than_core_4_4_keeps_the_vault_as_before(store, tmp_path):
+    from capabilities_contract.db import _migrate
+    with connect(application_name="setup", transaction=True) as conn:
+        migrate(conn, "core", _migrate.CORE_STEPS[:6], major=4, minor=3)
+        conn.execute("INSERT INTO agents (id) VALUES (%s)", (AGENT,))
+        conn.commit()
+    disconnect()
+    vault._READERS.clear()
+    text = vault.generate_key()
+    root = tmp_path / "agent"
+    root.mkdir()
+    (root / ".env.local").write_text(f"{vault.KEY_ENV}={text}\n")
+    vault.write(root, AGENT, {"OWN": "mine"})
+    vault.write(root, AGENT, {"OWN": "mine-2"})
+    with connect(application_name="reader", transaction=True) as conn:
+        [row] = vault.rows(conn, AGENT)
+    assert (row["ciphertext"][0], row["box"]) == (vault.SEALED_FORMAT, None)
+    assert vault.reader(root, AGENT).get("OWN") == "mine-2"
 
 
 def test_a_dump_of_the_store_holds_no_key_and_no_value(vaulted, tmp_path):

@@ -5,9 +5,11 @@ The platform is a keypair the capabilities manager makes on first need, on the m
 it runs on, in a file only its user reads: `$XDG_CONFIG_HOME/capabilities/platform/key`,
 32 random bytes as URL-safe base64, like an agent's key, its X25519 secret derived the
 same way. It never enters the store and never reaches a node; the store publishes its
-public key (`store_state.platform_public_key`). A machine that finds the store publishing
-another platform key than the one its file holds, or one while it holds none, is refused
-(`platform_key_elsewhere`), so there is one platform per store.
+public key (`store_state.platform_public_key`) for display and hints, and no agent
+trusts it from there: an agent trusts the platform key it pinned in its own vault, or
+the key file on its own machine (`vault.take_pin`). A machine that finds the store
+publishing another platform key than the one its file holds, or one while it holds
+none, is refused (`platform_key_elsewhere`), so there is one platform per store.
 
 The platform keeps its own copy of every secret in `platform_secrets`, sealed to its own
 public key with sender authentication (`vault.seal_box`): a shared connection's secret
@@ -16,8 +18,10 @@ agent's copy only where that agent sent it, under the public key the platform pi
 for it, or where the platform did.
 
 Every entry the platform writes into an agent's vault is sealed from its copy to the
-agent's public key, sent by the platform, which the agent opens because it pinned the
-platform key. The platform pins each agent's public key at first sight, in
+agent's public key twice in one row: in format 2 (`vault.seal_for`), which every
+release opens, and beside it in `platform_ciphertext` in format 3, sent by the platform,
+which a release that reads it opens only from the platform key the agent trusts. The
+platform pins each agent's public key at first sight, in
 `$XDG_CONFIG_HOME/capabilities/platform/pins.json` beside its key, and refuses to seal
 for an agent whose published key is no longer the one it pinned (`agent_key_changed`)
 until a recovery pins the new one, so a writer of the store cannot swap an agent's key
@@ -317,27 +321,29 @@ def connection_values(conn: Any, platform: Platform, connection_id: str) -> dict
 
 def deliver(conn: Any, platform: Platform, agent_id: str, values: Mapping[str, str], *,
             updated_by: str | None = UPDATED_BY) -> dict[str, str]:
-    """Seal each of `values` into the agent's vault, sent by the platform, to
-    the agent's pinned public key: {name: "created" | "replaced" |
-    "unchanged"}, an entry the platform already sent with the same value left
-    as it is, so delivering again changes nothing. VaultError as `recipient`
-    raises it, with nothing written."""
+    """Seal each of `values` into the agent's vault, to the agent's pinned
+    public key: in format 2, and beside it the platform's format 3 copy, sent
+    by the platform. {name: "created" | "replaced" | "unchanged"}, an entry
+    the platform already delivered with the same value left as it is - a
+    format 2 entry beside a copy the platform sent of that value - so
+    delivering again changes nothing. VaultError as `recipient` raises it,
+    with nothing written."""
     fp, public = recipient(conn, agent_id)
     names = [vault.check_name(name) for name in values]
-    held = {name: (bytes(blob), at) for name, blob, at in conn.execute(
-        "SELECT name, ciphertext, key_fingerprint FROM secrets WHERE agent_id = %s "
-        "AND name = ANY(%s)", (agent_id, names)).fetchall()}
+    held = {row["name"]: row for row in vault.rows(conn, agent_id) if row["name"] in names}
     out = {}
     for name in names:
         found = held.get(name)
-        if found is not None and found[1] == fp and vault.open_box(
-                platform.secret, agent_id, name, found[0], [platform.public],
-                recipient=public) == values[name]:
+        if (found is not None and found["key_fingerprint"] == fp
+                and found["ciphertext"][:1] == bytes([vault.SEALED_FORMAT_PUBLIC])
+                and found["box"] is not None
+                and vault.open_box(platform.secret, agent_id, name, found["box"],
+                                   [platform.public], recipient=public) == values[name]):
             out[name] = "unchanged"
             continue
-        vault.put_row(conn, agent_id, name,
-                      vault.seal_box(platform.secret, public, agent_id, name, values[name]),
-                      fp, updated_by)
+        vault.put_row(conn, agent_id, name, vault.seal_for(public, agent_id, name, values[name]),
+                      fp, updated_by,
+                      box=vault.seal_box(platform.secret, public, agent_id, name, values[name]))
         out[name] = "replaced" if found is not None else "created"
     return out
 

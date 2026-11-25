@@ -1,12 +1,19 @@
-"""The core's seventh step: the store publishes the platform's public key and keeps
-the platform's own copy of every secret.
+"""The core's seventh step: the store publishes the platform's public key, keeps the
+platform's own copy of every secret, and keeps beside each entry the platform delivers
+a copy that says it sent it.
 
 It adds `store_state.platform_public_key`, the X25519 public key of the
 platform keypair the capabilities manager makes on the machine it runs on,
-in a file only its user reads, and never in the store. An agent pins it in
-its own vault the first time a process holding the agent's key sees it, and
-from then on opens an entry another than itself sealed only where it was
-sent by that key.
+in a file only its user reads, and never in the store. It is published for
+display and hints only: anyone holding the store's login writes it, so no
+agent trusts it from there. An agent trusts only the platform key pinned in
+its own vault, which only a holder of its key writes, or the platform key
+file on its own machine.
+
+It adds `secrets.platform_ciphertext`: beside an entry the platform delivers
+in format 2, which every release opens, the same value in format 3, sent by
+the platform, which a release that reads the column opens only where that
+sender is the platform key the agent trusts. An agent's own write clears it.
 
 It adds `platform_secrets`, the platform's own copy of every secret: a row
 per name, either of a connection the store shares (`connection_id`) or of
@@ -18,7 +25,7 @@ replaced. The table keys a row by its own uuid and refers to its agent or
 connection by id with a foreign key that takes the row with its parent; it
 carries no announcement, since only the platform reads it.
 
-The step adds a nullable column and a table and changes no row, so it is a
+The step adds two nullable columns and a table and changes no row, so it is a
 minor step (core 4.4): it is applied wherever the core is at major 4,
 outside the store upgrade, and a release that knows core 4.3 reads a store
 at 4.4 as a newer minor and reads every row it read before. Never edit the
@@ -36,9 +43,17 @@ ALTER TABLE store_state ADD COLUMN platform_public_key text
  CHECK (platform_public_key ~ '^[A-Za-z0-9_-]{43}$');
 COMMENT ON COLUMN store_state.platform_public_key IS 'The platform''s public key: the \
 X25519 public key of the keypair the capabilities manager keeps in a file of its own \
-machine, URL-safe base64 of 32 bytes, never the private key. An agent pins it in its own \
-vault on first sight and opens an entry another than itself sent only where this key \
-sent it. Null until the platform keypair is made (core 4.4).';
+machine, URL-safe base64 of 32 bytes, never the private key. Published for display and \
+hints only, never trusted from here: an agent trusts the platform key pinned in its own \
+vault or held in the key file of its own machine. Null until the platform keypair is \
+made (core 4.4).';
+ALTER TABLE secrets ADD COLUMN platform_ciphertext bytea;
+COMMENT ON COLUMN secrets.platform_ciphertext IS 'Beside an entry the platform delivers \
+in format 2, the same value in format 3: the format byte, the 32-byte X25519 public key \
+of the platform that sent it, the 24-byte nonce, then the XChaCha20-Poly1305 ciphertext \
+with its tag under the key the platform and the agent agree on, opened only where its \
+sender is the platform key the agent trusts. Null for an entry the agent wrote itself, \
+whose write clears it (core 4.4).';
 CREATE TABLE platform_secrets (
  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
  agent_id text REFERENCES agents (id) ON DELETE CASCADE CHECK (agent_id <> ''),
