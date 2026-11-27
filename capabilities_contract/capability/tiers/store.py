@@ -1364,6 +1364,11 @@ class FileRecords(Records):
         if rows is not None:
             rows.load_layers(capabilities)
 
+    def load_identifiers(self, capabilities: Iterable[str]) -> None:
+        """Read the identifiers of every one of `capabilities` in one round
+        trip, where the store holds them, so each one's identifier reads that
+        follow answer from it; nothing where they are files."""
+
     def global_grantees(self, capability: str, connection: str) -> list[str]:
         """Every agent a grant enables a connection of the global layer for,
         where that layer is the store's rows; none where it is files."""
@@ -2477,27 +2482,49 @@ class StoreRecords(FileRecords):
         """This capability's identifiers in the store, per scope: this
         project's rows and the global ones, each label to its value, note and
         time of writing."""
-        key = ("identifier", capability)
-        held = self._fresh(key)
+        held = self._fresh(("identifier", capability))
         if held is None:
-            held = {"project": {}, "global": {}}
-            # A row for one node is an agent's whose records moved into the
-            # store; this project reads the rows for every node. The node is
-            # read through the row's JSON, so a store whose identifiers carry
-            # no node yet is read the same way.
-            rows = self._read(
-                "SELECT agent_id, label, value, note, updated_at, "
-                "to_jsonb(i) ->> 'node' "
-                "FROM identifiers i "
-                "WHERE capability = %s AND (agent_id IS NULL OR agent_id = %s) "
-                "ORDER BY label", (capability, self.project_id))
-            for agent_id, label, value, note, updated_at, node in rows:
-                if node is not None:
-                    continue
-                scope = "global" if agent_id is None else "project"
-                held[scope][label] = (value, note or "", _stamp(updated_at))
-            self._cache[key] = (time.monotonic(), held)
+            held = self._read_identifiers([capability])[capability]
         return held
+
+    def load_identifiers(self, capabilities: Iterable[str]) -> None:
+        """Read the identifiers of every one of `capabilities` the cache does
+        not hold, in one round trip, where the store holds identifiers, so the
+        reads of each that follow answer from it rather than going to the
+        store once per capability."""
+        if "identifier" not in self.collections:
+            return
+        wanted: list[str] = []
+        for capability in capabilities:
+            _store_check("capability", capability, CAPABILITY_RE)
+            if capability not in wanted and self._fresh(("identifier", capability)) is None:
+                wanted.append(capability)
+        if wanted:
+            self._read_identifiers(wanted)
+
+    def _read_identifiers(self, capabilities: list[str]) -> dict[str, dict]:
+        """The identifiers of each of `capabilities`, read together and held
+        in the cache under `("identifier", capability)`."""
+        found = {capability: {"project": {}, "global": {}} for capability in capabilities}
+        # A row for one node is an agent's whose records moved into the
+        # store; this project reads the rows for every node. The node is
+        # read through the row's JSON, so a store whose identifiers carry
+        # no node yet is read the same way.
+        rows = self._read(
+            "SELECT capability, agent_id, label, value, note, updated_at, "
+            "to_jsonb(i) ->> 'node' "
+            "FROM identifiers i "
+            "WHERE capability = ANY(%s) AND (agent_id IS NULL OR agent_id = %s) "
+            "ORDER BY capability, label", (list(capabilities), self.project_id))
+        for capability, agent_id, label, value, note, updated_at, node in rows:
+            if node is not None:
+                continue
+            scope = "global" if agent_id is None else "project"
+            found[capability][scope][label] = (value, note or "", _stamp(updated_at))
+        now = time.monotonic()
+        for capability, held in found.items():
+            self._cache[("identifier", capability)] = (now, held)
+        return found
 
     def _policy_rows(self) -> list[tuple[str, str | None, dict[str, tuple]]]:
         """The policy rows that apply to this project on this node, as the
@@ -3908,23 +3935,23 @@ class AgentRecords(StoreRecords):
         found = self._defaults(capability)
         return found.get("project") or found.get("global")
 
-    def _identifier_rows(self, capability: str) -> dict:
-        key = ("identifier", capability)
-        held = self._fresh(key)
-        if held is None:
-            held = {(scope, node): {} for scope in ("project", "global")
-                    for node in (self.node, None)}
-            rows = self._read(
-                "SELECT agent_id, node, label, value, note, updated_at "
-                "FROM identifiers "
-                "WHERE capability = %s AND (agent_id IS NULL OR agent_id = %s) "
-                "AND (node IS NULL OR node = %s) ORDER BY label",
-                (capability, self.project_id, self.node))
-            for agent_id, node, label, value, note, updated_at in rows:
-                scope = "global" if agent_id is None else "project"
-                held[(scope, node)][label] = (value, note or "", _stamp(updated_at))
-            self._cache[key] = (time.monotonic(), held)
-        return held
+    def _read_identifiers(self, capabilities: list[str]) -> dict[str, dict]:
+        found = {capability: {(scope, node): {} for scope in ("project", "global")
+                              for node in (self.node, None)}
+                 for capability in capabilities}
+        rows = self._read(
+            "SELECT capability, agent_id, node, label, value, note, updated_at "
+            "FROM identifiers "
+            "WHERE capability = ANY(%s) AND (agent_id IS NULL OR agent_id = %s) "
+            "AND (node IS NULL OR node = %s) ORDER BY capability, label",
+            (list(capabilities), self.project_id, self.node))
+        for capability, agent_id, node, label, value, note, updated_at in rows:
+            scope = "global" if agent_id is None else "project"
+            found[capability][(scope, node)][label] = (value, note or "", _stamp(updated_at))
+        now = time.monotonic()
+        for capability, held in found.items():
+            self._cache[("identifier", capability)] = (now, held)
+        return found
 
     def _scope_layers(self, capability: str, collection: str,
                       scope: str) -> list[dict[str, dict[str, Any]]]:
