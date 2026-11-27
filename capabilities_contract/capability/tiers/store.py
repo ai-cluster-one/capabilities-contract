@@ -18,7 +18,7 @@ import socket
 # The capability core region reads the clock through `time` and imports nothing
 # of its own, so this region keeps carrying it.
 import time
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -1296,6 +1296,14 @@ class FileRecords(Records):
         in force, else `files`. A configured store that does not answer
         raises StoreError, since a write could land in neither."""
         return "store" if self._global_rows(write=True) is not None else "files"
+
+    def load_global(self, capabilities: Iterable[str]) -> None:
+        """Read the store's global layer of every one of `capabilities` in one
+        round trip, where that layer is the store's rows, so the global reads
+        of each that follow answer from it; nothing where it is files."""
+        rows = self._global_rows()
+        if rows is not None:
+            rows.load_layers(capabilities)
 
     def global_grantees(self, capability: str, connection: str) -> list[str]:
         """Every agent a grant enables a connection of the global layer for,
@@ -3391,27 +3399,52 @@ class GlobalRows(StoreRecords):
         key = ("global", capability)
         held = self._fresh(key)
         if held is None:
-            connections, grants = self._read_many([
-                ("SELECT id, spec, label FROM connections "
-                 "WHERE capability = %s AND owner_agent_id IS NULL ORDER BY label",
-                 (capability,)),
-                ("SELECT connection_id, enabled, allow_write, is_default "
-                 "FROM grants WHERE agent_id IS NULL "
-                 "AND node IS NULL AND capability = %s ORDER BY connection_id",
-                 (capability,))])
-            held = {"connections": {cid: dict(spec) if isinstance(spec, dict) else {}
-                                    for cid, spec, _label in connections},
-                    "labels": {cid: label for cid, _spec, label in connections},
-                    "grants": {}, "default": None}
-            for cid, enabled, allow_write, is_default in grants:
-                fields = {f: v for f, v in (("enabled", enabled),
-                                            ("allow_write", allow_write)) if v is not None}
-                if fields:
-                    held["grants"][cid] = fields
-                if is_default and held["default"] is None:
-                    held["default"] = cid
-            self._cache[key] = (time.monotonic(), held)
+            held = self._read_layers([capability])[capability]
         return held
+
+    def load_layers(self, capabilities: Iterable[str]) -> None:
+        """Read the global layer of every one of `capabilities` the cache does
+        not hold, in one round trip, so the reads of each that follow answer
+        from it rather than going to the store once per capability."""
+        wanted = []
+        for capability in capabilities:
+            _store_check("capability", capability, CAPABILITY_RE)
+            if capability not in wanted and self._fresh(("global", capability)) is None:
+                wanted.append(capability)
+        if wanted:
+            self._read_layers(wanted)
+
+    def _read_layers(self, capabilities: list[str]) -> dict[str, dict[str, Any]]:
+        """The global layer of each of `capabilities`, read together and held
+        in the cache under `("global", capability)`."""
+        connections, grants = self._read_many([
+            ("SELECT capability, id, spec, label FROM connections "
+             "WHERE capability = ANY(%s) AND owner_agent_id IS NULL "
+             "ORDER BY capability, label",
+             (list(capabilities),)),
+            ("SELECT capability, connection_id, enabled, allow_write, is_default "
+             "FROM grants WHERE agent_id IS NULL "
+             "AND node IS NULL AND capability = ANY(%s) "
+             "ORDER BY capability, connection_id",
+             (list(capabilities),))])
+        layers: dict[str, dict[str, Any]] = {
+            capability: {"connections": {}, "labels": {}, "grants": {}, "default": None}
+            for capability in capabilities}
+        for capability, cid, spec, label in connections:
+            layers[capability]["connections"][cid] = dict(spec) if isinstance(spec, dict) else {}
+            layers[capability]["labels"][cid] = label
+        for capability, cid, enabled, allow_write, is_default in grants:
+            held = layers[capability]
+            fields = {f: v for f, v in (("enabled", enabled),
+                                        ("allow_write", allow_write)) if v is not None}
+            if fields:
+                held["grants"][cid] = fields
+            if is_default and held["default"] is None:
+                held["default"] = cid
+        now = time.monotonic()
+        for capability, held in layers.items():
+            self._cache[("global", capability)] = (now, held)
+        return layers
 
     def connection_labels(self, capability: str) -> dict[str, str]:
         """What each shared connection of `capability` is called, by its id."""
