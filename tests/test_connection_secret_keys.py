@@ -26,6 +26,7 @@ from capabilities_contract.capability import store as S
 from capabilities_contract.db import _migrate, connect, disconnect, migrate
 
 CORE_4_4 = _migrate.CORE_STEPS[:7]
+CORE_4_5 = _migrate.CORE_STEPS[:8]
 
 
 @pytest.fixture
@@ -57,11 +58,11 @@ def test_a_store_at_core_4_4_takes_the_step_without_the_upgrade_and_old_rows_sta
     disconnect()
     monkeypatch.delenv(_migrate.UPGRADE_ENV, raising=False)
     with connect(application_name="setup", transaction=True) as conn:
-        result = migrate(conn, "core", _migrate.CORE_STEPS, major=4, minor=5)
+        result = migrate(conn, "core", CORE_4_5, major=4, minor=5)
         conn.commit()
     disconnect()
     assert result.applied == ["0046-connection-secret-keys"]
-    assert (result.major, result.minor) == (4, 5) == _migrate.CORE_VERSION
+    assert (result.major, result.minor) == (4, 5)
     assert _keys("old") is None
     [(comment,)] = _sql("SELECT col_description('connections'::regclass, attnum) "
                         "FROM pg_attribute WHERE attrelid = 'connections'::regclass "
@@ -81,7 +82,7 @@ def test_a_store_at_core_4_4_takes_the_step_without_the_upgrade_and_old_rows_sta
 
 def test_an_update_that_changes_the_row_without_the_names_clears_them(store):
     with connect(application_name="setup", transaction=True) as conn:
-        migrate(conn, "core", _migrate.CORE_STEPS, major=4, minor=5)
+        migrate(conn, "core", CORE_4_5, major=4, minor=5)
         conn.commit()
     disconnect()
     _sql("INSERT INTO connections (capability, label, spec, secret_keys) "

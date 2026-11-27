@@ -51,9 +51,10 @@ def under_the_upgrade(monkeypatch):
 
 
 def _stubs(conn, schema):
+    # A stub stands under an old table's name; the core's own views do not.
     return {name for (name,) in _rows(
         conn, "SELECT relname FROM pg_class WHERE relnamespace = %s::regnamespace "
-              "AND relkind = 'v'", (schema,))}
+              "AND relkind = 'v' AND starts_with(relname, 'capabilities_')", (schema,))}
 
 
 def _drop_stubs(conn, schema):

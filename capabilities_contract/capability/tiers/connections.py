@@ -433,6 +433,41 @@ def _labelled(wanted: str | None) -> str | None:
                 None)
 
 
+# The connection this process resolved last (`_select_connection`), which an
+# exit for refused credentials records as not signed in on this node.
+_CONNECTION_CHOSEN: list = [None]
+# How long that record may take at most, so a store that is slow to answer
+# never slows the exit it follows.
+CONNECTION_REFUSED_TIMEOUT_MS = 2000
+
+
+def _connection_refused() -> None:
+    """Record, on this node, that the connection this process resolved was
+    refused: its session in the store's node_sessions written not live,
+    `not_signed_in`. Only where the connection came from the store, on the
+    records' own connection, once that is open, never under the read-only
+    switch, and within CONNECTION_REFUSED_TIMEOUT_MS; whatever stands in its
+    way, nothing is written and nothing is said."""
+    cid = _CONNECTION_CHOSEN[0]
+    adapter = globals().get("_RECORDS")
+    if not cid or adapter is None or read_only_switch():
+        return
+    if not hasattr(adapter, "_begin") or not getattr(adapter, "_owns_conn", False) \
+            or adapter.mode_of("connection") != "store":
+        return
+    project, node = getattr(adapter, "project_id", None), adapter.node
+    if not project or not node:
+        return
+    conn = adapter._begin()
+    try:
+        with conn.transaction():
+            conn.execute(f"SET LOCAL statement_timeout = {int(CONNECTION_REFUSED_TIMEOUT_MS)}")
+            conn.execute(f"SET LOCAL lock_timeout = {int(CONNECTION_REFUSED_TIMEOUT_MS)}")
+            node_session_put(conn, project, node, NAME, cid, False, reason="not_signed_in")
+    finally:
+        adapter._end()
+
+
 def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
     """flag → default pointer → sole entry → die 6: (the connection's id, its
     entry, which carries `id` and `label` beside its fields). The flag names a
@@ -461,6 +496,7 @@ def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict 
 
     def chosen(cid: str) -> tuple[str, dict | None]:
         entry = conns[cid]
+        _CONNECTION_CHOSEN[0] = cid
         if isinstance(entry, dict):
             entry.setdefault("id", cid)
             entry.setdefault("label", labels.get(cid) or cid)

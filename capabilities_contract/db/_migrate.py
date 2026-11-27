@@ -33,6 +33,7 @@ from capabilities_contract.db import (
     _core,
     _keys,
     _node_cpu_percent,
+    _node_health,
     _platform_key,
 )
 from capabilities_contract.db._changes import CHANNEL_TABLE
@@ -136,7 +137,9 @@ class MigrateResult:
 # its CPU is in use (`_node_cpu_percent`); the seventh, a minor step, publishes
 # the platform's public key and keeps the platform's own copy of every secret
 # (`_platform_key`); the eighth, a minor step, records the names of the
-# secrets each connection resolves (`_connection_secret_keys`). While empty,
+# secrets each connection resolves (`_connection_secret_keys`); the ninth, a
+# minor step, reads each agent's health on each of its nodes through one view
+# and announces every change of its state (`_node_health`). While empty,
 # nothing runs for the core and nothing is written for it.
 CORE_STEPS: tuple[Step, ...] = (
     Step(_core.CORE_STEP_ID, _core.CORE_STEP_SQL, major=_core.CORE_MAJOR),
@@ -147,8 +150,9 @@ CORE_STEPS: tuple[Step, ...] = (
     Step(_node_cpu_percent.STEP_ID, _node_cpu_percent.STEP_SQL),
     Step(_platform_key.STEP_ID, _platform_key.STEP_SQL),
     Step(_connection_secret_keys.STEP_ID, _connection_secret_keys.STEP_SQL),
+    Step(_node_health.STEP_ID, _node_health.STEP_SQL),
 )
-CORE_VERSION = (_connection_secret_keys.MAJOR, _connection_secret_keys.MINOR)
+CORE_VERSION = (_node_health.MAJOR, _node_health.MINOR)
 
 # The pre-image the connection id step leaves: each connection's id beside the
 # capability, the name it was keyed by before core 3.0 and the label it had.

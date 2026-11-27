@@ -21,6 +21,16 @@ def _die(exit_code: int, code: str, message: str,
                                     ensure_ascii=False) + "\n")
         sys.stdout.flush()
     sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    if exit_code == 2:
+        # Refused credentials (the auth exit): the connection this process
+        # resolved is recorded as not signed in on this node, where the
+        # connections tier is carried; that record never fails the exit.
+        refused = globals().get("_connection_refused")
+        if callable(refused):
+            try:
+                refused()
+            except BaseException:
+                pass
     sys.exit(exit_code)
 
 

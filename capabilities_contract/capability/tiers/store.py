@@ -341,7 +341,15 @@ NODE_LOG_MANAGER = "manager"
 NODE_LOG_LINES = 100
 NODE_LOG_LINE_CHARS = 500
 NODE_LOG_MASK = "***"
-STORE_TABLES_VERSION = (4, 5)
+# Each agent's health on each of its nodes, read through the one view that
+# holds the colour rule, and the channel that announces every change of state
+# of a node's sign-ins, sessions and services (core 4.6).
+NODE_HEALTH_VIEW = "agent_nodes_health"
+NODE_HEALTH_CHANNEL = "agent_nodes_health"
+NODE_HEALTH_COLUMNS = ("node", "health", "reachable", "cannot_read_store", "store_major",
+                       "store_since", "last_seen_at", "reported_at", "fresh_until", "items",
+                       "sign_ins", "sessions")
+STORE_TABLES_VERSION = (4, 6)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -441,11 +449,14 @@ def service_instance_put(conn: Any, project_id: str, capability: str, node: str,
                          host: str | None = None, started_at: Any = None,
                          last_exit_code: int | None = None, last_error: str | None = None,
                          last_error_at: Any = None,
-                         skipped_settings: Sequence[Any] = ()) -> None:
+                         skipped_settings: Sequence[Any] = (),
+                         restart_settings: Sequence[str] | None = None) -> None:
     """Write the whole row of what `node` runs of `capability` for the project,
     as its supervisor sees it now; `checked_at` is the store's now. Text is
     kept to its last SERVICE_INSTANCE_TEXT_CHARS characters, and an empty
-    string is written as nothing."""
+    string is written as nothing. `restart_settings` names the settings keys
+    the service takes only when it starts, as its capability declares them;
+    None where the writer does not say (core 4.6)."""
     if state not in SERVICE_INSTANCE_STATES:
         raise StoreError("bad_state", f"service state {state!r} is not one of "
                          f"{', '.join(SERVICE_INSTANCE_STATES)}")
@@ -457,18 +468,21 @@ def service_instance_put(conn: Any, project_id: str, capability: str, node: str,
     conn.execute(
         "INSERT INTO service_instances AS i (agent_id, capability, node,"
         " state, problem, problem_code, payload_sha256, pid, host, started_at,"
-        " last_exit_code, last_error, last_error_at, skipped_settings)"
-        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)"
+        " last_exit_code, last_error, last_error_at, skipped_settings, restart_settings)"
+        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)"
         " ON CONFLICT (agent_id, capability, node) DO UPDATE SET"
         " state = EXCLUDED.state, problem = EXCLUDED.problem,"
         " problem_code = EXCLUDED.problem_code, payload_sha256 = EXCLUDED.payload_sha256,"
         " pid = EXCLUDED.pid, host = EXCLUDED.host, started_at = EXCLUDED.started_at,"
         " checked_at = now(), last_exit_code = EXCLUDED.last_exit_code,"
         " last_error = EXCLUDED.last_error, last_error_at = EXCLUDED.last_error_at,"
-        " skipped_settings = EXCLUDED.skipped_settings",
+        " skipped_settings = EXCLUDED.skipped_settings,"
+        " restart_settings = EXCLUDED.restart_settings",
         (project_id, capability, node, state, text(problem), text(problem_code),
          payload_sha256 or None, pid, text(host), started_at, last_exit_code,
-         text(last_error), last_error_at, json.dumps(list(skipped_settings))))
+         text(last_error), last_error_at, json.dumps(list(skipped_settings)),
+         sorted({str(k) for k in restart_settings if str(k)})
+         if restart_settings is not None else None))
 
 
 def service_instance_drop(conn: Any, project_id: str, capability: str, node: str) -> bool:
@@ -618,6 +632,37 @@ def node_sessions_put(conn: Any, project_id: str, node: str, capability: str,
                      (project_id, node, live, account, reason, keys, capability, connection))
 
 
+def node_session_put(conn: Any, project_id: str, node: str, capability: str,
+                     connection: str, live: bool, account: str | None = None,
+                     reason: str | None = None,
+                     reason_keys: Sequence[str] | None = None) -> None:
+    """Write the project's one session of `capability`'s `connection` on
+    `node`, leaving its others as they are: the connection's key as
+    `node_sessions_put` reads it, whether it is live, and why not (one of
+    NODE_SESSION_REASONS, with reason_keys exactly beside key_missing). A
+    session not live keeps the account it last held where none is given.
+    `checked_at` is the store's now."""
+    keys = [str(k) for k in reason_keys or () if str(k)] or None
+    if reason is not None and (reason not in NODE_SESSION_REASONS or live):
+        raise StoreError("bad_state", f"session reason {reason!r} is not one of "
+                         f"{', '.join(NODE_SESSION_REASONS)} beside a session that "
+                         "is not live")
+    if (keys is not None) != (reason == "key_missing"):
+        raise StoreError("bad_state", "a session names the keys that do not resolve"
+                         " exactly when its reason is key_missing")
+    conn.execute("INSERT INTO node_sessions AS s (agent_id, node, capability,"
+                 " connection_id, file_connection, live, account, reason, reason_keys)"
+                 f" SELECT %s, %s, k.capability, {_NODE_CONNECTION_KEY},"
+                 " %s, %s, %s, %s FROM (SELECT %s::text AS capability, %s::text AS key) k"
+                 " ON CONFLICT (agent_id, node, capability,"
+                 " coalesce(connection_id, file_connection)) DO UPDATE SET"
+                 " live = EXCLUDED.live, account = coalesce(EXCLUDED.account,"
+                 " CASE WHEN NOT EXCLUDED.live THEN s.account END), reason = EXCLUDED.reason,"
+                 " reason_keys = EXCLUDED.reason_keys, checked_at = now()",
+                 (project_id, node, bool(live), _node_text(account), reason, keys,
+                  capability, connection))
+
+
 def node_agents_prune(conn: Any, node: str, asked: Sequence[str],
                       kept: Sequence[tuple[str, str]]) -> int:
     """Delete on `node` the sessions of each project in `asked` whose
@@ -689,6 +734,20 @@ def node_sessions(conn: Any, project_id: str, nodes: Sequence[str]) -> list[dict
         f" ORDER BY node, capability, {_NODE_CONNECTION}",
         (project_id, list(nodes))).fetchall()
     return [dict(zip(NODE_SESSION_COLUMNS, row, strict=True)) for row in found]
+
+
+def node_health(conn: Any, project_id: str, nodes: Sequence[str]) -> list[dict[str, Any]]:
+    """The project's health on each of `nodes` it lives on, by node, as the
+    store's view NODE_HEALTH_VIEW says it (core 4.6): each {node, health -
+    green, yellow, red or disabled - reachable, cannot_read_store,
+    store_major, store_since, last_seen_at, reported_at, fresh_until, items,
+    sign_ins, sessions}. The view holds the colour rule, and this reads it
+    as it is."""
+    found = conn.execute(
+        f"SELECT {', '.join(NODE_HEALTH_COLUMNS)} FROM {NODE_HEALTH_VIEW}"
+        " WHERE agent_id = %s AND node = ANY (%s) ORDER BY node",
+        (project_id, list(nodes))).fetchall()
+    return [dict(zip(NODE_HEALTH_COLUMNS, row, strict=True)) for row in found]
 
 
 # What reads as a secret in a log line, each with what replaces it: a

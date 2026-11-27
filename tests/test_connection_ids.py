@@ -287,7 +287,8 @@ def test_a_fresh_store_and_one_moved_from_core_2_end_with_the_same_catalog(
         conn.commit()
         with conn.transaction():
             for (view,) in conn.execute("SELECT relname FROM pg_class WHERE relkind = 'v'"
-                                        " AND relnamespace = %s::regnamespace",
+                                        " AND relnamespace = %s::regnamespace"
+                                        " AND starts_with(relname, 'capabilities_')",
                                         (other_schema,)).fetchall():
                 conn.execute(f'DROP VIEW "{other_schema}"."{view}"')
         moved = catalog(conn, other_schema)
