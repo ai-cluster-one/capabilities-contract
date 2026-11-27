@@ -3241,6 +3241,11 @@ _PROBE_TIMEOUT = 2
 _ACTOR_RE = re.compile(r"migrate|[a-z][a-z0-9-]{0,62}-service")
 
 
+def _store_major_key(setting: Any) -> tuple:
+    """What the store-major guard reads once per process for."""
+    return (repr(sorted(setting.connect_kwargs().items())), setting.schema)
+
+
 def _store_major_guard(conn: Any, setting: Any) -> None:
     """Refuse a store at another schema major than the one this library reads,
     reading it once per process for `setting`. Raises StoreError."""
@@ -3248,7 +3253,7 @@ def _store_major_guard(conn: Any, setting: Any) -> None:
     from capabilities_contract.db import _migrate
     if db.upgrading():
         return
-    key = (repr(sorted(setting.connect_kwargs().items())), setting.schema)
+    key = _store_major_key(setting)
     if key not in _STORE_MAJOR_SEEN:
         import psycopg
         try:
@@ -3276,6 +3281,26 @@ def _store_connect(project_root: Path, application_name: str,
             "driver_missing",
             "the shared database library capabilities-contract is not installed",
             "run the capability through its own script header, which pins it") from None
+    conn, setting = _store_open(project_root, application_name, timeout)
+    try:
+        _store_major_guard(conn, setting)
+    except StoreError:
+        conn.close()
+        raise
+    return conn, setting.schema
+
+
+def _store_open(project_root: Path, application_name: str,
+                timeout: int | None = None) -> tuple[Any, Any]:
+    """A transaction connection to the database resolved for `project_root`, and
+    its setting, the store's major not yet read. Raises StoreError."""
+    try:
+        from capabilities_contract import db
+    except ImportError:
+        raise StoreError(
+            "driver_missing",
+            "the shared database library capabilities-contract is not installed",
+            "run the capability through its own script header, which pins it") from None
     try:
         setting = db.resolve_setting(project_root)
         extra = {"connect_timeout": timeout} if timeout else {}
@@ -3283,12 +3308,7 @@ def _store_connect(project_root: Path, application_name: str,
                           transaction=True, **extra)
     except db.DbError as exc:
         raise StoreError(exc.slug, exc.message, exc.hint) from None
-    try:
-        _store_major_guard(conn, setting)
-    except StoreError:
-        conn.close()
-        raise
-    return conn, setting.schema
+    return conn, setting
 
 
 def _read_together(conn: Any, statements: Sequence[tuple[str, Sequence[Any]]]) -> list[list]:
@@ -3302,27 +3322,36 @@ def _read_together(conn: Any, statements: Sequence[tuple[str, Sequence[Any]]]) -
     return together(conn, list(statements))
 
 
+def _agent_state_reads(agent_id: str) -> list[tuple[str, tuple]]:
+    """The two reads `_agent_state` makes: the agent's registry row, and its nodes."""
+    return [("SELECT migrating_since, migrated_at FROM agents WHERE id = %s", (agent_id,)),
+            ("SELECT node, is_master, may_write FROM agent_nodes "
+             "WHERE agent_id = %s ORDER BY node", (agent_id,))]
+
+
 def _agent_state(conn: Any, agent_id: str) -> dict | None:
     """The agent's registry row and its nodes, or None where the store holds
     no such row or no registry at all."""
     import psycopg
     from capabilities_contract import db
-    agent = ("SELECT migrating_since, migrated_at FROM agents WHERE id = %s",
-             (agent_id,))
-    nodes_of = ("SELECT node, is_master, may_write FROM agent_nodes "
-                "WHERE agent_id = %s ORDER BY node", (agent_id,))
+    agent, nodes_of = _agent_state_reads(agent_id)
     try:
         if getattr(db, "batch", None) is not None:
             # Both in one round trip; the nodes are read whether or not the
             # row is there, and count only where it is.
             rows, nodes = db.batch(conn, [agent, nodes_of])
-            row = rows[0] if rows else None
         else:
-            row = conn.execute(*agent).fetchone()
-            nodes = conn.execute(*nodes_of).fetchall() if row else []
+            rows = conn.execute(*agent).fetchall()
+            nodes = conn.execute(*nodes_of).fetchall() if rows else []
     except psycopg.errors.UndefinedTable:
         conn.rollback()
         return None
+    return _agent_state_of(agent_id, rows, nodes)
+
+
+def _agent_state_of(agent_id: str, rows: list, nodes: list) -> dict | None:
+    """The agent's state from the rows of `_agent_state_reads`."""
+    row = rows[0] if rows else None
     if row is None:
         return None
     # Stamped here rather than through `_stamp`, a name a capability may also
@@ -3332,6 +3361,49 @@ def _agent_state(conn: Any, agent_id: str) -> dict | None:
             "nodes": {node: {"is_master": bool(master), "may_write": bool(may_write)}
                       for node, master, may_write in nodes},
             "master": next((node for node, master, _w in nodes if master), None)}
+
+
+def _opening_reads(conn: Any, setting: Any, agent_id: str) -> tuple[dict | None, bool] | None:
+    """What `open_records` reads before it chooses the adapter, in one round
+    trip: the store's major, where the guard has not read it for `setting` in
+    this process (`_store_major_guard`), whether the record tables need
+    nothing from `migrate`, and the agent's registry row and nodes
+    (`_agent_state`). Answers the agent's state and whether the record tables
+    are settled; refuses with the guard's StoreError a store at another major.
+    Answers None, having read nothing it keeps, wherever the reads are not
+    answered together - no `batch`, a table missing, any store error - so the
+    caller reads them one by one, as it would without this."""
+    import psycopg
+    from capabilities_contract import db
+    from capabilities_contract.db import _migrate
+    if getattr(db, "batch", None) is None:
+        return None
+    key = None if db.upgrading() else _store_major_key(setting)
+    statements = []
+    if key is not None and key not in _STORE_MAJOR_SEEN:
+        statements.append(_migrate._store_major_query(setting.schema))
+    major, minor = STORE_TABLES_VERSION
+    settled_query, settled_params, settled = _migrate._settled_read(
+        STORE_OWNER, record_table_steps(), major=major, minor=minor, schema=setting.schema)
+    statements.append((settled_query, settled_params))
+    statements += _agent_state_reads(agent_id)
+    try:
+        answers = db.batch(conn, statements)
+    except (psycopg.Error, db.DbError):
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+    if len(statements) == 4:
+        found = _migrate._store_major_of(answers.pop(0)[0]).major
+        _STORE_MAJOR_SEEN[key] = _migrate._major_refusal(found)
+    if key is not None:
+        refusal = _STORE_MAJOR_SEEN[key]
+        if refusal is not None:
+            raise StoreError(refusal.slug, refusal.message, refusal.hint)
+    settled_rows, rows, nodes = answers
+    return _agent_state_of(agent_id, rows, nodes), settled(settled_rows[0])
 
 
 def _master_hint(state: dict) -> str:
@@ -4753,8 +4825,15 @@ def open_records(envelope: Path | str, global_dir: Path | str,
     if legacy._guard_agent is None:
         return legacy
     try:
-        conn, schema = _store_connect(root or envelope.parent, application_name,
-                                      None if in_store else _PROBE_TIMEOUT)
+        conn, setting = _store_open(root or envelope.parent, application_name,
+                                    None if in_store else _PROBE_TIMEOUT)
+        try:
+            opened = _opening_reads(conn, setting, agent_id)
+            if opened is None:
+                _store_major_guard(conn, setting)
+        except StoreError:
+            conn.close()
+            raise
     except StoreError as exc:
         if exc.slug in STORE_MAJOR_SLUGS:
             raise
@@ -4765,9 +4844,14 @@ def open_records(envelope: Path | str, global_dir: Path | str,
         legacy._references_failure = (None if exc.slug == "store_not_configured"
                                       else exc)
         return legacy
+    schema = setting.schema
     import psycopg
+    settled = False
     try:
-        state = _agent_state(conn, agent_id)
+        if opened is None:
+            state = _agent_state(conn, agent_id)
+        else:
+            state, settled = opened
         conn.rollback()
     except psycopg.Error as exc:
         try:
@@ -4797,5 +4881,7 @@ def open_records(envelope: Path | str, global_dir: Path | str,
     adapter._guard_root = root
     adapter._guard_application = application_name
     adapter._schema = schema
+    # Read with the agent's state: its tables need nothing from `migrate`.
+    adapter._ledger_current = settled
     return adapter
 

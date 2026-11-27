@@ -522,14 +522,9 @@ def _major_refusal(found: int | None) -> DbError | None:
                             f"major {STORE_MAJOR}")
 
 
-def store_major(conn: Any, schema: str | None = None) -> StoreMajor:
-    """The store's major and since when, in one read without a lock, changing
-    nothing; inside a caller's transaction it reads in a savepoint of it. The
-    major is the one the store records for `core`, 1 for a store with rows but no
-    `core` row, and None for an empty store; `since` is when the latest major step
-    of `CORE_STEPS` was applied, None when none was."""
-    psycopg, sql = _psycopg()
-    schema = check_schema_name(schema if schema is not None else bound_schema(conn))
+def _store_major_query(schema: str) -> tuple[Any, tuple]:
+    """The one statement `store_major` reads, and its parameters."""
+    _, sql = _psycopg()
     steps = [step.id for step in CORE_STEPS if step.major is not None]
     query = sql.SQL(
         "SELECT EXISTS (SELECT 1 FROM {versions}), "
@@ -539,15 +534,33 @@ def store_major(conn: Any, schema: str | None = None) -> StoreMajor:
                                               sql.Identifier(VERSION_TABLE)),
              ledger=sql.SQL("{}.{}").format(sql.Identifier(schema),
                                             sql.Identifier(LEDGER_TABLE)))
-    try:
-        held, major, since = _read_alone(conn, query, (CORE_OWNER, CORE_OWNER, steps))[0]
-    except psycopg.errors.UndefinedTable:
-        return StoreMajor(None, None)
+    return query, (CORE_OWNER, CORE_OWNER, steps)
+
+
+def _store_major_of(row: Sequence[Any]) -> StoreMajor:
+    """The store's major from the one row `_store_major_query` reads."""
+    held, major, since = row
     if not held:
         return StoreMajor(None, None)
     if major is None:
         return StoreMajor(1, None)
     return StoreMajor(major, since)
+
+
+def store_major(conn: Any, schema: str | None = None) -> StoreMajor:
+    """The store's major and since when, in one read without a lock, changing
+    nothing; inside a caller's transaction it reads in a savepoint of it. The
+    major is the one the store records for `core`, 1 for a store with rows but no
+    `core` row, and None for an empty store; `since` is when the latest major step
+    of `CORE_STEPS` was applied, None when none was."""
+    psycopg, _sql = _psycopg()
+    schema = check_schema_name(schema if schema is not None else bound_schema(conn))
+    query, params = _store_major_query(schema)
+    try:
+        row = _read_alone(conn, query, params)[0]
+    except psycopg.errors.UndefinedTable:
+        return StoreMajor(None, None)
+    return _store_major_of(row)
 
 
 def _read_alone(conn: Any, query: Any, params: Sequence[Any]) -> list[tuple]:
@@ -615,16 +628,12 @@ def _settled_each(conn: Any, schema: str, owner: str, plan: list[Step], major: i
     return True
 
 
-def _settled(conn: Any, schema: str, owner: str, plan: list[Step], major: int, minor: int,
-             result: MigrateResult) -> bool:
-    """Whether there is nothing to do for `owner` and, for any owner but `core`,
-    for the core's own steps too, judged from one read without a lock: the
-    platform tables exist, every step is applied with its SQL, and the store
-    records each version asked for or a newer minor. Fills `result` (and
-    `result.core`) only when it answers True. Anything else - a table, step or
-    version missing, a refusal - answers False, and the locked path judges it
-    as it always has."""
-    psycopg, sql = _psycopg()
+def _settled_query(schema: str, owner: str, plan: list[Step], major: int,
+                   minor: int) -> tuple[Any, tuple, list]:
+    """The one statement `_settled` reads for `owner` and, for any owner but
+    `core`, for the core's own steps too; its parameters; and what is asked of
+    it, as `_settled_of` judges it."""
+    _, sql = _psycopg()
     asked = [(owner, plan, major, minor)]
     if owner != CORE_OWNER and CORE_STEPS:
         asked.insert(0, (CORE_OWNER, CORE_STEPS, CORE_VERSION[0], CORE_VERSION[1]))
@@ -639,11 +648,14 @@ def _settled(conn: Any, schema: str, owner: str, plan: list[Step], major: int, m
                                               sql.Identifier(VERSION_TABLE)),
              ledger=sql.SQL("{}.{}").format(sql.Identifier(schema),
                                             sql.Identifier(LEDGER_TABLE)))
-    try:
-        channel, versions, ledger = _read_alone(
-            conn, query, (f'"{schema}".{CHANNEL_TABLE}', owners, owners))[0]
-    except psycopg.errors.UndefinedTable:
-        return False
+    return query, (f'"{schema}".{CHANNEL_TABLE}', owners, owners), asked
+
+
+def _settled_of(row: Sequence[Any], schema: str, owner: str, asked: list,
+                result: MigrateResult) -> bool:
+    """Whether the one row `_settled_query` reads says there is nothing to do,
+    filling `result` (and `result.core`) only when it does."""
+    channel, versions, ledger = row
     if not channel:
         return False
     stored = {name: (int(got_major), int(got_minor)) for name, got_major, got_minor in versions}
@@ -672,6 +684,63 @@ def _settled(conn: Any, schema: str, owner: str, plan: list[Step], major: int, m
     if owner != CORE_OWNER and CORE_STEPS:
         result.core = judged[CORE_OWNER]
     return True
+
+
+def _settled(conn: Any, schema: str, owner: str, plan: list[Step], major: int, minor: int,
+             result: MigrateResult) -> bool:
+    """Whether there is nothing to do for `owner` and, for any owner but `core`,
+    for the core's own steps too, judged from one read without a lock: the
+    platform tables exist, every step is applied with its SQL, and the store
+    records each version asked for or a newer minor. Fills `result` (and
+    `result.core`) only when it answers True. Anything else - a table, step or
+    version missing, a refusal - answers False, and the locked path judges it
+    as it always has."""
+    psycopg, _sql = _psycopg()
+    query, params, asked = _settled_query(schema, owner, plan, major, minor)
+    try:
+        row = _read_alone(conn, query, params)[0]
+    except psycopg.errors.UndefinedTable:
+        return False
+    return _settled_of(row, schema, owner, asked, result)
+
+
+def _settled_read(owner: str, steps: Iterable[Step | Sequence[str]], *, major: int,
+                 minor: int, schema: str) -> tuple[Any, tuple, Any]:
+    """The statement that says whether `migrate` with the same arguments has
+    nothing to do, its parameters, and the judge of its one row: called with
+    the row, it answers True where `migrate` would apply and record nothing,
+    else False. For a caller that sends it in a `batch` beside its own reads;
+    a missing platform table fails the statement (`UndefinedTable`), which
+    means the same as False."""
+    owner = check_owner(owner)
+    major, minor = _check_version_numbers(major, minor)
+    schema = check_schema_name(schema)
+    plan = _normalise_steps(steps)
+    query, params, asked = _settled_query(schema, owner, plan, major, minor)
+
+    def judge(row: Sequence[Any]) -> bool:
+        return _settled_of(row, schema, owner, asked, MigrateResult(owner=owner, schema=schema))
+    return query, params, judge
+
+
+def applied(conn: Any, owner: str, steps: Iterable[Step | Sequence[str]], *,
+            schema: str | None = None) -> list[str]:
+    """The ids of `steps` the ledger records as applied for `owner` with their
+    SQL, in their order: what `status` answers as `applied`, read in one
+    statement without a lock and changing nothing (on an idle transaction
+    connection, one round trip). A store with no ledger has none applied."""
+    psycopg, sql = _psycopg()
+    owner = check_owner(owner)
+    schema = check_schema_name(schema if schema is not None else bound_schema(conn))
+    plan = _normalise_steps(steps)
+    query = sql.SQL("SELECT step, checksum FROM {}.{} WHERE owner = %s").format(
+        sql.Identifier(schema), sql.Identifier(LEDGER_TABLE))
+    try:
+        rows = _read_alone(conn, query, (owner,))
+    except psycopg.errors.UndefinedTable:
+        return []
+    done = dict(rows)
+    return [step.id for step in plan if done.get(step.id) == step.checksum]
 
 
 def status(conn: Any, owner: str, steps: Iterable[Step | Sequence[str]], *,
